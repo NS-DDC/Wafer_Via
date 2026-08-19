@@ -39,6 +39,18 @@ class YoloCoordinateTests(unittest.TestCase):
         )
         self.assertEqual(points, [(128.0, 256.0), (384.0, 409.6)])
 
+    def test_auto_parses_point_conf_and_six_column_normalized_yolo(self):
+        points = parse_yolo_points(
+            [[128, 256, 0.90], [384, 410, 0.10]],
+            (512, 512), confidence_threshold=0.25,
+        )
+        self.assertEqual(points, [(128.0, 256.0)])
+        normalized = parse_yolo_points(
+            [[0, 0.25, 0.50, 0.02, 0.02, 0.95]],
+            (512, 512),
+        )
+        self.assertEqual(normalized, [(128.0, 256.0)])
+
     def test_center_side_below_pitch_and_angle(self):
         image = np.zeros((512, 512, 3), np.uint8)
         points = rotated_points()
@@ -127,6 +139,21 @@ class WaferBoundaryAndMapTests(unittest.TestCase):
         self.assertAlmostEqual(die_map.grid_angle_deg, 2.0, places=4)
         self.assertGreater(die_map.num_dies, 100)
         self.assertEqual(make_wafer_overlay(wafer, die_map).shape, wafer.shape)
+
+    def test_end_to_end_memory_arrays_with_six_column_yolo(self):
+        wafer = np.zeros((1200, 1200, 3), np.uint8)
+        cv2.circle(wafer, (600, 600), 520, (80, 160, 205), -1)
+        clip_view = wafer[344:856, 344:856]  # non-contiguous in-memory view
+        points = rotated_points(pitch_x=80.0, pitch_y=90.0, angle_deg=2.0)
+        detections = np.asarray([
+            [0, p[0] / 512.0, p[1] / 512.0, 4.0 / 512.0, 4.0 / 512.0, 0.95]
+            for p in points
+        ], dtype=np.float32)
+        die_map = build_die_map_from_yolo(wafer, clip_view, detections)
+        self.assertAlmostEqual(die_map.pitch_x, 80.0, places=3)
+        self.assertAlmostEqual(die_map.pitch_y, 90.0, places=3)
+        self.assertAlmostEqual(die_map.grid_angle_deg, 2.0, places=3)
+        self.assertEqual((die_map.x0, die_map.y0), (600.0, 600.0))
 
 
 if __name__ == "__main__":

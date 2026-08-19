@@ -47,6 +47,26 @@ dm = build_die_map_from_yolo(
 )
 ```
 
+이미지 경로 대신 OpenCV BGR `numpy.ndarray`를 그대로 전달할 수 있습니다.
+
+```python
+dm = build_die_map_from_yolo(
+    wafer_image=wafer_bgr,       # uint8 ndarray, 예: (10000, 10000, 3)
+    clip_image=center_clip_bgr,  # uint8 ndarray, 예: (512, 512, 3)
+    detections=yolo_array,       # Nx2/Nx3/Nx4/Nx5/Nx6 ndarray 또는 list
+)
+```
+
+`auto`가 지원하는 메모리 좌표 형식:
+
+- `x, y`
+- `x, y, confidence`
+- `x1, y1, x2, y2`
+- `class, cx, cy, w, h[, confidence]` (정규화 YOLO)
+- `x1, y1, x2, y2, confidence, class` (Ultralytics)
+
+픽셀 단위의 6열 `class,cx,cy,w,h,confidence`는 다른 6열 형식과 모호하므로 `detection_format="yolo_txt", normalized=False`를 지정합니다.
+
 중앙이 아닌 위치에서 clip했다면 `clip_origin=(full_x, full_y)`를 명시합니다. 생략하면 full image의 정확한 중앙 clip으로 계산합니다.
 
 ## 각도와 좌표 규칙

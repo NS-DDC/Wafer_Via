@@ -19,7 +19,9 @@ import numpy as np
 
 ImageInput = Union[str, Path, np.ndarray]
 Point = Tuple[float, float]
-DetectionFormat = Literal["auto", "point", "xyxy", "xywh", "yolo_txt", "xyxy_conf_class"]
+DetectionFormat = Literal[
+    "auto", "point", "point_conf", "xyxy", "xywh", "yolo_txt", "xyxy_conf_class"
+]
 
 __all__ = [
     "GridEstimate",
@@ -167,9 +169,10 @@ def parse_yolo_points(
 ) -> List[Point]:
     """Convert common YOLO points/boxes to pixel centres.
 
-    Supported rows are ``(x,y)``, ``(x1,y1,x2,y2)``, standard YOLO txt
-    ``(class,cx,cy,w,h)``, and ``(x1,y1,x2,y2,confidence,class)``.  Dictionaries
-    may contain ``point``, ``center``, ``xyxy``, ``xywh``, or ``bbox``.
+    Supported rows are ``(x,y)``, ``(x,y,confidence)``, ``(x1,y1,x2,y2)``,
+    standard YOLO txt ``(class,cx,cy,w,h[,confidence])``, and Ultralytics
+    ``(x1,y1,x2,y2,confidence,class)``. Dictionaries may contain ``point``,
+    ``center``, ``xyxy``, ``xywh``, or ``bbox``.
     """
 
     width, height = int(image_size[0]), int(image_size[1])
@@ -217,11 +220,25 @@ def parse_yolo_points(
         if item_format == "auto":
             if len(row) == 2:
                 item_format = "point"
+            elif len(row) == 3:
+                item_format = "point_conf"
             elif len(row) == 4:
                 item_format = "xyxy"
             elif len(row) == 5:
                 item_format = "yolo_txt"
-            elif len(row) >= 6:
+            elif len(row) == 6:
+                # Resolve the two common six-column layouts. Normalized YOLO
+                # labels start with an integer class and keep cx/cy/w/h in
+                # [0,1]. Pixel-space six-column rows remain explicitly
+                # selectable with detection_format when their layout is
+                # ambiguous.
+                looks_like_normalized_yolo = (
+                    row[0] >= 0.0
+                    and abs(row[0] - round(row[0])) < 1e-6
+                    and all(0.0 <= value <= 1.0 for value in row[1:6])
+                )
+                item_format = "yolo_txt" if looks_like_normalized_yolo else "xyxy_conf_class"
+            elif len(row) > 6:
                 item_format = "xyxy_conf_class"
             else:
                 raise ValueError(f"Cannot infer detection row format: {row}")
@@ -230,6 +247,11 @@ def parse_yolo_points(
             if len(row) < 2:
                 raise ValueError(f"Point needs two values: {row}")
             cx, cy = row[:2]
+            coord_values = row[:2]
+        elif item_format == "point_conf":
+            if len(row) < 3:
+                raise ValueError(f"point_conf needs x,y,confidence: {row}")
+            cx, cy, confidence = row[:3]
             coord_values = row[:2]
         elif item_format == "xyxy":
             if len(row) < 4:
