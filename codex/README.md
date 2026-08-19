@@ -86,6 +86,7 @@ dm = build_die_map_from_yolo(
 - `[SECTOR: 60_LOCATE_DIE]`: point/bbox → die index
 - `[SECTOR: 70_OVERLAY]`: clip/wafer overlay
 - `[SECTOR: 80_PIPELINE]`: end-to-end API
+- `[SECTOR: 90_USAGE_REFERENCE]`: 단일 파일 복사용 상세 한국어 주석 예제
 
 ## 검증
 

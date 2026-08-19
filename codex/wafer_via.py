@@ -836,7 +836,13 @@ def build_die_map_from_yolo(
     edge_mode: str = "circle",
     boundary_max_dimension: int = 2048,
 ) -> WaferDieMap:
-    """End-to-end entry point for a full wafer image and centre-clip YOLO output."""
+    """End-to-end entry point for a full wafer image and centre-clip YOLO output.
+
+    ``wafer_image`` and ``clip_image`` accept either an image path or an
+    already-decoded OpenCV/numpy image. For production, uint8 BGR arrays are
+    recommended. ``detections`` accepts memory arrays/lists as well as a YOLO
+    text path. See ``[SECTOR: 90_USAGE_REFERENCE]`` below for detailed examples.
+    """
 
     wafer = _load_bgr(wafer_image)
     clip = _load_bgr(clip_image)
@@ -867,3 +873,338 @@ def build_die_map_from_yolo(
 
 
 build_die_map = build_die_map_from_yolo
+
+
+# [SECTOR: 90_USAGE_REFERENCE] ------------------------------------------------
+# =============================================================================
+# 상세 사용법 (전부 주석이므로 이 파일을 통째로 복사해도 자동 실행되지 않습니다.)
+# =============================================================================
+#
+# 이 모듈의 가장 일반적인 처리 순서는 다음과 같습니다.
+#
+#   1) 10000x10000 전체 wafer 이미지를 메모리에 준비합니다.
+#   2) 전체 이미지의 중앙에서 512x512 clip을 만듭니다.
+#   3) 학습한 YOLO 모델로 clip 안의 십자점들을 검출합니다.
+#   4) 전체 이미지, clip 이미지, YOLO 좌표를 build_die_map_from_yolo()에 넣습니다.
+#   5) 반환된 dm으로 pitch/angle을 읽고 locate_die()를 호출합니다.
+#
+# 중요:
+#   - 함수 하나만 복사하면 안 됩니다. 이 wafer_via.py 파일 전체를 복사해야 합니다.
+#   - 이 파일 위쪽에 있는 numpy/cv2 import와 모든 class/helper 함수가 필요합니다.
+#   - 이미지 색상으로 십자점을 새로 찾는 구조가 아닙니다. YOLO 좌표가 기준입니다.
+#   - Python OpenCV 이미지는 일반적으로 dtype=uint8, shape=(H,W,3), BGR 순서입니다.
+#   - JPEG/PNG 압축 bytes는 cv2.imdecode()로 ndarray로 바꾼 뒤 전달합니다.
+#
+# -----------------------------------------------------------------------------
+# 예제 1. 전체 wafer 이미지와 중앙 512x512 clip이 모두 메모리에 있을 때
+# -----------------------------------------------------------------------------
+#
+# # wafer_bgr: 전체 원본 이미지, 예: shape=(10000, 10000, 3), dtype=uint8
+# full_h, full_w = wafer_bgr.shape[:2]
+# clip_w = 512
+# clip_h = 512
+# clip_x = (full_w - clip_w) // 2
+# clip_y = (full_h - clip_h) // 2
+#
+# # copy()는 선택입니다. view를 그대로 전달해도 현재 로직은 정상 동작합니다.
+# center_clip_bgr = wafer_bgr[
+#     clip_y:clip_y + clip_h,
+#     clip_x:clip_x + clip_w,
+# ].copy()
+#
+# # exact center clip이면 clip_origin을 생략해도 같은 값이 자동 계산됩니다.
+# clip_origin = (clip_x, clip_y)
+#
+# -----------------------------------------------------------------------------
+# 예제 2. YOLO 검출 좌표를 메모리 배열로 준비하는 방법
+# -----------------------------------------------------------------------------
+#
+# 아래 형식 중 하나를 사용합니다. 모든 좌표는 512x512 clip 기준입니다.
+# confidence_threshold보다 작은 detection은 자동 제외됩니다.
+#
+# 2-A) 십자점 중심만 있는 Nx2 형식: [x, y]
+# yolo_points = np.array([
+#     [166.2, 164.8],
+#     [256.1, 169.5],
+#     [345.9, 174.1],
+#     [161.5, 256.3],
+#     [251.4, 260.9],  # clip 중앙에 가장 가까운 점 -> center corner 후보
+#     [341.3, 265.6],  # center corner 옆 점 -> pitch_x 계산
+#     [246.7, 352.8],  # center corner 아래 점 -> pitch_y 계산
+# ], dtype=np.float32)
+#
+# dm = build_die_map_from_yolo(
+#     wafer_image=wafer_bgr,
+#     clip_image=center_clip_bgr,
+#     detections=yolo_points,
+#     detection_format="point",   # auto도 가능
+#     normalized=False,           # x,y가 pixel 좌표이므로 False
+#     clip_origin=clip_origin,
+# )
+#
+# 2-B) 점 + 신뢰도 Nx3 형식: [x, y, confidence]
+# yolo_points_conf = np.array([
+#     [251.4, 260.9, 0.98],
+#     [341.3, 265.6, 0.96],
+#     [246.7, 352.8, 0.97],
+# ], dtype=np.float32)
+#
+# dm = build_die_map_from_yolo(
+#     wafer_bgr,
+#     center_clip_bgr,
+#     yolo_points_conf,
+#     detection_format="point_conf",  # auto도 가능
+#     normalized=False,
+#     confidence_threshold=0.25,
+#     clip_origin=clip_origin,
+# )
+#
+# 2-C) Ultralytics boxes.xyxy Nx4 형식: [x1, y1, x2, y2]
+# yolo_xyxy = results[0].boxes.xyxy.cpu().numpy()
+#
+# dm = build_die_map_from_yolo(
+#     wafer_bgr,
+#     center_clip_bgr,
+#     yolo_xyxy,
+#     detection_format="xyxy",
+#     normalized=False,
+#     clip_origin=clip_origin,
+# )
+#
+# 2-D) Ultralytics boxes.data Nx6 형식:
+#      [x1, y1, x2, y2, confidence, class]
+# yolo_data = results[0].boxes.data.cpu().numpy()
+#
+# dm = build_die_map_from_yolo(
+#     wafer_bgr,
+#     center_clip_bgr,
+#     yolo_data,
+#     detection_format="xyxy_conf_class",  # auto도 가능
+#     normalized=False,
+#     confidence_threshold=0.25,
+#     clip_origin=clip_origin,
+# )
+#
+# 2-E) 정규화 YOLO Nx5/Nx6 형식:
+#      [class, center_x, center_y, width, height, (optional confidence)]
+# yolo_normalized = np.array([
+#     [0, 0.4910, 0.5096, 0.0200, 0.0200, 0.98],
+#     [0, 0.6666, 0.5188, 0.0200, 0.0200, 0.96],
+#     [0, 0.4818, 0.6891, 0.0200, 0.0200, 0.97],
+# ], dtype=np.float32)
+#
+# dm = build_die_map_from_yolo(
+#     wafer_bgr,
+#     center_clip_bgr,
+#     yolo_normalized,
+#     detection_format="yolo_txt",  # normalized 6열은 auto 판별도 가능
+#     normalized=True,
+#     clip_origin=clip_origin,
+# )
+#
+# 주의: pixel 단위의 [class,cx,cy,w,h,confidence] 6열은 다른 6열 형식과
+#       모호하므로 detection_format="yolo_txt", normalized=False를 명시합니다.
+#
+# -----------------------------------------------------------------------------
+# 예제 3. 가장 권장하는 전체 호출 형태
+# -----------------------------------------------------------------------------
+#
+# dm = build_die_map_from_yolo(
+#     wafer_image=wafer_bgr,          # 전체 wafer BGR ndarray
+#     clip_image=center_clip_bgr,     # YOLO에 넣었던 512x512 BGR ndarray
+#     detections=yolo_data,           # YOLO 결과 ndarray/list
+#     clip_origin=(clip_x, clip_y),   # clip 왼쪽 위의 full-image 좌표
+#     detection_format="xyxy_conf_class",
+#     normalized=False,
+#     confidence_threshold=0.25,
+#     refine=False,                   # 기본 권장: YOLO box 중심을 그대로 사용
+#     pixel_per_unit=32.0,            # 실좌표 환산용 px/unit
+#     include_edge=True,              # wafer 외곽의 partial die도 map에 포함
+#     edge_margin=1.0,
+#     edge_mode="circle",            # circle | ring | both
+#     boundary_max_dimension=2048,    # 외곽선 검출용 downscale 상한
+# )
+#
+# exact center clip이면 clip_origin은 생략할 수 있습니다.
+# 하지만 생산 코드에서는 clip 위치 실수를 방지하기 위해 명시하는 것을 권장합니다.
+#
+# -----------------------------------------------------------------------------
+# 예제 4. 반환값에서 center corner, pitch, angle 확인
+# -----------------------------------------------------------------------------
+#
+# print("wafer center:", (dm.wafer_cx, dm.wafer_cy))
+# print("wafer radius:", dm.wafer_r)
+# print("center corner(full image):", (dm.x0, dm.y0))
+# print("pitch_x:", dm.pitch_x)
+# print("pitch_y:", dm.pitch_y)
+# print("grid angle(deg):", dm.grid_angle_deg)
+# print("angle confidence:", dm.angle_confidence)
+# print("number of dies:", dm.num_dies)
+# print("full image shape:", dm.image_shape)
+#
+# # 512 clip 안에서 실제 선택된 세 점도 확인할 수 있습니다.
+# estimate = dm.grid_estimate
+# if estimate is not None:
+#     print("center corner in clip:", estimate.center_corner_clip)
+#     print("side corner in clip:", estimate.side_corner_clip)
+#     print("below corner in clip:", estimate.below_corner_clip)
+#     print("angle from X vector:", estimate.angle_x_deg)
+#     print("angle from Y vector:", estimate.angle_y_deg)
+#
+# angle 규칙:
+#   - angle > 0이면 오른쪽 이웃으로 갈수록 영상의 Y가 증가하는 기울기입니다.
+#   - 같은 +angle 값을 cv2.getRotationMatrix2D에 사용하면 수평 보정할 수 있습니다.
+#   - 이 모듈은 full image를 실제 회전시키지 않고 회전 lattice를 원본 좌표에 만듭니다.
+#   - 따라서 locate_die() 입력은 항상 원본 10000x10000 좌표를 그대로 사용합니다.
+#
+# -----------------------------------------------------------------------------
+# 예제 5. full-image의 point 좌표로 die index 찾기
+# -----------------------------------------------------------------------------
+#
+# result = locate_die(dm, point=(5499, 4700))
+#
+# print("die index:", result["die_index"])
+# print("query point:", result["query_px"])
+# print("die center:", result["die_center_px"])
+# print("die polygon:", result["die_polygon_px"])
+# print("die bounding rect:", result["die_rect_px"])
+# print("real coordinate:", result["real_coord"])
+# print("inside wafer:", result["in_wafer"])
+# print("edge die:", result["is_edge"])
+#
+# index 규칙:
+#   - ix + 방향 = 영상 오른쪽
+#   - iy + 방향 = 영상 위쪽
+#   - 회전각이 있어도 위 규칙은 grid 축 기준으로 유지됩니다.
+#
+# -----------------------------------------------------------------------------
+# 예제 6. 검사/불량 BBox 중심이 어느 die인지 찾기
+# -----------------------------------------------------------------------------
+#
+# defect_bbox = (4880, 5080, 4980, 5180)  # full-image x1,y1,x2,y2
+# result = locate_die(dm, bbox=defect_bbox)
+# print(result["die_index"])
+#
+# point와 bbox를 동시에 넣으면 안 됩니다. 둘 중 정확히 하나만 지정합니다.
+# bbox는 내부적으로 중심 좌표를 계산해서 해당 die를 찾습니다.
+#
+# -----------------------------------------------------------------------------
+# 예제 7. index로 이미 생성된 die 정보 직접 조회
+# -----------------------------------------------------------------------------
+#
+# die = dm.get_die(ix=2, iy=-3)
+# if die is not None:
+#     print(die["center_px"])
+#     print(die["polygon_px"])
+#     print(die["is_edge_partial"])
+#     print(die["is_edge_ring"])
+#
+# -----------------------------------------------------------------------------
+# 예제 8. 512 clip에서 center/side/below 선택 결과 오버레이
+# -----------------------------------------------------------------------------
+#
+# if dm.grid_estimate is not None:
+#     clip_overlay = make_clip_overlay(center_clip_bgr, dm.grid_estimate)
+#     cv2.imwrite("clip_grid_overlay.png", clip_overlay)
+#
+# overlay 색상:
+#   - 초록점: 선택된 center corner
+#   - 파란 화살표: pitch_x를 만든 옆 점 방향
+#   - 자홍 화살표: pitch_y를 만든 아래 점 방향
+#   - 노란점: YOLO가 전달한 전체 십자점
+#
+# -----------------------------------------------------------------------------
+# 예제 9. full wafer 외곽선 + 전체 die map 오버레이
+# -----------------------------------------------------------------------------
+#
+# wafer_overlay = make_wafer_overlay(
+#     wafer_bgr,
+#     dm,
+#     draw_dies=True,
+#     thickness=1,
+# )
+# cv2.imwrite("wafer_die_map_overlay.png", wafer_overlay)
+#
+# 주의: 10000x10000 uint8 BGR 원본은 약 300MB입니다.
+# make_wafer_overlay()는 출력 이미지를 별도로 복사하므로 약 300MB가 추가로 필요합니다.
+# 메모리가 부족하면 draw_dies=False로 외곽선/기준점만 확인하거나 작은 preview를 씁니다.
+#
+# -----------------------------------------------------------------------------
+# 예제 10. YOLO 중심좌표가 street 중앙에서 약간 벗어날 때만 refine 사용
+# -----------------------------------------------------------------------------
+#
+# dm = build_die_map_from_yolo(
+#     wafer_bgr,
+#     center_clip_bgr,
+#     yolo_data,
+#     clip_origin=clip_origin,
+#     detection_format="xyxy_conf_class",
+#     refine=True,
+# )
+#
+# refine=False:
+#   - 기본 권장값입니다.
+#   - 학습 모델의 bbox 중심을 신뢰하고 색상 영향을 전혀 받지 않습니다.
+#
+# refine=True:
+#   - YOLO 좌표 주변의 Lab 양방향 경계를 이용해 street 중심을 미세 보정합니다.
+#   - 특정 빨강/초록/파랑 hue를 임계값으로 사용하지 않습니다.
+#   - YOLO 점이 실제 십자점에서 너무 멀면 잘못된 경계를 선택할 수 있으므로 overlay를 확인합니다.
+#
+# -----------------------------------------------------------------------------
+# 예제 11. 중앙이 아닌 위치에서 512 clip을 만든 경우
+# -----------------------------------------------------------------------------
+#
+# clip_x = 4200
+# clip_y = 4650
+# center_clip_bgr = wafer_bgr[clip_y:clip_y + 512, clip_x:clip_x + 512]
+#
+# dm = build_die_map_from_yolo(
+#     wafer_bgr,
+#     center_clip_bgr,
+#     yolo_data,
+#     clip_origin=(clip_x, clip_y),  # 반드시 실제 clip 왼쪽 위 좌표
+#     detection_format="xyxy_conf_class",
+# )
+#
+# clip_origin을 잘못 넣으면 pitch와 angle은 맞아도 full-image center corner와 모든
+# die 좌표가 같은 양만큼 이동하므로 반드시 실제 crop 위치와 일치시킵니다.
+#
+# -----------------------------------------------------------------------------
+# 예제 12. JPEG/PNG 압축 bytes가 메모리에 있을 때
+# -----------------------------------------------------------------------------
+#
+# # encoded_wafer_bytes / encoded_clip_bytes가 bytes 또는 bytearray라고 가정합니다.
+# wafer_buffer = np.frombuffer(encoded_wafer_bytes, dtype=np.uint8)
+# clip_buffer = np.frombuffer(encoded_clip_bytes, dtype=np.uint8)
+# wafer_bgr = cv2.imdecode(wafer_buffer, cv2.IMREAD_COLOR)
+# center_clip_bgr = cv2.imdecode(clip_buffer, cv2.IMREAD_COLOR)
+# if wafer_bgr is None or center_clip_bgr is None:
+#     raise ValueError("이미지 bytes decode 실패")
+#
+# dm = build_die_map_from_yolo(wafer_bgr, center_clip_bgr, yolo_data)
+#
+# -----------------------------------------------------------------------------
+# 예제 13. 자주 발생하는 오류와 확인할 값
+# -----------------------------------------------------------------------------
+#
+# ValueError: At least three YOLO cross-points are required
+#   -> confidence_threshold 이후 남은 점이 center/side/below 최소 3개보다 적습니다.
+#
+# ValueError: The centre corner has no usable neighbour on one grid axis
+#   -> center 기준 옆 또는 아래 점이 없거나 false positive 때문에 축 방향이 깨졌습니다.
+#
+# ValueError: X/Y angle disagreement ...
+#   -> 옆 벡터와 아래 벡터가 직교 grid로 설명되지 않습니다.
+#      YOLO 좌표, class filtering, 중복 검출을 확인합니다.
+#
+# RuntimeError: Wafer boundary was not found
+#   -> wafer/background 대비가 너무 낮거나 wafer 면적이 기본 허용 범위를 벗어났습니다.
+#
+# 결과 승인 전 확인 권장:
+#   1) dm.grid_estimate.center_corner_clip이 실제 중앙 십자점인지
+#   2) side_corner_clip이 같은 row의 바로 옆 점인지
+#   3) below_corner_clip이 같은 column의 바로 아래 점인지
+#   4) pitch_x/pitch_y가 실제 die 간격과 일치하는지
+#   5) angle_x_deg와 angle_y_deg 차이가 작은지
+#   6) clip overlay와 wafer overlay가 실제 street/grid에 맞는지
