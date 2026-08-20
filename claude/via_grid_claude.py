@@ -96,6 +96,7 @@ import math
 from dataclasses import dataclass
 from typing import Optional, Sequence, Tuple
 
+import cv2
 import numpy as np
 
 __all__ = ["GridFit", "fit_grid", "analyze_clip"]
@@ -125,6 +126,9 @@ class GridFit:
     residual: float           # 맞춤 잔차 RMS (px). 크면 뭔가 틀린 것
     ij: np.ndarray            # (n_used, 2) int, 쓴 점들의 격자 인덱스
     used: np.ndarray          # (N,) bool, 입력 점 중 어떤 걸 썼나
+
+    angle_sigma_deg: float = float("nan")   # 회전각 추정치의 표준편차 (deg)
+    angle_confidence: float = 0.0           # P(|각도오차| < 0.05deg), 0..1
 
     def xy_of(self, i: float, j: float) -> np.ndarray:
         """격자 인덱스 -> 픽셀 좌표."""
@@ -264,19 +268,91 @@ def _basis_from_pairs(p: np.ndarray,
 # ====================================================================
 
 def _lstsq_grid(p: np.ndarray, ij: np.ndarray
-                ) -> Tuple[np.ndarray, np.ndarray, np.ndarray, float]:
+                ) -> Tuple[np.ndarray, np.ndarray, np.ndarray, float, float, float]:
     """
     p ~= o + i*vx + j*vy 를 최소제곱으로 푼다.
 
     미지수 6개(o, vx, vy) 를 x/y 각각 3개씩 나눠 푼다.
     설계행렬 A = [1, i, j] 는 x, y 가 공유하므로 한 번만 만든다.
+
+    돌려주는 sii, sjj 는 (A^T A)^-1 의 대각 성분이다. 잔차와 곱하면
+    vx, vy 각 성분의 분산이 되고, 그게 회전각 불확실도의 재료다.
+    (자세한 건 _angle_sigma 참고)
     """
     A = np.column_stack([np.ones(len(ij)), ij[:, 0], ij[:, 1]]).astype(np.float64)
     sol, *_ = np.linalg.lstsq(A, p.astype(np.float64), rcond=None)   # (3,2)
     o, vx, vy = sol[0], sol[1], sol[2]
     resid = p - A @ sol
     rms = float(np.sqrt((resid ** 2).sum(axis=1).mean()))
-    return o, vx, vy, rms
+    try:
+        cov = np.linalg.inv(A.T @ A)
+        sii, sjj = float(cov[1, 1]), float(cov[2, 2])
+    except np.linalg.LinAlgError:                 # 점이 한 줄로 늘어선 경우
+        sii = sjj = float("nan")
+    return o, vx, vy, rms, sii, sjj
+
+
+# 회전각 신뢰도를 만들 때 "이 정도면 맞다"고 볼 각도 오차 (deg).
+# 반지름 5000 px 웨이퍼 끝에서 5000*tan(0.05deg) = 4.36 px 밀린다.
+# die pitch 가 100~200 px 이니 한 칸의 2~4% 다.
+ANGLE_TOL_DEG = 0.05
+
+# 자유도가 0 이면 잔차가 0 으로 나온다. 그때 "오차 0" 이라고 우기면 안 되므로
+# 서브픽셀 보정의 실측 오차 분포(중앙값 0.070, p90 0.155 px)에서 가져온
+# 바닥값을 대신 쓴다. test_refine_claude.py 참고.
+REFINE_NOISE_FLOOR_PX = 0.155
+
+
+def _angle_sigma(rms: float, n: int, sii: float, sjj: float,
+                 pitch_x: float, pitch_y: float) -> float:
+    """
+    회전각 추정치의 표준편차 (deg). 못 내면 nan.
+
+    _angle_from_basis 는 단위벡터 ux 와 rot90(vy) 를 **더해서** 각을 낸다.
+    단위벡터 둘의 합이 가리키는 방향은 정확히 두 각의 이등분선이므로
+    추정량은 그냥 평균이다:  t_hat = (a_x + a_y) / 2.
+
+    a_x 의 흔들림은 vx 의 **수직** 성분 오차를 |vx| 로 나눈 것이고,
+    a_y 도 같은 식이다. 두 항의 공분산은
+
+        cov(perp_x, perp_y) = (1/(px*py)) * sigma^2 * S_ij * (-sin t cos t + sin t cos t)
+                            = 0
+
+    으로 1차항에서 상쇄된다 (x/y 좌표가 같은 설계행렬을 공유하기 때문).
+    따라서
+
+        sigma_t = 0.5 * sqrt( (sigma_c*sqrt(Sii)/px)^2 + (sigma_c*sqrt(Sjj)/py)^2 )
+
+    sigma_c 는 좌표 한 성분의 잔차 표준편차다. rms 는 x,y 를 합쳐 잰 값이라
+    관측 2n 개 - 미지수 6 개 = 2n-6 자유도로 나눈다.
+    """
+    if not np.isfinite(sii) or not np.isfinite(sjj) or pitch_x <= 0 or pitch_y <= 0:
+        return float("nan")
+    dof = 2 * n - 6
+    if dof <= 0:
+        sig_c = REFINE_NOISE_FLOOR_PX            # 잔차가 구조적으로 0 인 구간
+    else:
+        sig_c = math.sqrt(max(n * rms * rms, 0.0) / dof)
+        sig_c = max(sig_c, REFINE_NOISE_FLOOR_PX * 0.5)
+    sx = sig_c * math.sqrt(max(sii, 0.0)) / pitch_x
+    sy = sig_c * math.sqrt(max(sjj, 0.0)) / pitch_y
+    return math.degrees(0.5 * math.hypot(sx, sy))
+
+
+def _angle_confidence(sigma_deg: float, tol_deg: float = ANGLE_TOL_DEG) -> float:
+    """
+    각도 표준편차 -> 0..1 신뢰도.
+
+    "참값이 +-tol 안에 있을 확률" 을 정규분포로 읽은 것이다:
+        P(|err| < tol) = erf( tol / (sigma * sqrt(2)) )
+    임의로 만든 점수가 아니라 확률이라 해석이 된다.
+    sigma 를 못 내면 0.0 (모른다 = 못 믿는다).
+    """
+    if not np.isfinite(sigma_deg):
+        return 0.0
+    if sigma_deg <= 0:
+        return 1.0
+    return float(math.erf(tol_deg / (sigma_deg * math.sqrt(2.0))))
 
 
 # ====================================================================
@@ -345,7 +421,7 @@ def fit_grid(points: Sequence[Tuple[float, float]],
     if len(p) < 3:
         return _fail("중복 제거 후 점이 %d개뿐이다" % len(p), n_in)
 
-    o, vx, vy, rms = _lstsq_grid(p, ij)
+    o, vx, vy, rms, sii, sjj = _lstsq_grid(p, ij)
 
     # 센터 코너 = 클립 중앙(또는 지정 좌표)에 가장 가까운 실제 십자
     if center_xy is not None:
@@ -368,22 +444,39 @@ def fit_grid(points: Sequence[Tuple[float, float]],
     used = np.zeros(n_in, dtype=bool)
     used[np.nonzero(keep)[0][good][np.sort(uniq)]] = True
 
+    px_, py_ = float(np.hypot(*vx)), float(np.hypot(*vy))
+    a_sig = _angle_sigma(rms, len(p), sii, sjj, px_, py_)
+
     return GridFit(ok=(rms <= max_resid), reason=("" if rms <= max_resid else
                    "잔차 %.2f px 가 한계 %.2f px 를 넘었다" % (rms, max_resid)),
                    center=p[k].copy(), origin=o,
                    vx=vx, vy=vy,
-                   pitch_x=float(np.hypot(*vx)), pitch_y=float(np.hypot(*vy)),
+                   pitch_x=px_, pitch_y=py_,
                    angle_deg=ang, n_used=len(p), residual=rms,
-                   ij=ij, used=used)
+                   ij=ij, used=used,
+                   angle_sigma_deg=a_sig,
+                   angle_confidence=_angle_confidence(a_sig))
 
 
 def analyze_clip(clip: np.ndarray,
                  yolo_points: Sequence[Tuple[float, float]],
                  conf_min: float = 0.3,
+                 *,
+                 refine: bool = True,
+                 win: Optional[int] = None,
+                 noise_kernel: int = 0,
                  ):
     """
     **이게 사용자가 부르는 함수다.**
     512x512 센터 클립 + YOLO 점 리스트 -> 보정 결과 + 격자.
+
+    refine       : False 면 서브픽셀 보정을 건너뛰고 raw 좌표로 격자를 세운다.
+                   실측상 각도 오차가 56배 나빠지므로 비교용이 아니면 켜 둔다.
+    win          : 보정 윈도우 **반경**. None 이면 pitch 에서 자동으로 뽑는다
+                   (실측상 pitch*0.30 이 제일 좋았다).
+    noise_kernel : 보정 전에 클립에 걸 medianBlur 커널 (홀수, 0 이면 안 건다).
+                   "흰색+갈색 노이즈" 같은 점잡음용이다. streetness 의
+                   bg_ksize(≈pitch) 와는 **다른 물건**이니 헷갈리면 안 된다.
 
         res, g = analyze_clip(clip, [(x, y), ...])
         g.pitch_x, g.pitch_y, g.angle_deg, g.center
@@ -400,8 +493,17 @@ def analyze_clip(clip: np.ndarray,
     """
     from via_refine_claude import refine_points, rough_pitch_from_points
 
-    res = refine_points(clip, yolo_points,
+    src = clip
+    k = int(noise_kernel)
+    if k >= 3:
+        src = cv2.medianBlur(clip, k | 1)
+
+    res = refine_points(src, yolo_points, win=win,
                         pitch_hint=rough_pitch_from_points(yolo_points))
+    if not refine:
+        # 보정을 끄더라도 신뢰도/가장자리 판정은 그대로 쓴다. 좌표만 raw 로 되돌린다.
+        res.points = np.asarray(yolo_points, np.float32).reshape(-1, 2).copy()
+
     g = fit_grid(res.points, conf=res.confidence,
                  conf_min=conf_min, img_shape=clip.shape)
     if g.ok:

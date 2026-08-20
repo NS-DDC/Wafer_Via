@@ -1,64 +1,66 @@
 # -*- coding: utf-8 -*-
 """
-via_diemap_claude.py
+wafer_via_claude.py
 ====================================================================
-**웨이퍼 외곽선** + **클립에서 뽑은 격자** -> 10000x10000 die map,
-그리고 좌표 -> die index 조회.
+YOLO 십자점 -> 격자 -> 웨이퍼 die map.  **이 파일 하나면 된다.**
 
-사용자 요구 (원문)
+    pip install numpy opencv-python        # 이게 전부
+
+쓰는 법
 --------------------------------------------------------------------
-  "저기서 뽑은 데이터로 10000x10000 Wafer 외각선 기준으로 DM 만들고
-   좌표 넣으면 die index 이런거 나오는건 유지해줘"
+    import cv2
+    from ultralytics import YOLO
+    from wafer_via_claude import build_die_map_from_yolo
 
-  "locate_die, 오버레이, Wafer 외각선 찾기, Die map 생성, 회전각 추정
-   이렇게는 보존해주고 나머지는 지우고 싶어"
+    wafer_bgr      = cv2.imread("wafer.png")            # 10000x10000
+    center_clip_bgr = wafer_bgr[h//2-256:h//2+256,      # 정중앙 512x512
+                                w//2-256:w//2+256]
+    results = YOLO("best.pt")(center_clip_bgr)
 
-v6 에서 가져온 것 / 버린 것
+    dm = build_die_map_from_yolo(
+        wafer_image=wafer_bgr,
+        clip_image=center_clip_bgr,
+        detections=results[0].boxes.xywh.cpu().numpy(),
+        detection_format="xywh",
+        refine=True,
+        refine_mode="auto",
+        refine_radius=24,
+        refine_noise_kernel=5,
+        refine_min_confidence=0.15,
+    )
+
+    print(dm.x0, dm.y0)          # 전체 wafer 좌표의 center corner
+    print(dm.pitch_x, dm.pitch_y)
+    print(dm.grid_angle_deg)
+    print(dm.angle_confidence)   # P(|각도오차| < 0.05deg), 0..1
+    print(dm.num_dies)
+    print(dm.dies)               # [{index, center_px, quad_px, ...}, ...]
+    print(dm.dies_by_index)      # {(i,j): 위와 **같은 객체**}
+    print(dm.wafer_boundary)     # WaferBoundary(cx, cy, r, contour)
+    print(dm.aligned_image)      # 회전 보정본 (처음 볼 때 만든다, 286 MB)
+
+    # 좌표 -> die
+    info = locate_die_via(dm, point=(7321.0, 4180.5))
+    print(info["die_index"], info["die_center_px"], info["is_edge"])
+
+파이프라인
 --------------------------------------------------------------------
-가져옴 : 배경색 추정 -> Lab 거리맵 -> Otsu -> 실루엣 -> 원 (외곽선 검출).
-         die 순회 / edge 판정 / 4분면 검증 / crop / 오버레이 / 좌표조회.
-버림   : 다채널 주기성 격자검출(_spectral_pitch, _fold, detect_grid_adaptive ...)
-         과 projection/FFT 회전각 추정(estimate_grid_angle_adaptive).
-         pitch 와 회전각을 이제 YOLO 클립에서 직접 얻으므로 필요가 없다.
-         (그쪽이 훨씬 정확하다 - 회전각 실측 0.0055 deg vs 주기성 방식 0.1 deg 대)
+    512x512 클립 + YOLO 검출 (N,4)
+        |  detections_to_points     bbox 중심만 뽑는다
+        |  refine_points            서브픽셀 보정 (색-무관)
+        |  fit_grid                 센터 코너 / pitch_x,y / 회전각 / 신뢰도
+        |  detect_wafer_adaptive    웨이퍼 외곽선 (색-무관)
+        v  build_die_map_via        격자를 웨이퍼 전체로 외삽
+    ViaDieMap
 
-**이미지를 회전시키지 않는다** (v6 와의 가장 큰 차이)
+색에 안 흔들리는 이유
 --------------------------------------------------------------------
-v6 는 격자가 축과 나란해지도록 이미지 전체를 워핑한 다음
-`ix = floor((x - x0) / pitch_x)` 로 인덱스를 구했다. 10000x10000 에서 이건
-1억 픽셀을 재샘플링하는 것이다. 느리고, 메모리를 먹고, 무엇보다 **모든
-픽셀이 보간으로 뭉개진다**.
+회색조로 안 바꾼다. 회색조는 밝기가 같고 색만 다른 die/street 쌍을
+통째로 지워버린다. 대신 **배경색으로부터의 Lab 거리**를 본다.
+"검정보다 밝은가"가 아니라 "배경과 다른가"라서 극성 가정이 없다.
 
-지금은 클립에서 vx, vy 를 이미 알고 있으므로 회전할 이유가 없다:
-
-    die(i,j) 중심 = origin + (i+0.5)*vx + (j+0.5)*vy
-    좌표 -> 인덱스  = V^-1 (q - origin),  V = [vx | vy]
-
-2x2 역행렬 한 번이면 끝이고 보간이 전혀 없다. 원본 픽셀이 그대로 남는다.
-
-인덱스 방향 (주의)
---------------------------------------------------------------------
-(i, j) 는 **vx, vy 방향**을 센다. vy 는 이미지 아래쪽을 향하므로
-**j 는 아래로 갈수록 커진다** (이미지 좌표계와 같은 방향).
-v5/v6 의 iy 는 위로 갈수록 커졌으니 부호가 반대다. 두 관습을 섞으면
-반드시 사고가 나므로 여기서는 이미지 방향 하나로 통일했다.
-물리 좌표가 필요하면 `real_coord` 를 쓰면 된다 - 그건 v5 처럼 y 가 위로 양수다.
-
-십자점은 die 의 "모서리"다
---------------------------------------------------------------------
-YOLO 가 찾는 십자(street 교차점)는 die 중심이 아니라 **네 die 가 만나는 꼭지점**
-이다. 그래서 die 중심에는 +0.5 칸이 붙는다. v6 도 `x0 + ix*px + px/2` 로
-같은 일을 했다 (x0,y0 가 코너였다).
-
-사용법
---------------------------------------------------------------------
-    from via_grid_claude import analyze_clip
-    from via_diemap_claude import build_die_map_via, locate_die_via
-
-    res, g = analyze_clip(clip512, yolo_points)        # 클립에서 격자
-    dm = build_die_map_via(wafer_img, g)               # 웨이퍼 외곽선 + die map
-    hit = locate_die_via(dm, point=(4820.0, 3110.0))   # 좌표 -> die
-    hit["die_index"], hit["is_edge"], hit["real_coord"]
+이 파일은 build_single_claude.py 가 만든 것이다 (직접 고치지 말고
+via_refine/via_grid/via_diemap 을 고친 뒤 다시 만들 것).
 """
 
 from __future__ import annotations
@@ -73,11 +75,789 @@ import cv2
 import numpy as np
 
 __all__ = [
-    "WaferProfile", "DieMapDiag", "ViaDieMap", "WaferBoundary",
-    "detect_wafer_adaptive", "clean_wafer_outside",
-    "build_die_map_via", "build_die_map_from_yolo", "locate_die_via",
+    # --- 진입점 (보통 이것만 쓴다) ---------------------------------
+    "build_die_map_from_yolo", "locate_die_via",
+    # --- 결과 형식 -------------------------------------------------
+    "ViaDieMap", "WaferBoundary", "GridFit", "RefineResult",
+    "WaferProfile", "DieMapDiag",
+    # --- 단계별로 직접 부르고 싶을 때 ------------------------------
+    "detections_to_points", "refine_points", "streetness_map",
+    "rough_pitch_from_points", "fit_grid", "analyze_clip",
+    "detect_wafer_adaptive", "clean_wafer_outside", "build_die_map_via",
+    # --- 잘라내기 / 확인용 -----------------------------------------
     "clip_die", "crop_die", "save_debug_overlay",
 ]
+
+
+# ####################################################################
+# 1) 서브픽셀 보정 - YOLO 좌표를 십자 중심으로 당긴다  (원본: wafer_via_claude.py)
+# ####################################################################
+
+CENTER_TOL = 2.0    # 봉우리가 이만큼(px) 벗어나면 confidence 가 절반이 된다
+
+
+# ====================================================================
+# 1) streetness 맵
+# ====================================================================
+
+def streetness_map(img: np.ndarray,
+                   bg_ksize: int = 81,
+                   dot_ksize: int = 5,
+                   normalize: bool = True) -> np.ndarray:
+    """
+    색/극성에 무관하게 street 를 밝게 만드는 스칼라 맵. float32, 대략 [0,1].
+
+    bg_ksize : die 색 지도를 만드는 median 크기 (홀수).
+
+               **pitch 에 맞먹는 크기로 크게 잡아야 한다.** (기본 81)
+               직관과 반대라 이유를 적어 둔다:
+                 - 창이 street 폭의 2~3배 정도로 어중간하면, 십자 중심에서는
+                   창 면적의 80% 넘게가 street 라서 median 자체가 street 색이
+                   된다 -> 정작 십자 위에서 streetness 가 0 으로 꺼진다.
+                 - 창이 pitch 만큼 크면 한 주기를 통째로 보는데, die 면적이
+                   보통 78% 이상이라 median 이 안정적으로 die 색이 된다.
+               실측(합성 5장, street 폭 5~16px):
+                   k=pitch/6  -> 십자 위 streetness 0.15~0.24 (die 0.04~0.20)
+                                 심하면 die 가 십자보다 밝게 뒤집힘
+                   k=pitch*0.8-> 십자 위 streetness 0.90~0.99 (die 0.03~0.14)
+               속도는 같다(히스토그램 기반이라 k 에 거의 무관, 512x512 에 ~35ms).
+    dot_ksize: die 위 점 노이즈를 죽이는 median 크기 (3 또는 5).
+               OpenCV 제약상 float32 에는 3/5 만 된다.
+
+    normalize=True 면 99 퍼센타일로 나눠 [0,1] 로 만든다.
+    (절대값이 아니라 상대값이라 이미지마다 대비가 달라도 같은 스케일)
+    """
+    if img.ndim != 3 or img.shape[2] != 3:
+        raise ValueError("BGR 3채널 이미지가 필요하다. shape=%r" % (img.shape,))
+
+    k = int(bg_ksize) | 1                      # 홀수 강제
+    k = max(3, k)
+    src = img if img.dtype == np.uint8 else np.clip(img, 0, 255).astype(np.uint8)
+
+    bg = cv2.medianBlur(src, k)
+
+    lab_i = cv2.cvtColor(src, cv2.COLOR_BGR2LAB).astype(np.float32)
+    lab_b = cv2.cvtColor(bg, cv2.COLOR_BGR2LAB).astype(np.float32)
+    d = np.sqrt(np.sum((lab_i - lab_b) ** 2, axis=2, dtype=np.float32))
+
+    dk = int(dot_ksize) | 1
+    if dk in (3, 5):
+        d = cv2.medianBlur(d, dk)              # 점 노이즈 제거
+
+    if normalize:
+        hi = float(np.percentile(d, 99.0))
+        d = np.clip(d / max(hi, 1e-6), 0.0, 1.0).astype(np.float32)
+    return d
+
+
+# ====================================================================
+# 2) 대략적 pitch (윈도우 크기 정하는 용도)
+# ====================================================================
+
+def rough_pitch_from_points(points: Sequence[Tuple[float, float]]) -> float:
+    """
+    점들의 최근접 이웃 거리 중앙값. 정확할 필요 없다 —
+    보정 윈도우 크기를 정하는 데만 쓴다.
+
+    점이 2개 미만이면 0.0 을 돌려주고, 호출부가 기본값을 쓰게 한다.
+    """
+    p = np.asarray(points, dtype=np.float64)
+    if p.ndim != 2 or p.shape[0] < 2:
+        return 0.0
+    # N 이 작아서(수십 개) 전수 거리 계산이 제일 단순하고 빠르다.
+    d2 = np.sum((p[:, None, :] - p[None, :, :]) ** 2, axis=2)
+    np.fill_diagonal(d2, np.inf)
+    nn = np.sqrt(np.min(d2, axis=1))
+    return float(np.median(nn))
+
+
+# ====================================================================
+# 3) 보정
+# ====================================================================
+
+@dataclass
+class RefineResult:
+    points: np.ndarray        # (N,2) float32 보정 좌표
+    confidence: np.ndarray    # (N,)  float32 0~1. border 인 점은 0 으로 눌러 둔다
+    conf_raw: np.ndarray      # (N,)  float32 border 를 누르기 **전** 값.
+                              #       점이 너무 적어 border 점까지 써야 할 때만 쓴다
+    moved: np.ndarray         # (N,)  float32 원래 좌표에서 움직인 거리(px)
+    border: np.ndarray        # (N,)  bool   윈도우가 이미지 밖으로 나간 점
+    win: int                  # 실제로 쓴 윈도우 반경
+    streetness: np.ndarray    # (H,W) float32 (디버그/오버레이용)
+
+
+def _peak_centroid(prof: np.ndarray, rel: float = 0.25
+                   ) -> Optional[Tuple[float, float]]:
+    """
+    1D 프로파일에서 **가장 높은 봉우리 하나**의 무게중심과 그 봉우리 높이.
+
+    바닥(median)을 빼고, 최대점에서 좌우로 rel*최대값 위에 머무는 동안만
+    확장한 뒤 그 구간에서만 무게중심을 잡는다.
+    구간을 제한하는 이유: 윈도우가 넓으면 옆 street 의 봉우리가 같이 들어오는데,
+    그걸 함께 평균 내면 중심이 두 봉우리 사이로 끌려간다.
+
+    반환 (무게중심 인덱스, 봉우리 높이). 봉우리가 없으면 None.
+    봉우리 높이는 "이 축에 street 가 정말 있나"의 근거로 쓴다.
+    """
+    q = prof - float(np.median(prof))
+    np.clip(q, 0.0, None, out=q)
+    if not np.isfinite(q).all():
+        return None
+    i = int(np.argmax(q))
+    top = float(q[i])
+    if top <= 1e-9:
+        return None
+
+    thr = rel * top
+    lo = i
+    while lo - 1 >= 0 and q[lo - 1] > thr:
+        lo -= 1
+    hi = i
+    while hi + 1 < len(q) and q[hi + 1] > thr:
+        hi += 1
+
+    seg = q[lo:hi + 1]
+    w = float(seg.sum())
+    if w <= 1e-9:
+        return None
+    idx = np.arange(lo, hi + 1, dtype=np.float64)
+    return float((idx * seg).sum() / w), top
+
+
+def _keep_mask(win: int, excl: int) -> Tuple[int, np.ndarray]:
+    """중심 띠를 뺀 대칭 마스크. (excl 이 너무 크면 줄여서라도 행을 남긴다)"""
+    w = int(win)
+    e = int(max(1, excl))
+    if e >= w - 1:
+        e = max(1, w // 3)
+    keep = np.ones(2 * w + 1, dtype=bool)
+    keep[w - e: w + e + 1] = False
+    return w, keep
+
+
+def _profiles(s: np.ndarray, cx: float, cy: float, w: int, keep: np.ndarray
+              ) -> Tuple[np.ndarray, np.ndarray]:
+    """(cx,cy) 중심 패치에서 중심 띠를 뺀 x/y 프로파일. getRectSubPix 가 서브픽셀 보간."""
+    side = 2 * w + 1
+    patch = cv2.getRectSubPix(s, (side, side), (cx, cy))
+    return patch[keep, :].mean(axis=0), patch[:, keep].mean(axis=1)
+
+
+def prominence_at(s: np.ndarray, pts: np.ndarray, win: int, excl: int
+                  ) -> Tuple[np.ndarray, np.ndarray]:
+    """
+    각 점에서 x/y 프로파일의 (봉우리 높이, 중심에서 벗어난 거리)를 잰다.
+    반환 (prom (N,2), off (N,2)).
+
+    **보정이 끝난 최종 위치에서** 재야 한다. 보정 도중 값을 그대로 쓰면,
+    옆 십자로 튀었다가 되돌려진 오검출이 그 십자의 높은 점수를 들고 온다.
+    (실측: die 한복판 오검출이 conf 0.81~0.88 로 진짜와 안 갈렸다)
+
+    off 가 필요한 이유: 봉우리 높이만 보면 "윈도우 **안에** 십자가 있나"를
+    재는 셈이라, 십자에서 30 px 떨어진 점도 높게 나온다(win 이 그만큼 넓다).
+    "십자 **위에** 있나"를 재려면 봉우리가 윈도우 중앙에 와야 한다.
+    """
+    w, keep = _keep_mask(win, excl)
+    prom = np.zeros((len(pts), 2), dtype=np.float32)
+    off = np.full((len(pts), 2), float(w), dtype=np.float32)
+    for i, (x, y) in enumerate(pts):
+        if not (np.isfinite(x) and np.isfinite(y)):
+            continue
+        px, py = _profiles(s, float(x), float(y), w, keep)
+        rx = _peak_centroid(px)
+        ry = _peak_centroid(py)
+        if rx is not None:
+            prom[i, 0], off[i, 0] = rx[1], abs(rx[0] - w)
+        if ry is not None:
+            prom[i, 1], off[i, 1] = ry[1], abs(ry[0] - w)
+    return prom, off
+
+
+def _refine_one(s: np.ndarray, x: float, y: float, win: int, excl: int,
+                n_iter: int = 3) -> Tuple[float, float]:
+    """
+    점 하나를 띠 프로파일 무게중심으로 반복 보정.
+
+    excl 이 핵심이다. streetness 는 street 위에서 포화(=1)라서,
+    십자 중심을 **지나는** 띠는 모든 열이 밝다 -> 봉우리가 없다.
+    그래서 중심 근처 |dy| < excl 을 **빼고**, 위/아래 두 조각만 쓴다.
+    그 영역에는 세로 street 말고 밝은 게 없으므로 봉우리가 하나만 남는다.
+
+    위/아래를 **대칭**으로 쓰는 게 중요하다. 격자가 기울면 위 조각의
+    street 는 왼쪽, 아래 조각은 오른쪽으로 밀리는데, 대칭이면 그 둘이
+    상쇄돼 무게중심이 제자리를 지킨다. (그래서 각도를 몰라도 된다)
+    """
+    w, keep = _keep_mask(win, excl)
+    cx, cy = float(x), float(y)
+
+    for _ in range(n_iter):
+        px_prof, py_prof = _profiles(s, cx, cy, w, keep)
+        rx = _peak_centroid(px_prof)      # 열(=x) 프로파일
+        ry = _peak_centroid(py_prof)      # 행(=y) 프로파일
+        if rx is None and ry is None:
+            break
+        dx = (rx[0] - w) if rx is not None else 0.0
+        dy = (ry[0] - w) if ry is not None else 0.0
+        cx += dx
+        cy += dy
+        if abs(dx) < 0.01 and abs(dy) < 0.01:
+            break
+    return cx, cy
+
+
+def refine_points(img: np.ndarray,
+                  points: Sequence[Tuple[float, float]],
+                  pitch_hint: Optional[float] = None,
+                  win: Optional[int] = None,
+                  excl: Optional[int] = None,
+                  bg_ksize: Optional[int] = None,
+                  max_move: Optional[float] = None,
+                  streetness: Optional[np.ndarray] = None,
+                  ) -> RefineResult:
+    """
+    YOLO 점을 서브픽셀 보정한다.
+
+    pitch_hint : 대략적 pitch(px). None 이면 points 로 추정.
+    win        : 윈도우 반경. None 이면 pitch*0.3 (6~70 으로 클립).
+                 옆 십자를 물면 안 되므로 pitch/2 보다 작아야 한다.
+    excl       : 중심에서 제외할 띠의 반높이. None 이면 pitch*0.10 (4~24).
+                 street 반폭(최대 pitch*0.055)보다 확실히 커야
+                 가로 street 가 프로파일에 안 섞인다.
+    bg_ksize   : streetness 의 median 크기. None 이면 pitch*0.8 을 홀수로
+                 (최소 9, 최대 201). 왜 크게 잡는지는 streetness_map 참고
+                 (작게 잡으면 십자 중심에서 streetness 가 꺼진다).
+    max_move   : 이 거리보다 많이 움직인 보정은 **되돌린다**.
+                 보정이 실패하면 엉뚱한 곳으로 튀는데, 원래 YOLO 좌표보다
+                 나쁜 답을 주느니 원본을 쓰는 게 낫다.
+                 None 이면 pitch*0.25 (윈도우 안에서만 움직이게).
+
+    반환 RefineResult. 오검출은 **버리지 않고** confidence 로 표시만 한다.
+    """
+    pts = np.asarray(points, dtype=np.float32).reshape(-1, 2)
+    if len(pts) == 0:
+        z = np.zeros((0,), dtype=np.float32)
+        return RefineResult(pts.copy(), z, z.copy(), z.copy(),
+                            np.zeros((0,), dtype=bool), 0,
+                            np.zeros(img.shape[:2], dtype=np.float32))
+
+    p_hint = float(pitch_hint) if pitch_hint else rough_pitch_from_points(pts)
+    if p_hint <= 0:
+        p_hint = 120.0                            # 512 클립에 4~5개 들어가는 크기
+
+    if bg_ksize is None:
+        bg_ksize = int(np.clip(round(p_hint * 0.8) | 1, 9, 201))
+    if win is None:
+        win = int(np.clip(round(p_hint * 0.30), 6, 70))
+    if excl is None:
+        excl = int(np.clip(round(p_hint * 0.10), 4, 24))
+    if max_move is None:
+        max_move = float(p_hint * 0.25)
+
+    s = streetness_map(img, bg_ksize=bg_ksize) if streetness is None else streetness
+
+    ref = np.empty_like(pts)
+    for i, (x, y) in enumerate(pts):
+        ref[i] = _refine_one(s, float(x), float(y), int(win), int(excl))
+
+    moved = np.sqrt(np.sum((ref - pts) ** 2, axis=1)).astype(np.float32)
+
+    # 발산 방지: 너무 많이 움직였거나 NaN 이면 원본으로 되돌린다.
+    bad = ~np.isfinite(ref).all(axis=1) | (moved > max_move)
+    if np.any(bad):
+        ref[bad] = pts[bad]
+        moved[bad] = 0.0
+
+    # 이미지 밖으로 나간 것도 되돌린다.
+    h, w = s.shape[:2]
+    oob = ((ref[:, 0] < 0) | (ref[:, 0] > w - 1) |
+           (ref[:, 1] < 0) | (ref[:, 1] > h - 1))
+    if np.any(oob):
+        ref[oob] = pts[oob]
+        moved[oob] = 0.0
+
+    # 신뢰도 = 두 축 봉우리 높이 중 **약한 쪽**. (되돌리기까지 끝난 최종 위치에서)
+    #
+    # 보정 위치의 streetness 를 그대로 쓰면 안 된다(처음엔 그렇게 했다).
+    # street 한복판을 잘못 찍은 오검출은 streetness 가 1.0 이라 진짜 십자와
+    # 구분이 안 된다(실측: 진짜 하위10% 0.904 vs 오검출 상위10% 0.936, 겹침).
+    # 십자는 **가로/세로 street 가 둘 다** 있어야 하므로, 한 축이라도
+    # 봉우리가 약하면 십자가 아니다. min 이 그걸 정확히 잡아낸다.
+    #
+    # 배치 안에서 다시 정규화하지 않는다. streetness 가 이미 이미지의 99
+    # 퍼센타일로 [0,1] 이라, 진짜 십자의 봉우리 높이는 자연스럽게 0.9 근처,
+    # die 한복판은 0 근처로 나온다. 배치 정규화를 하면 그 배치에 오검출이
+    # 몇 개 섞였느냐에 따라 같은 점의 confidence 가 달라져서 못 쓴다.
+    # 윈도우가 이미지 밖으로 나가는 점은 신뢰할 수 없다.
+    # getRectSubPix 는 밖을 **가장자리 픽셀 복사**로 채우는데, 그러면 위/아래
+    # 조각의 대칭이 깨진다. 복사된 쪽은 가장자리 행의 street 위치만 반복해서
+    # 강조하므로, 격자가 기울어 있으면 봉우리가 그쪽으로 끌려간다.
+    #   실측(합성 30장): 윈도우가 완전히 안에 있는 289점 -> 오차 최대 0.249 px
+    #                    가장자리에 걸친 81점        -> p90 1.109, 최대 2.241 px
+    #                    (십자에서 9 px 벗어난 채 conf 0.67 로 나온 사례도 있었다)
+    # 그래서 좌표는 그대로 두되(그래도 raw 보단 낫다) confidence 를 0 으로
+    # 눌러서 호출부가 거르게 한다. border 플래그로 이유도 같이 알려 준다.
+    border = ((ref[:, 0] < win) | (ref[:, 0] >= w - win) |
+              (ref[:, 1] < win) | (ref[:, 1] >= h - win))
+
+    prom, off = prominence_at(s, ref, int(win), int(excl))
+    conf = np.clip(np.minimum(prom[:, 0], prom[:, 1]), 0.0, 1.0)
+
+    # 봉우리가 윈도우 중앙에 안 오면 그만큼 깎는다.
+    # 보정이 성공한 점은 0.01 px 이내로 수렴하므로 깎이지 않는다. 반대로
+    # max_move 에 걸려 되돌려진 오검출은 봉우리가 수십 px 밖에 있어서 죽는다.
+    # CENTER_TOL 은 "수렴했다고 볼 여유" 라서 값이 예민하지 않다(1~3 px 동일).
+    conf = (conf / (1.0 + (off.max(axis=1) / CENTER_TOL) ** 2)).astype(np.float32)
+    conf_raw = conf.copy()
+    conf = conf.copy()
+    conf[border] = 0.0
+
+    return RefineResult(points=ref, confidence=conf, conf_raw=conf_raw,
+                        moved=moved, border=border, win=int(win), streetness=s)
+
+
+# ####################################################################
+# 2) 격자 - 센터 코너 / pitch_x,y / 회전각 / 신뢰도  (원본: wafer_via_claude.py)
+# ####################################################################
+
+# ====================================================================
+# 결과 형식
+# ====================================================================
+
+@dataclass
+class GridFit:
+    ok: bool                  # 격자를 세웠나
+    reason: str               # ok=False 면 실패 사유.
+                              # ok=True 인데도 비어있지 않으면 "세우긴 했는데
+                              # 이런 사정이 있었다"는 경고다 (analyze_clip 참고).
+
+    center: np.ndarray        # (2,) 센터 코너 (클립 중앙에 가장 가까운 십자)
+    origin: np.ndarray        # (2,) 격자 원점 = center 와 동일 (i=j=0 기준점)
+    vx: np.ndarray            # (2,) 한 칸 오른쪽 벡터
+    vy: np.ndarray            # (2,) 한 칸 아래쪽 벡터
+
+    pitch_x: float            # |vx|
+    pitch_y: float            # |vy|
+    angle_deg: float          # 격자 회전각 (-45 ~ 45)
+
+    n_used: int               # 격자 맞춤에 쓴 점 개수
+    residual: float           # 맞춤 잔차 RMS (px). 크면 뭔가 틀린 것
+    ij: np.ndarray            # (n_used, 2) int, 쓴 점들의 격자 인덱스
+    used: np.ndarray          # (N,) bool, 입력 점 중 어떤 걸 썼나
+
+    angle_sigma_deg: float = float("nan")   # 회전각 추정치의 표준편차 (deg)
+    angle_confidence: float = 0.0           # P(|각도오차| < 0.05deg), 0..1
+
+    def xy_of(self, i: float, j: float) -> np.ndarray:
+        """격자 인덱스 -> 픽셀 좌표."""
+        return self.origin + i * self.vx + j * self.vy
+
+    def index_of(self, x: float, y: float, snap: bool = True):
+        """
+        픽셀 좌표 -> 격자 인덱스.
+        snap=True 면 정수로 반올림, False 면 실수 그대로.
+        """
+        V = np.stack([self.vx, self.vy], axis=1)          # 2x2, 열이 기저
+        ij = np.linalg.solve(V, np.asarray([x, y], np.float64) - self.origin)
+        return (int(round(ij[0])), int(round(ij[1]))) if snap else ij
+
+
+def _fail(reason: str, n: int) -> GridFit:
+    z2 = np.zeros(2, np.float64)
+    return GridFit(ok=False, reason=reason, center=z2, origin=z2,
+                   vx=z2.copy(), vy=z2.copy(), pitch_x=0.0, pitch_y=0.0,
+                   angle_deg=0.0, n_used=0, residual=float("nan"),
+                   ij=np.zeros((0, 2), int), used=np.zeros(n, bool))
+
+
+# ====================================================================
+# 1) 이웃 차 벡터 -> 기저 (vx, vy)
+# ====================================================================
+
+def _basis_from_pairs(p: np.ndarray,
+                      band: Tuple[float, float] = (0.45, 3.0),
+                      min_sin: float = 0.3,
+                      off_tol: float = 0.2,
+                      ) -> Optional[Tuple[np.ndarray, np.ndarray]]:
+    """
+    점들의 "한 칸짜리" 차 벡터를 모아 기저 두 개를 만든다.
+
+    두 단계로 한다.
+
+    1) 가장 짧은 벡터 v1, 그리고 v1 과 평행하지 않은 것 중 가장 짧은 v2.
+       (격자 기저 축소 - 한 칸 벡터는 정의상 가장 짧은 두 독립 벡터다)
+    2) 모든 차 벡터를 (v1,v2) 로 분해해 인덱스가 정확히 (±1,0)/(0,±1) 인
+       것만 모아 평균낸다. 대각선/두 칸 벡터는 여기서 자동으로 빠진다.
+
+    왜 이렇게 바꿨나 (길이 문턱 하나로 자르면 안 되는 이유)
+    ------------------------------------------------------------------
+    예전에는 "최근접 거리 중앙값 * 1.4 이하"를 한 칸으로 봤다.
+    1.4 는 **정사각** 격자의 대각선 배율 sqrt(2)=1.414 에서 온 값인데,
+    pitch_x != pitch_y 면 그 가정이 깨진다.
+
+        실측 실패 예 (합성 seed 18): px=121.94, py=136.92
+        최근접 거리 중앙값 step = 136.86 -> 문턱 191.60
+        대각선 = sqrt(px^2+py^2) = 183.35  < 191.60   ** 통과해 버린다 **
+
+    대각선 5개가 섞이자 |dx|<|dy| 라는 이유로 전부 "세로 방향"으로 분류돼
+    vy 평균이 망가졌고, pitch_y 가 136.9 대신 61.1 로, 회전각이 -3.51 대신
+    -7.36 도로 나왔다. die map 전체가 60 칸 어긋났다.
+    길이만 보는 한 어떤 상수를 넣어도 pitch 비율에 따라 언젠가 깨진다.
+
+    band    : v1/v2 후보 길이 범위 = (하한, 상한) * 최근접거리 중앙값.
+              하한은 중복 검출(거의 같은 자리 두 점)을 막고,
+              상한은 pitch 비가 커도 반대 방향 한 칸이 들어오게 넉넉히 둔다.
+              어차피 "가장 짧은 것"을 고르므로 상한이 넉넉해도 안전하다.
+    min_sin : v1 과 독립으로 볼 최소 |sin|. 0.3 = 약 17도.
+    off_tol : 2단계에서 정수 인덱스로 인정할 오차 (칸 단위).
+    """
+    n = len(p)
+    if n < 3:
+        return None
+
+    d = p[:, None, :] - p[None, :, :]                  # (n,n,2) 양방향 다 있음
+    L = np.sqrt((d ** 2).sum(axis=2))
+    np.fill_diagonal(L, np.inf)
+    step = float(np.median(L.min(axis=1)))             # 최근접 거리 중앙값
+    if not np.isfinite(step) or step <= 1e-6:
+        return None
+
+    iu = np.triu_indices(n, 1)
+    v_all = d[iu]                                      # (k,2) 한쪽 방향만
+    l_all = L[iu]
+    sel = (l_all >= band[0] * step) & (l_all <= band[1] * step)
+    if sel.sum() < 2:
+        return None
+    vb, lb = v_all[sel], l_all[sel]
+
+    # --- 1) 가장 짧은 두 독립 벡터 -----------------------------------
+    order = np.argsort(lb)
+    v1 = vb[order[0]]
+    n1 = float(np.hypot(v1[0], v1[1]))
+    v2 = None
+    for k in order[1:]:
+        vk = vb[k]
+        nk = float(np.hypot(vk[0], vk[1]))
+        if nk <= 1e-6:
+            continue
+        sin = abs(float(v1[0] * vk[1] - v1[1] * vk[0])) / (n1 * nk)
+        if sin >= min_sin:
+            v2 = vk
+            break
+    if v2 is None:
+        return None
+
+    V = np.stack([v1, v2], axis=1).astype(np.float64)
+    if abs(float(np.linalg.det(V))) < 1e-6:
+        return None
+
+    # --- 2) 정확히 한 칸인 벡터만 모아 평균 ----------------------------
+    a = d.reshape(-1, 2).astype(np.float64)
+    ijf = np.linalg.solve(V, a.T).T
+    ij = np.round(ijf)
+    fit = np.abs(ijf - ij).max(axis=1) < off_tol
+
+    def _mean_step(di: int, dj: int) -> Optional[np.ndarray]:
+        pos = fit & (ij[:, 0] == di) & (ij[:, 1] == dj)
+        neg = fit & (ij[:, 0] == -di) & (ij[:, 1] == -dj)
+        if not pos.any() and not neg.any():
+            return None
+        return np.concatenate([a[pos], -a[neg]], axis=0).mean(axis=0)
+
+    e1 = _mean_step(1, 0)
+    e2 = _mean_step(0, 1)
+    if e1 is None or e2 is None:
+        return None
+
+    # |회전각| < 45도 가정 -> 두 기저 중 |dx|>|dy| 인 쪽이 가로다
+    if abs(e1[0]) >= abs(e1[1]):
+        vx, vy = e1, e2
+    else:
+        vx, vy = e2, e1
+    if vx[0] < 0:                                      # vx 는 오른쪽(+x)
+        vx = -vx
+    if vy[1] < 0:                                      # vy 는 아래(+y)
+        vy = -vy
+    return vx.astype(np.float64), vy.astype(np.float64)
+
+
+# ====================================================================
+# 2) 최소제곱 격자 맞춤
+# ====================================================================
+
+def _lstsq_grid(p: np.ndarray, ij: np.ndarray
+                ) -> Tuple[np.ndarray, np.ndarray, np.ndarray, float, float, float]:
+    """
+    p ~= o + i*vx + j*vy 를 최소제곱으로 푼다.
+
+    미지수 6개(o, vx, vy) 를 x/y 각각 3개씩 나눠 푼다.
+    설계행렬 A = [1, i, j] 는 x, y 가 공유하므로 한 번만 만든다.
+
+    돌려주는 sii, sjj 는 (A^T A)^-1 의 대각 성분이다. 잔차와 곱하면
+    vx, vy 각 성분의 분산이 되고, 그게 회전각 불확실도의 재료다.
+    (자세한 건 _angle_sigma 참고)
+    """
+    A = np.column_stack([np.ones(len(ij)), ij[:, 0], ij[:, 1]]).astype(np.float64)
+    sol, *_ = np.linalg.lstsq(A, p.astype(np.float64), rcond=None)   # (3,2)
+    o, vx, vy = sol[0], sol[1], sol[2]
+    resid = p - A @ sol
+    rms = float(np.sqrt((resid ** 2).sum(axis=1).mean()))
+    try:
+        cov = np.linalg.inv(A.T @ A)
+        sii, sjj = float(cov[1, 1]), float(cov[2, 2])
+    except np.linalg.LinAlgError:                 # 점이 한 줄로 늘어선 경우
+        sii = sjj = float("nan")
+    return o, vx, vy, rms, sii, sjj
+
+
+# 회전각 신뢰도를 만들 때 "이 정도면 맞다"고 볼 각도 오차 (deg).
+# 반지름 5000 px 웨이퍼 끝에서 5000*tan(0.05deg) = 4.36 px 밀린다.
+# die pitch 가 100~200 px 이니 한 칸의 2~4% 다.
+ANGLE_TOL_DEG = 0.05
+
+# 자유도가 0 이면 잔차가 0 으로 나온다. 그때 "오차 0" 이라고 우기면 안 되므로
+# 서브픽셀 보정의 실측 오차 분포(중앙값 0.070, p90 0.155 px)에서 가져온
+# 바닥값을 대신 쓴다. test_refine_claude.py 참고.
+REFINE_NOISE_FLOOR_PX = 0.155
+
+
+def _angle_sigma(rms: float, n: int, sii: float, sjj: float,
+                 pitch_x: float, pitch_y: float) -> float:
+    """
+    회전각 추정치의 표준편차 (deg). 못 내면 nan.
+
+    _angle_from_basis 는 단위벡터 ux 와 rot90(vy) 를 **더해서** 각을 낸다.
+    단위벡터 둘의 합이 가리키는 방향은 정확히 두 각의 이등분선이므로
+    추정량은 그냥 평균이다:  t_hat = (a_x + a_y) / 2.
+
+    a_x 의 흔들림은 vx 의 **수직** 성분 오차를 |vx| 로 나눈 것이고,
+    a_y 도 같은 식이다. 두 항의 공분산은
+
+        cov(perp_x, perp_y) = (1/(px*py)) * sigma^2 * S_ij * (-sin t cos t + sin t cos t)
+                            = 0
+
+    으로 1차항에서 상쇄된다 (x/y 좌표가 같은 설계행렬을 공유하기 때문).
+    따라서
+
+        sigma_t = 0.5 * sqrt( (sigma_c*sqrt(Sii)/px)^2 + (sigma_c*sqrt(Sjj)/py)^2 )
+
+    sigma_c 는 좌표 한 성분의 잔차 표준편차다. rms 는 x,y 를 합쳐 잰 값이라
+    관측 2n 개 - 미지수 6 개 = 2n-6 자유도로 나눈다.
+    """
+    if not np.isfinite(sii) or not np.isfinite(sjj) or pitch_x <= 0 or pitch_y <= 0:
+        return float("nan")
+    dof = 2 * n - 6
+    if dof <= 0:
+        sig_c = REFINE_NOISE_FLOOR_PX            # 잔차가 구조적으로 0 인 구간
+    else:
+        sig_c = math.sqrt(max(n * rms * rms, 0.0) / dof)
+        sig_c = max(sig_c, REFINE_NOISE_FLOOR_PX * 0.5)
+    sx = sig_c * math.sqrt(max(sii, 0.0)) / pitch_x
+    sy = sig_c * math.sqrt(max(sjj, 0.0)) / pitch_y
+    return math.degrees(0.5 * math.hypot(sx, sy))
+
+
+def _angle_confidence(sigma_deg: float, tol_deg: float = ANGLE_TOL_DEG) -> float:
+    """
+    각도 표준편차 -> 0..1 신뢰도.
+
+    "참값이 +-tol 안에 있을 확률" 을 정규분포로 읽은 것이다:
+        P(|err| < tol) = erf( tol / (sigma * sqrt(2)) )
+    임의로 만든 점수가 아니라 확률이라 해석이 된다.
+    sigma 를 못 내면 0.0 (모른다 = 못 믿는다).
+    """
+    if not np.isfinite(sigma_deg):
+        return 0.0
+    if sigma_deg <= 0:
+        return 1.0
+    return float(math.erf(tol_deg / (sigma_deg * math.sqrt(2.0))))
+
+
+# ====================================================================
+# 3) 메인
+# ====================================================================
+
+def fit_grid(points: Sequence[Tuple[float, float]],
+             conf: Optional[Sequence[float]] = None,
+             conf_min: float = 0.3,
+             img_shape: Optional[Tuple[int, ...]] = None,
+             center_xy: Optional[Tuple[float, float]] = None,
+             max_resid: float = 3.0,
+             ) -> GridFit:
+    """
+    보정된 십자 좌표에서 격자를 세운다.
+
+    points   : (N,2) 보정 좌표 (refine_points 결과를 넣으면 된다)
+    conf     : (N,) 신뢰도. 주면 conf_min 미만은 버린다.
+               refine_points 는 오검출과 가장자리 점을 여기서 0 으로 눌러 준다.
+    conf_min : 신뢰도 문턱. 실측상 진짜 점은 0.47 이상, 오검출은 0.01 이하라
+               0.3 이면 넉넉히 갈린다.
+    img_shape: 클립 크기. 주면 그 중심에서 가장 가까운 점을 센터 코너로 잡는다.
+    center_xy: 센터 코너 기준점을 직접 주고 싶을 때. (img_shape 보다 우선)
+    max_resid: 맞춤 잔차가 이보다 크면 ok=False. 격자가 아닌 걸 격자라고
+               우기지 않게 하는 안전장치.
+
+    실패해도 예외를 던지지 않고 ok=False + reason 으로 돌려준다.
+    (호출부가 클립 한 장 실패로 전체가 죽는 걸 원하지 않을 것이므로)
+    """
+    p_all = np.asarray(points, dtype=np.float64).reshape(-1, 2)
+    n_in = len(p_all)
+
+    keep = np.ones(n_in, dtype=bool)
+    if conf is not None:
+        c = np.asarray(conf, dtype=np.float64).ravel()
+        if len(c) != n_in:
+            return _fail("conf 길이가 points 와 다르다", n_in)
+        keep &= c >= conf_min
+
+    p = p_all[keep]
+    if len(p) < 3:
+        return _fail("신뢰할 점이 %d개뿐이다 (최소 3개)" % len(p), n_in)
+
+    base = _basis_from_pairs(p)
+    if base is None:
+        return _fail("이웃 벡터에서 기저를 못 만들었다", n_in)
+    vx, vy = base
+
+    # 기저로 정수 인덱스를 매긴다. 기준점은 아무거나(첫 점) — 뒤에서 옮긴다.
+    V = np.stack([vx, vy], axis=1)
+    if abs(float(np.linalg.det(V))) < 1e-6:
+        return _fail("기저 두 벡터가 평행하다", n_in)
+    ij_f = np.linalg.solve(V, (p - p[0]).T).T
+    ij = np.round(ij_f).astype(int)
+
+    # 정수에서 너무 벗어난 점은 격자 밖(오검출)이므로 뺀다.
+    off = np.abs(ij_f - ij).max(axis=1)
+    good = off < 0.25
+    if good.sum() < 3:
+        return _fail("격자에 붙는 점이 %d개뿐이다" % int(good.sum()), n_in)
+    p, ij = p[good], ij[good]
+
+    # 같은 격자칸에 두 점이 겹치면(중복 검출) 하나만 남긴다.
+    _, uniq = np.unique(ij, axis=0, return_index=True)
+    p, ij = p[np.sort(uniq)], ij[np.sort(uniq)]
+    if len(p) < 3:
+        return _fail("중복 제거 후 점이 %d개뿐이다" % len(p), n_in)
+
+    o, vx, vy, rms, sii, sjj = _lstsq_grid(p, ij)
+
+    # 센터 코너 = 클립 중앙(또는 지정 좌표)에 가장 가까운 실제 십자
+    if center_xy is not None:
+        cxy = np.asarray(center_xy, dtype=np.float64)
+    elif img_shape is not None:
+        cxy = np.asarray([img_shape[1] * 0.5, img_shape[0] * 0.5], dtype=np.float64)
+    else:
+        cxy = p.mean(axis=0)
+    k = int(np.argmin(((p - cxy) ** 2).sum(axis=1)))
+
+    # 인덱스 원점을 센터 코너로 옮긴다 -> 센터가 (0,0), 옆이 (1,0), 밑이 (0,1)
+    # origin 은 p[k] 원본이 아니라 **최소제곱이 예측한** 센터 위치를 쓴다.
+    # 그래야 그 점 하나의 보정 오차가 격자 전체에 실리지 않는다.
+    ij_k = ij[k].copy()
+    ij = ij - ij_k
+    o = o + ij_k[0] * vx + ij_k[1] * vy
+
+    ang = _angle_from_basis(vx, vy)
+
+    used = np.zeros(n_in, dtype=bool)
+    used[np.nonzero(keep)[0][good][np.sort(uniq)]] = True
+
+    px_, py_ = float(np.hypot(*vx)), float(np.hypot(*vy))
+    a_sig = _angle_sigma(rms, len(p), sii, sjj, px_, py_)
+
+    return GridFit(ok=(rms <= max_resid), reason=("" if rms <= max_resid else
+                   "잔차 %.2f px 가 한계 %.2f px 를 넘었다" % (rms, max_resid)),
+                   center=p[k].copy(), origin=o,
+                   vx=vx, vy=vy,
+                   pitch_x=px_, pitch_y=py_,
+                   angle_deg=ang, n_used=len(p), residual=rms,
+                   ij=ij, used=used,
+                   angle_sigma_deg=a_sig,
+                   angle_confidence=_angle_confidence(a_sig))
+
+
+def analyze_clip(clip: np.ndarray,
+                 yolo_points: Sequence[Tuple[float, float]],
+                 conf_min: float = 0.3,
+                 *,
+                 refine: bool = True,
+                 win: Optional[int] = None,
+                 noise_kernel: int = 0,
+                 ):
+    """
+    **이게 사용자가 부르는 함수다.**
+    512x512 센터 클립 + YOLO 점 리스트 -> 보정 결과 + 격자.
+
+    refine       : False 면 서브픽셀 보정을 건너뛰고 raw 좌표로 격자를 세운다.
+                   실측상 각도 오차가 56배 나빠지므로 비교용이 아니면 켜 둔다.
+    win          : 보정 윈도우 **반경**. None 이면 pitch 에서 자동으로 뽑는다
+                   (실측상 pitch*0.30 이 제일 좋았다).
+    noise_kernel : 보정 전에 클립에 걸 medianBlur 커널 (홀수, 0 이면 안 건다).
+                   "흰색+갈색 노이즈" 같은 점잡음용이다. streetness 의
+                   bg_ksize(≈pitch) 와는 **다른 물건**이니 헷갈리면 안 된다.
+
+        res, g = analyze_clip(clip, [(x, y), ...])
+        g.pitch_x, g.pitch_y, g.angle_deg, g.center
+
+    반환 (RefineResult, GridFit).
+
+    가장자리 점 되살리기
+    ----------------------------------------------------------------
+    refine_points 는 윈도우가 이미지 밖으로 나간 점의 confidence 를 0 으로
+    누른다(대칭이 깨져 못 믿으므로). 그런데 pitch 가 아주 크면(190 px 이상)
+    512 클립 안에 십자가 2~3개밖에 안 들어와서, 그걸 다 빼면 격자를 못 세운다.
+    그럴 때만 conf_raw(=누르기 전 값)로 한 번 더 시도한다.
+    성공하면 GridFit.reason 에 그 사실을 적어 둔다 — 조용히 넘어가지 않는다.
+    """
+
+    src = clip
+    k = int(noise_kernel)
+    if k >= 3:
+        src = cv2.medianBlur(clip, k | 1)
+
+    res = refine_points(src, yolo_points, win=win,
+                        pitch_hint=rough_pitch_from_points(yolo_points))
+    if not refine:
+        # 보정을 끄더라도 신뢰도/가장자리 판정은 그대로 쓴다. 좌표만 raw 로 되돌린다.
+        res.points = np.asarray(yolo_points, np.float32).reshape(-1, 2).copy()
+
+    g = fit_grid(res.points, conf=res.confidence,
+                 conf_min=conf_min, img_shape=clip.shape)
+    if g.ok:
+        return res, g
+
+    g2 = fit_grid(res.points, conf=res.conf_raw,
+                  conf_min=conf_min, img_shape=clip.shape)
+    if g2.ok:
+        g2.reason = ("점이 부족해 가장자리 점까지 썼다 "
+                     "(%d개 중 %d개가 가장자리) - 정확도가 낮을 수 있다"
+                     % (int(g2.used.sum()), int((g2.used & res.border).sum())))
+        return res, g2
+    return res, g
+
+
+def _angle_from_basis(vx: np.ndarray, vy: np.ndarray) -> float:
+    """
+    vx, vy 를 **둘 다** 써서 회전각을 낸다.
+
+    vy 를 -90도 돌리면 vx 와 같은 방향이 된다(직교 기저니까).
+    그 둘을 단위벡터로 만들어 더하면, 한쪽 방향 점이 적어도 각도가 안 흔들린다.
+    결과는 -45~45 로 접는다 (90도 대칭이라 그 이상은 의미가 없다).
+    """
+    ux = vx / max(np.hypot(*vx), 1e-9)
+    # vy 를 시계 반대로 90도 회전: (x,y) -> (y,-x)
+    uy = np.asarray([vy[1], -vy[0]], dtype=np.float64)
+    uy /= max(np.hypot(*uy), 1e-9)
+    if float(ux @ uy) < 0:            # 반대로 뒤집혀 있으면 맞춰 준다
+        uy = -uy
+    u = ux + uy
+    a = math.degrees(math.atan2(float(u[1]), float(u[0])))
+    return ((a + 45.0) % 90.0) - 45.0
+
+
+# ####################################################################
+# 3) die map - 웨이퍼 외곽선, 격자 외삽, 좌표->die  (원본: wafer_via_claude.py)
+# ####################################################################
 
 _EPS = 1e-9
 
@@ -1029,7 +1809,6 @@ def build_die_map_from_yolo(wafer_image: Union[str, Path, np.ndarray],
     ------
     ValueError : 격자를 못 세웠을 때. 조용히 틀린 die map 을 주지 않는다.
     """
-    from via_grid_claude import analyze_clip
 
     wafer = _load_bgr(wafer_image)
     clip = _load_bgr(clip_image)
@@ -1263,7 +2042,7 @@ def save_debug_overlay(image: Union[str, Path, np.ndarray],
         b = g.background_bgr or (0, 0, 0)
         n_edge = sum(1 for d in dm.dies if d["is_edge"])
         lines = [
-            "via_diemap_claude   DIE MAP (no image rotation)",
+            "wafer_via_claude   DIE MAP (no image rotation)",
             "wafer    c=(%d,%d)  r=%d   cov=%s"
             % (dm.wafer_cx, dm.wafer_cy, dm.wafer_r,
                "-" if g.wafer_coverage is None else "%.3f" % g.wafer_coverage)
