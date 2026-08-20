@@ -1,6 +1,9 @@
 import math
+import io
 import unittest
+from contextlib import redirect_stdout
 from pathlib import Path
+from types import SimpleNamespace
 
 import cv2
 import numpy as np
@@ -12,6 +15,7 @@ from codex.wafer_via import (
     detect_wafer_boundary,
     estimate_grid_from_yolo,
     generate_die_map,
+    inspect_yolo_results,
     locate_die,
     make_clip_overlay,
     make_wafer_overlay,
@@ -35,6 +39,44 @@ def rotated_points(center=(256.0, 256.0), pitch_x=82.5, pitch_y=91.75, angle_deg
 
 
 class YoloCoordinateTests(unittest.TestCase):
+    def test_inspect_ultralytics_style_results(self):
+        class FakeBoxes(SimpleNamespace):
+            def __len__(self):
+                return len(self.data)
+
+        data = np.asarray([
+            [10.0, 20.0, 30.0, 40.0, 0.90, 0.0],
+            [50.0, 60.0, 90.0, 100.0, 0.80, 0.0],
+            [12.0, 14.0, 22.0, 24.0, 0.70, 1.0],
+        ], dtype=np.float32)
+        xywh = np.column_stack((
+            (data[:, 0] + data[:, 2]) / 2.0,
+            (data[:, 1] + data[:, 3]) / 2.0,
+            data[:, 2] - data[:, 0],
+            data[:, 3] - data[:, 1],
+        )).astype(np.float32)
+        boxes = FakeBoxes(
+            data=data,
+            xywh=xywh,
+            xywhn=xywh / np.asarray((512, 512, 512, 512), np.float32),
+            xyxy=data[:, :4],
+            xyxyn=data[:, :4] / np.asarray((512, 512, 512, 512), np.float32),
+            conf=data[:, 4], cls=data[:, 5], id=None,
+            is_track=False, orig_shape=(512, 512),
+        )
+        result = SimpleNamespace(boxes=boxes, orig_shape=(512, 512), path="memory")
+        output = io.StringIO()
+        with redirect_stdout(output):
+            summary = inspect_yolo_results([result], max_rows=2)
+        printed = output.getvalue()
+        self.assertIn("results length: 1", printed)
+        self.assertIn("detection count: 3", printed)
+        self.assertIn("xywh: shape=(3, 4)", printed)
+        self.assertIn("... 1 more row(s)", printed)
+        self.assertEqual(summary["results_count"], 1)
+        self.assertEqual(summary["items"][0]["boxes"]["detection_count"], 3)
+        self.assertEqual(summary["items"][0]["boxes"]["arrays"]["data"]["preview"].shape, (2, 6))
+
     def test_parse_standard_normalized_yolo_txt_rows(self):
         points = parse_yolo_points(
             [[0, 0.25, 0.50, 0.02, 0.02], [0, 0.75, 0.80, 0.02, 0.02]],

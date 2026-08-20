@@ -70,6 +70,66 @@ dm = build_die_map_from_yolo(
 
 중앙이 아닌 위치에서 clip했다면 `clip_origin=(full_x, full_y)`를 명시합니다. 생략하면 full image의 정확한 중앙 clip으로 계산합니다.
 
+## Ultralytics 결과 구조 출력하기
+
+`model(...)` 반환값의 list 길이가 1이면 일반적으로 입력 이미지가 한 장이라는 뜻입니다. 실제 검출 박스 수는 `len(results[0].boxes)`로 확인합니다.
+
+다음 진단 함수는 Ultralytics와 torch를 이 모듈에서 직접 import하지 않고도 결과 구조를 출력합니다.
+
+```python
+from codex.wafer_via import inspect_yolo_results
+
+results = model(center_clip_bgr)
+summary = inspect_yolo_results(results, max_rows=10)
+```
+
+출력 항목:
+
+- `results` 실제 type과 list 길이
+- 각 `Results`의 type, `orig_shape`, 입력 path
+- `boxes` type과 실제 detection 개수
+- tracking 결과인지 여부
+- `boxes.data`
+- `boxes.xywh`, `boxes.xywhn`
+- `boxes.xyxy`, `boxes.xyxyn`
+- `boxes.conf`, `boxes.cls`, `boxes.id`
+- 각 tensor의 shape, dtype, 앞쪽 `max_rows`개 값
+
+검출 수가 많아도 전체 tensor를 모두 출력하지 않습니다. `max_rows`만 출력하고 나머지 행 개수를 표시합니다. 반환되는 `summary`에도 전체 배열이 아니라 shape, dtype, preview만 들어갑니다.
+
+확인 후 현재 die-map 함수에는 다음 중 하나로 전달하는 것을 권장합니다.
+
+```python
+boxes = results[0].boxes
+
+# 방법 1: 십자점 box 중심을 직접 사용
+keep = (boxes.conf >= 0.25) & (boxes.cls == 0)
+detections_xywh = boxes.xywh[keep].cpu().numpy()
+
+dm = build_die_map_from_yolo(
+    wafer_bgr,
+    center_clip_bgr,
+    detections_xywh,
+    detection_format="xywh",
+    normalized=False,
+)
+```
+
+또는 confidence와 class가 포함된 raw data를 전달합니다.
+
+```python
+detections_data = boxes.data.cpu().numpy()
+
+dm = build_die_map_from_yolo(
+    wafer_bgr,
+    center_clip_bgr,
+    detections_data,
+    detection_format="xyxy_conf_class",
+    normalized=False,
+    confidence_threshold=0.25,
+)
+```
+
 ## 결과값 한눈에 보기
 
 `build_die_map_from_yolo()`의 반환값은 `WaferDieMap` 객체입니다. 이 객체 하나에 wafer 외곽선, 선택된 십자점, pitch, angle, 전체 die map이 모두 들어 있습니다.

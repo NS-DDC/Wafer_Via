@@ -27,6 +27,7 @@ __all__ = [
     "GridEstimate",
     "WaferBoundary",
     "WaferDieMap",
+    "inspect_yolo_results",
     "parse_yolo_points",
     "refine_cross_point",
     "estimate_grid_from_yolo",
@@ -152,6 +153,114 @@ class WaferDieMap:
 
 
 # [SECTOR: 10_YOLO_COORDINATES] ----------------------------------------------
+def _tensor_to_numpy(value: Any) -> Optional[np.ndarray]:
+    """Convert a torch/numpy-like value to CPU numpy without importing torch."""
+
+    if value is None:
+        return None
+    converted = value
+    if hasattr(converted, "detach"):
+        converted = converted.detach()
+    if hasattr(converted, "cpu"):
+        converted = converted.cpu()
+    if hasattr(converted, "numpy"):
+        converted = converted.numpy()
+    return np.asarray(converted)
+
+
+def inspect_yolo_results(results: Any, *, max_rows: int = 10) -> Dict[str, Any]:
+    """Print and return a compact description of Ultralytics YOLO results.
+
+    Accepts either the full ``results`` list returned by ``model(...)`` or one
+    ``Results`` object. Tensor values are detached, moved to CPU, and previewed
+    without requiring this module to import Ultralytics or torch.
+    """
+
+    if max_rows < 0:
+        raise ValueError("max_rows must be zero or greater.")
+    if hasattr(results, "boxes"):
+        result_items = [results]
+    elif isinstance(results, Sequence) and not isinstance(results, (str, bytes, bytearray)):
+        result_items = list(results)
+    else:
+        raise TypeError("Pass the results list from model(...) or one Results object.")
+
+    summary: Dict[str, Any] = {
+        "results_type": type(results).__name__,
+        "results_count": len(result_items),
+        "items": [],
+    }
+    print(f"results type: {type(results).__module__}.{type(results).__name__}")
+    print(f"results length: {len(result_items)}")
+
+    for result_index, result in enumerate(result_items):
+        item: Dict[str, Any] = {
+            "index": result_index,
+            "result_type": type(result).__name__,
+            "orig_shape": getattr(result, "orig_shape", None),
+            "path": str(getattr(result, "path", "")),
+            "boxes": None,
+        }
+        print(f"\n[result {result_index}]")
+        print(f"result type: {type(result).__module__}.{type(result).__name__}")
+        print(f"original shape: {item['orig_shape']}")
+        if item["path"]:
+            print(f"path: {item['path']}")
+
+        boxes = getattr(result, "boxes", None)
+        if boxes is None:
+            print("boxes: None")
+            summary["items"].append(item)
+            continue
+
+        try:
+            detection_count = len(boxes)
+        except TypeError:
+            detection_count = None
+        box_summary: Dict[str, Any] = {
+            "boxes_type": type(boxes).__name__,
+            "detection_count": detection_count,
+            "is_track": bool(getattr(boxes, "is_track", False)),
+            "orig_shape": getattr(boxes, "orig_shape", None),
+            "arrays": {},
+        }
+        item["boxes"] = box_summary
+        print(f"boxes type: {type(boxes).__module__}.{type(boxes).__name__}")
+        print(f"detection count: {detection_count}")
+        print(f"boxes original shape: {box_summary['orig_shape']}")
+        print(f"tracking boxes: {box_summary['is_track']}")
+
+        for attribute in ("data", "xywh", "xywhn", "xyxy", "xyxyn", "conf", "cls", "id"):
+            try:
+                raw_value = getattr(boxes, attribute, None)
+                array = _tensor_to_numpy(raw_value)
+            except Exception as exc:  # diagnostic output must continue for other attributes
+                box_summary["arrays"][attribute] = {"error": str(exc)}
+                print(f"{attribute}: ERROR {exc}")
+                continue
+            if array is None:
+                box_summary["arrays"][attribute] = None
+                print(f"{attribute}: None")
+                continue
+            if array.ndim == 0:
+                preview = array.copy()
+            else:
+                preview = array[:max_rows].copy()
+            metadata = {
+                "shape": tuple(int(value) for value in array.shape),
+                "dtype": str(array.dtype),
+                "preview": preview,
+            }
+            box_summary["arrays"][attribute] = metadata
+            print(f"{attribute}: shape={metadata['shape']}, dtype={metadata['dtype']}")
+            print(preview)
+            if array.ndim > 0 and len(array) > max_rows:
+                print(f"... {len(array) - max_rows} more row(s)")
+
+        summary["items"].append(item)
+    return summary
+
+
 def _load_yolo_rows(path: Union[str, Path]) -> List[List[float]]:
     rows: List[List[float]] = []
     for line_number, raw in enumerate(Path(path).read_text(encoding="utf-8").splitlines(), 1):
@@ -984,6 +1093,17 @@ build_die_map = build_die_map_from_yolo
 #   - 이미지 색상으로 십자점을 새로 찾는 구조가 아닙니다. YOLO 좌표가 기준입니다.
 #   - Python OpenCV 이미지는 일반적으로 dtype=uint8, shape=(H,W,3), BGR 순서입니다.
 #   - JPEG/PNG 압축 bytes는 cv2.imdecode()로 ndarray로 바꾼 뒤 전달합니다.
+#
+# -----------------------------------------------------------------------------
+# 예제 0. Ultralytics results/list/boxes 구조 먼저 출력하기
+# -----------------------------------------------------------------------------
+#
+# results = model(center_clip_bgr)
+# summary = inspect_yolo_results(results, max_rows=10)
+#
+# # list 길이가 1이면 일반적으로 입력 이미지가 1장이라는 뜻입니다.
+# # 실제 십자점 검출 개수는 len(results[0].boxes)로 확인합니다.
+# # 출력된 boxes.xywh 또는 boxes.data를 아래 예제처럼 detections로 변환합니다.
 #
 # -----------------------------------------------------------------------------
 # 예제 1. 전체 wafer 이미지와 중앙 512x512 clip이 모두 메모리에 있을 때
