@@ -44,8 +44,14 @@ code, result, via_bin = check_via("원본.jpg", "이진화.png",
 from via_code import check_via_code
 
 code, result = check_via_code("내가_이진화한_VIA.png",
-                              "PAD설계도.png", "VIA설계도.png")
+                              "PAD설계도.png", "VIA설계도.png",
+                              bin_mask="이진화.png")   # 되도록 같이 주세요
 ```
+
+`bin_mask`(실측 PAD 이진화)는 VIA 를 찾는 데는 안 쓰고 **기준점**을 잡는 데만 씁니다.
+① 설계도-실물 어긋남을 PAD 마다 흡수하고 ② PAD 자체가 없는 자리를 `"42"` 가 아니라
+"PAD 없음"으로 빼둡니다. 실측으로 44장 중 **5장**이 이 차이 하나로 코드가 갈렸습니다
+(`bin_mask` 있으면 `check_via` 와 44/44 일치, 없으면 39/44).
 
 너무 많이 잡거나 너무 못 잡으면 코드를 고치지 않고 호출할 때 한 번만 밀 수 있습니다.
 
