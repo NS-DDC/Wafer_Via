@@ -35,6 +35,9 @@ __all__ = [
     "build_die_map_from_yolo",
     "build_die_map",
     "locate_die",
+    "align_wafer_image",
+    "transform_point_to_aligned",
+    "transform_point_to_original",
     "make_clip_overlay",
     "make_wafer_overlay",
 ]
@@ -126,6 +129,9 @@ class WaferDieMap:
     edge_mode: str = "circle"
     wafer_boundary: Optional[WaferBoundary] = field(default=None, repr=False)
     grid_estimate: Optional[GridEstimate] = field(default=None, repr=False)
+    aligned_image: Optional[np.ndarray] = field(default=None, repr=False)
+    original_to_aligned_matrix: Optional[np.ndarray] = field(default=None, repr=False)
+    aligned_to_original_matrix: Optional[np.ndarray] = field(default=None, repr=False)
 
     @property
     def num_dies(self) -> int:
@@ -779,6 +785,73 @@ def locate_die(
     }
 
 
+# [SECTOR: 65_ANGLE_ALIGNED_IMAGE] --------------------------------------------
+def _alignment_matrices(center_px: Point, angle_deg: float) -> Tuple[np.ndarray, np.ndarray]:
+    matrix = cv2.getRotationMatrix2D(
+        (float(center_px[0]), float(center_px[1])), float(angle_deg), 1.0
+    ).astype(np.float64)
+    inverse = cv2.invertAffineTransform(matrix).astype(np.float64)
+    return matrix, inverse
+
+
+def align_wafer_image(
+    image: ImageInput,
+    center_px: Point,
+    angle_deg: float,
+    *,
+    interpolation: int = cv2.INTER_CUBIC,
+    border_value: Tuple[int, int, int] = (0, 0, 0),
+) -> Tuple[np.ndarray, np.ndarray, np.ndarray]:
+    """Rotate a wafer image to horizontal and return image plus both transforms.
+
+    Returns ``(aligned_image, original_to_aligned, aligned_to_original)``.
+    Output size is identical to the input and rotation is around ``center_px``.
+    """
+
+    source = _load_bgr(image)
+    height, width = source.shape[:2]
+    matrix, inverse = _alignment_matrices(center_px, angle_deg)
+    if abs(float(angle_deg)) < 1e-12:
+        return source.copy(), matrix, inverse
+    aligned = cv2.warpAffine(
+        source,
+        matrix,
+        (width, height),
+        flags=interpolation,
+        borderMode=cv2.BORDER_CONSTANT,
+        borderValue=tuple(int(value) for value in border_value),
+    )
+    return aligned, matrix, inverse
+
+
+def _transform_point(matrix: np.ndarray, point: Point) -> Point:
+    homogeneous = np.array((float(point[0]), float(point[1]), 1.0), dtype=np.float64)
+    transformed = np.asarray(matrix, dtype=np.float64) @ homogeneous
+    return float(transformed[0]), float(transformed[1])
+
+
+def transform_point_to_aligned(die_map: WaferDieMap, point: Point) -> Point:
+    """Convert one original-image point to ``die_map.aligned_image`` coordinates."""
+
+    matrix = die_map.original_to_aligned_matrix
+    if matrix is None:
+        matrix, _ = _alignment_matrices(
+            (die_map.wafer_cx, die_map.wafer_cy), die_map.grid_angle_deg
+        )
+    return _transform_point(matrix, point)
+
+
+def transform_point_to_original(die_map: WaferDieMap, point: Point) -> Point:
+    """Convert one aligned-image point back to original-image coordinates."""
+
+    matrix = die_map.aligned_to_original_matrix
+    if matrix is None:
+        _, matrix = _alignment_matrices(
+            (die_map.wafer_cx, die_map.wafer_cy), die_map.grid_angle_deg
+        )
+    return _transform_point(matrix, point)
+
+
 # [SECTOR: 70_OVERLAY] --------------------------------------------------------
 def make_clip_overlay(clip_image: ImageInput, estimate: GridEstimate) -> np.ndarray:
     overlay = _load_bgr(clip_image).copy()
@@ -835,6 +908,9 @@ def build_die_map_from_yolo(
     edge_margin: float = 1.0,
     edge_mode: str = "circle",
     boundary_max_dimension: int = 2048,
+    return_aligned_image: bool = True,
+    alignment_interpolation: int = cv2.INTER_CUBIC,
+    alignment_border_value: Tuple[int, int, int] = (0, 0, 0),
 ) -> WaferDieMap:
     """End-to-end entry point for a full wafer image and centre-clip YOLO output.
 
@@ -860,7 +936,7 @@ def build_die_map_from_yolo(
     origin_full = (clip_origin[0] + estimate.center_corner_clip[0],
                    clip_origin[1] + estimate.center_corner_clip[1])
     boundary = detect_wafer_boundary(wafer, max_dimension=boundary_max_dimension)
-    return generate_die_map(
+    die_map = generate_die_map(
         boundary, (full_height, full_width), origin_full,
         estimate.pitch_x, estimate.pitch_y, estimate.angle_deg,
         pixel_per_unit=pixel_per_unit,
@@ -870,6 +946,20 @@ def build_die_map_from_yolo(
         angle_confidence=estimate.angle_confidence,
         grid_estimate=estimate,
     )
+    matrix, inverse = _alignment_matrices(
+        (die_map.wafer_cx, die_map.wafer_cy), die_map.grid_angle_deg
+    )
+    die_map.original_to_aligned_matrix = matrix
+    die_map.aligned_to_original_matrix = inverse
+    if return_aligned_image:
+        die_map.aligned_image, _, _ = align_wafer_image(
+            wafer,
+            (die_map.wafer_cx, die_map.wafer_cy),
+            die_map.grid_angle_deg,
+            interpolation=alignment_interpolation,
+            border_value=alignment_border_value,
+        )
+    return die_map
 
 
 build_die_map = build_die_map_from_yolo
@@ -1023,6 +1113,7 @@ build_die_map = build_die_map_from_yolo
 #     edge_margin=1.0,
 #     edge_mode="circle",            # circle | ring | both
 #     boundary_max_dimension=2048,    # 외곽선 검출용 downscale 상한
+#     return_aligned_image=True,      # angle 보정된 full image를 dm에 저장
 # )
 #
 # exact center clip이면 clip_origin은 생략할 수 있습니다.
@@ -1041,6 +1132,7 @@ build_die_map = build_die_map_from_yolo
 # print("angle confidence:", dm.angle_confidence)
 # print("number of dies:", dm.num_dies)
 # print("full image shape:", dm.image_shape)
+# print("aligned image:", None if dm.aligned_image is None else dm.aligned_image.shape)
 #
 # # 512 clip 안에서 실제 선택된 세 점도 확인할 수 있습니다.
 # estimate = dm.grid_estimate
@@ -1054,8 +1146,9 @@ build_die_map = build_die_map_from_yolo
 # angle 규칙:
 #   - angle > 0이면 오른쪽 이웃으로 갈수록 영상의 Y가 증가하는 기울기입니다.
 #   - 같은 +angle 값을 cv2.getRotationMatrix2D에 사용하면 수평 보정할 수 있습니다.
-#   - 이 모듈은 full image를 실제 회전시키지 않고 회전 lattice를 원본 좌표에 만듭니다.
-#   - 따라서 locate_die() 입력은 항상 원본 10000x10000 좌표를 그대로 사용합니다.
+#   - die lattice와 locate_die()는 원본 이미지 좌표계를 유지합니다.
+#   - dm.aligned_image에는 angle이 보정된 full image가 별도로 들어 있습니다.
+#   - 보정 이미지의 좌표는 transform_point_to_original()로 되돌린 뒤 locate_die()에 넣습니다.
 #
 # -----------------------------------------------------------------------------
 # 예제 5. full-image의 point 좌표로 die index 찾기
@@ -1114,6 +1207,37 @@ build_die_map = build_die_map_from_yolo
 #   - 노란점: YOLO가 전달한 전체 십자점
 #
 # -----------------------------------------------------------------------------
+# 예제 8-B. angle 보정된 full image 저장과 좌표 변환
+# -----------------------------------------------------------------------------
+#
+# # return_aligned_image=True가 기본값입니다.
+# if dm.aligned_image is not None:
+#     cv2.imwrite("wafer_aligned.png", dm.aligned_image)
+#
+# # 원본 좌표 -> angle 보정 이미지 좌표
+# original_point = (5499.0, 4700.0)
+# aligned_point = transform_point_to_aligned(dm, original_point)
+#
+# # angle 보정 이미지 좌표 -> 원본 좌표
+# restored_point = transform_point_to_original(dm, aligned_point)
+#
+# # locate_die()는 원본 좌표를 받으므로 aligned image에서 검출한 점은 되돌립니다.
+# aligned_defect = (5503.2, 4691.8)
+# original_defect = transform_point_to_original(dm, aligned_defect)
+# result = locate_die(dm, point=original_defect)
+#
+# # 10000x10000 BGR 보정 이미지의 추가 메모리가 부담되면 다음 옵션을 사용합니다.
+# dm_without_aligned = build_die_map_from_yolo(
+#     wafer_bgr,
+#     center_clip_bgr,
+#     yolo_data,
+#     clip_origin=clip_origin,
+#     detection_format="xyxy_conf_class",
+#     return_aligned_image=False,
+# )
+# # 이 경우 aligned_image만 None이며 좌표 변환 matrix는 계속 반환됩니다.
+#
+# -----------------------------------------------------------------------------
 # 예제 9. full wafer 외곽선 + 전체 die map 오버레이
 # -----------------------------------------------------------------------------
 #
@@ -1126,7 +1250,7 @@ build_die_map = build_die_map_from_yolo
 # cv2.imwrite("wafer_die_map_overlay.png", wafer_overlay)
 #
 # 주의: 10000x10000 uint8 BGR 원본은 약 300MB입니다.
-# make_wafer_overlay()는 출력 이미지를 별도로 복사하므로 약 300MB가 추가로 필요합니다.
+# 기본 aligned_image가 약 300MB, make_wafer_overlay() 출력도 약 300MB가 추가됩니다.
 # 메모리가 부족하면 draw_dies=False로 외곽선/기준점만 확인하거나 작은 preview를 씁니다.
 #
 # -----------------------------------------------------------------------------

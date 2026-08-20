@@ -7,6 +7,7 @@ import numpy as np
 
 from codex.wafer_via import (
     WaferBoundary,
+    align_wafer_image,
     build_die_map_from_yolo,
     detect_wafer_boundary,
     estimate_grid_from_yolo,
@@ -16,6 +17,8 @@ from codex.wafer_via import (
     make_wafer_overlay,
     parse_yolo_points,
     refine_cross_point,
+    transform_point_to_aligned,
+    transform_point_to_original,
 )
 
 
@@ -154,6 +157,46 @@ class WaferBoundaryAndMapTests(unittest.TestCase):
         self.assertAlmostEqual(die_map.pitch_y, 90.0, places=3)
         self.assertAlmostEqual(die_map.grid_angle_deg, 2.0, places=3)
         self.assertEqual((die_map.x0, die_map.y0), (600.0, 600.0))
+
+    def test_aligned_image_and_coordinate_round_trip(self):
+        wafer = np.zeros((1200, 1200, 3), np.uint8)
+        cv2.circle(wafer, (600, 600), 520, (80, 160, 205), -1)
+        clip = wafer[344:856, 344:856]
+        points = rotated_points(pitch_x=80.0, pitch_y=90.0, angle_deg=2.0)
+        boxes = np.asarray([[p[0] - 2, p[1] - 2, p[0] + 2, p[1] + 2] for p in points])
+        die_map = build_die_map_from_yolo(wafer, clip, boxes, detection_format="xyxy")
+
+        self.assertIsNotNone(die_map.aligned_image)
+        self.assertEqual(die_map.aligned_image.shape, wafer.shape)
+        self.assertIsNotNone(die_map.original_to_aligned_matrix)
+        self.assertIsNotNone(die_map.aligned_to_original_matrix)
+
+        center_original = (600.0, 600.0)
+        side_clip = points[2 * 5 + 3]
+        side_original = (344.0 + float(side_clip[0]), 344.0 + float(side_clip[1]))
+        center_aligned = transform_point_to_aligned(die_map, center_original)
+        side_aligned = transform_point_to_aligned(die_map, side_original)
+        self.assertAlmostEqual(center_aligned[1], side_aligned[1], places=6)
+        self.assertAlmostEqual(side_aligned[0] - center_aligned[0], 80.0, places=5)
+
+        original = (777.25, 433.75)
+        round_trip = transform_point_to_original(
+            die_map, transform_point_to_aligned(die_map, original)
+        )
+        self.assertTrue(np.allclose(round_trip, original, atol=1e-8))
+
+        aligned, forward, inverse = align_wafer_image(
+            wafer, (die_map.wafer_cx, die_map.wafer_cy), die_map.grid_angle_deg
+        )
+        self.assertEqual(aligned.shape, wafer.shape)
+        identity = np.vstack((forward, (0.0, 0.0, 1.0))) @ np.vstack((inverse, (0.0, 0.0, 1.0)))
+        self.assertTrue(np.allclose(identity, np.eye(3), atol=1e-10))
+
+        without_image = build_die_map_from_yolo(
+            wafer, clip, boxes, detection_format="xyxy", return_aligned_image=False
+        )
+        self.assertIsNone(without_image.aligned_image)
+        self.assertIsNotNone(without_image.original_to_aligned_matrix)
 
 
 if __name__ == "__main__":
