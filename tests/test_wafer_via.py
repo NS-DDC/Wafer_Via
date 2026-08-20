@@ -106,6 +106,10 @@ class YoloCoordinateTests(unittest.TestCase):
         self.assertAlmostEqual(estimate.pitch_y, 91.75, places=5)
         self.assertAlmostEqual(estimate.angle_deg, 3.25, places=5)
         self.assertGreater(estimate.angle_confidence, 0.99)
+        self.assertTrue(estimate.refined)
+        self.assertEqual(estimate.refinement_mode, "auto")
+        self.assertEqual(estimate.raw_points_clip, estimate.points_clip)
+        self.assertEqual(len(estimate.refinement_confidences), len(points))
         self.assertEqual(make_clip_overlay(image, estimate).shape, image.shape)
 
 
@@ -140,6 +144,83 @@ class ColourInvariantRefinementTests(unittest.TestCase):
         point, confidence = refine_cross_point(sample, (66.5, 56.5))
         self.assertGreater(confidence, 0.2)
         self.assertLess(math.hypot(point[0] - 66.5, point[1] - 56.5), 4.0)
+
+    def test_corner_colour_mode_rejects_severe_noise(self):
+        rng = np.random.default_rng(20260820)
+        image = np.full((200, 200, 3), (185, 185, 185), np.uint8)
+        colours = ((24, 65, 210), (205, 55, 45), (55, 185, 85), (165, 45, 190))
+        image[:91, :95] = colours[0]
+        image[:91, 106:] = colours[1]
+        image[104:, :95] = colours[2]
+        image[104:, 106:] = colours[3]
+        noisy = np.clip(
+            image.astype(np.float32) + rng.normal(0.0, 28.0, image.shape),
+            0,
+            255,
+        ).astype(np.uint8)
+        impulse_mask = rng.random(image.shape[:2]) < 0.035
+        noisy[impulse_mask] = rng.integers(
+            0, 256, (int(impulse_mask.sum()), 3), dtype=np.uint8
+        )
+
+        expected = (100.5, 97.0)
+        for mode in ("corner_color", "auto"):
+            point, confidence = refine_cross_point(
+                noisy,
+                (108.0, 88.0),
+                search_radius=30,
+                max_street_width=22,
+                mode=mode,
+                noise_kernel=7,
+            )
+            self.assertGreater(confidence, 0.5)
+            self.assertLess(math.dist(point, expected), 1.0)
+
+    def test_noisy_multicolour_grid_recovers_pitch_and_angle(self):
+        rng = np.random.default_rng(20260820)
+        image = np.full((512, 512, 3), 210, np.uint8)
+        xs = np.asarray((84, 170, 256, 342, 428))
+        ys = np.asarray((72, 164, 256, 348, 440))
+        x_boundaries = [0, 127, 213, 299, 385, 512]
+        y_boundaries = [0, 118, 210, 302, 394, 512]
+        for row in range(5):
+            for column in range(5):
+                image[
+                    y_boundaries[row]:y_boundaries[row + 1],
+                    x_boundaries[column]:x_boundaries[column + 1],
+                ] = rng.integers(25, 225, 3, dtype=np.uint8)
+        for x in xs:
+            image[:, x - 5:x + 6] = 210
+        for y in ys:
+            image[y - 5:y + 6, :] = 210
+        image = np.clip(
+            image.astype(np.float32) + rng.normal(0.0, 18.0, image.shape),
+            0,
+            255,
+        ).astype(np.uint8)
+
+        rotation = cv2.getRotationMatrix2D((256.0, 256.0), 3.0, 1.0)
+        rotated = cv2.warpAffine(
+            image, rotation, (512, 512), flags=cv2.INTER_LINEAR,
+            borderMode=cv2.BORDER_REFLECT,
+        )
+        detections = np.asarray(
+            [(x, y, 1.0) for y in ys for x in xs], dtype=np.float64
+        ) @ rotation.T
+        detections += rng.uniform(-7.0, 7.0, detections.shape)
+
+        estimate = estimate_grid_from_yolo(
+            rotated,
+            detections,
+            detection_format="point",
+            refine=True,
+            refine_radius=22,
+            refine_mode="auto",
+        )
+        self.assertLess(abs(estimate.pitch_x - 86.0), 0.6)
+        self.assertLess(abs(estimate.pitch_y - 92.0), 0.1)
+        self.assertLess(abs(estimate.angle_deg - (-3.0)), 0.2)
+        self.assertLess(math.dist(estimate.center_corner_clip, (256.0, 256.0)), 0.3)
 
 
 class WaferBoundaryAndMapTests(unittest.TestCase):
@@ -199,6 +280,33 @@ class WaferBoundaryAndMapTests(unittest.TestCase):
         self.assertAlmostEqual(die_map.pitch_y, 90.0, places=3)
         self.assertAlmostEqual(die_map.grid_angle_deg, 2.0, places=3)
         self.assertEqual((die_map.x0, die_map.y0), (600.0, 600.0))
+
+    def test_grid_origin_uses_wafer_center_not_image_center(self):
+        wafer = np.zeros((1200, 1200, 3), np.uint8)
+        cv2.circle(wafer, (650, 600), 500, (80, 160, 205), -1)
+        clip = wafer[344:856, 344:856].copy()  # image-centred 512x512 clip
+        detections = np.asarray([
+            (256.0 + 80.0 * ix, 256.0 + 90.0 * iy)
+            for iy in range(-2, 3)
+            for ix in range(-2, 3)
+        ])
+
+        die_map = build_die_map_from_yolo(
+            wafer,
+            clip,
+            detections,
+            detection_format="point",
+            refine=False,
+            return_aligned_image=False,
+        )
+
+        self.assertEqual((die_map.wafer_cx, die_map.wafer_cy), (650, 600))
+        self.assertEqual(die_map.grid_estimate.center_corner_clip, (336.0, 256.0))
+        self.assertEqual((die_map.x0, die_map.y0), (680.0, 600.0))
+        self.assertLess(
+            math.dist((die_map.x0, die_map.y0), (650.0, 600.0)),
+            math.dist((600.0, 600.0), (650.0, 600.0)),
+        )
 
     def test_aligned_image_and_coordinate_round_trip(self):
         wafer = np.zeros((1200, 1200, 3), np.uint8)

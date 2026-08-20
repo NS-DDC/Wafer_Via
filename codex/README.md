@@ -2,7 +2,7 @@
 
 학습된 YOLO가 512×512 중앙 clip에서 찾은 여러 십자점으로 다음 정보만 생성합니다.
 
-- 중앙에 가장 가까운 `center_corner`
+- 검출된 wafer 중심에 가장 가까운 `center_corner` (`(0,0)` die/grid origin)
 - 중앙 코너의 옆 점으로 `pitch_x`
 - 중앙 코너의 아래 점으로 `pitch_y`
 - 두 축 벡터로 회전 보정각 `angle_deg`
@@ -10,19 +10,25 @@
 - 원본(예: 10000×10000) 좌표계의 회전 die map
 - `locate_die`와 clip/full-wafer overlay
 
-die/street의 RGB·HSV 색상 임계값은 사용하지 않습니다. YOLO 좌표가 기준이며 `refine=True`일 때만 Lab 경계의 쌍을 이용해 street 중앙을 미세 보정합니다.
+die/street의 고정 RGB·HSV 색상 임계값은 사용하지 않습니다. 기본 `refine=True`, `refine_mode="auto"`는 각 YOLO 점 주변 네 꼭짓점의 die 색상을 현장에서 학습하고, 그 색들과 다른 수직/수평 band 및 Lab 경계쌍을 결합해 street 교차 중심을 미세 보정합니다.
 
 ## 빠른 사용법
 
 ```python
 import cv2
-from codex.wafer_via import build_die_map_from_yolo, locate_die, make_wafer_overlay
+from codex.wafer_via import (
+    build_die_map_from_yolo,
+    locate_die,
+    make_clip_overlay,
+    make_wafer_overlay,
+)
 
 dm = build_die_map_from_yolo(
     wafer_image="wafer_10000.png",
     clip_image="center_clip_512.png",
     detections="center_clip_512.txt",  # YOLO: class cx cy w h (normalized)
-    refine=False,                       # 모델 bbox 중심을 그대로 쓰는 기본값
+    refine=True,                        # 기본값: 노이즈 억제 + 로컬 corner 색상 보정
+    refine_mode="auto",                # auto | corner_color | gradient
 )
 
 print(dm.x0, dm.y0)                     # full image 기준 center corner
@@ -35,6 +41,19 @@ print(result["die_index"], result["die_polygon_px"])
 
 overlay = make_wafer_overlay("wafer_10000.png", dm)
 cv2.imwrite("wafer_overlay.png", overlay)
+```
+
+현재 사용 중인 Ultralytics `boxes.xywh`는 다음 형태가 가장 권장됩니다.
+
+```python
+detections = results[0].boxes.xywh.cpu().numpy()
+
+dm = build_die_map_from_yolo(
+    wafer_image,
+    clip_image,
+    detections=detections,
+    detection_format="xywh",
+)
 ```
 
 Ultralytics의 `boxes.xyxy`도 바로 전달할 수 있습니다.
@@ -163,7 +182,7 @@ WaferDieMap (dm)
 |---|---|---|
 | `wafer_cx`, `wafer_cy` | `int` | full image에서 검출한 wafer 중심 픽셀 |
 | `wafer_r` | `int` | wafer 외곽 contour의 최소 외접원 반지름 |
-| `x0`, `y0` | `float` | full image 좌표계의 center corner/grid origin |
+| `x0`, `y0` | `float` | 검출된 wafer 중심에 가장 가까운 십자점. full image 좌표계의 `(0,0)` grid origin |
 | `pitch_x`, `pitch_y` | `float` | 옆 점과 아래 점으로 계산한 실제 grid 간격(px) |
 | `die_w`, `die_h` | `int` | `round(pitch_x)`, `round(pitch_y)` 호환 필드 |
 | `grid_angle_deg` | `float` | 오른쪽 grid축의 영상 기준 기울기(deg) |
@@ -269,7 +288,7 @@ if grid is not None:
 | 필드 | 의미 |
 |---|---|
 | `points_clip` | confidence 필터링과 중복 제거 후 사용한 전체 YOLO 십자점 |
-| `center_corner_clip` | 512 clip 중심에 가장 가까워 center corner로 선택된 점 |
+| `center_corner_clip` | full wafer 중심을 clip 좌표로 변환한 기준점에 가장 가까워 선택된 십자점 |
 | `side_corner_clip` | center corner의 같은 row에서 선택한 가장 가까운 옆 점 |
 | `below_corner_clip` | center corner의 같은 column에서 선택한 가장 가까운 아래 점 |
 | `pitch_x` | center → side 벡터 길이 |
@@ -278,9 +297,53 @@ if grid is not None:
 | `angle_y_deg` | center → below 벡터로 계산한 각도 |
 | `angle_deg` | `angle_x_deg`와 `angle_y_deg`를 결합한 최종 각도 |
 | `angle_confidence` | 두 각도가 얼마나 일치하는지 나타내는 값 |
-| `refined` | Lab 경계 기반 미세 보정을 적용했는지 여부 |
+| `refined` | 중심 미세 보정 단계를 실행했는지 여부 |
+| `raw_points_clip` | 보정 전 YOLO bbox 중심 좌표들 |
+| `points_clip` | confidence 안전장치 적용 후 실제 pitch/angle 계산에 사용한 좌표들 |
+| `refinement_confidences` | 각 점의 중심 보정 confidence (`0.0~1.0`) |
+| `refinement_mode` | `auto`, `corner_color`, `gradient`, 또는 보정하지 않은 `none` |
 
 `angle_confidence`는 YOLO 모델 confidence 평균이 아닙니다. 두 직교축에서 구한 회전각의 일치도를 나타냅니다.
+
+### 3-A. 노이즈가 심한 이미지의 중심 보정
+
+`auto` 모드는 각 YOLO bbox 중심 주위의 작은 ROI만 사용합니다. ROI의 네 꼭짓점 patch에서 각각 median Lab 색상을 구한 후, 네 die 색상 중 어느 것과도 닮지 않은 픽셀을 street 후보로 만듭니다. 따라서 네 die가 서로 다른 색이어도 되고, 특정 초록색 또는 빨간색을 코드에 고정하지 않습니다. Median filter와 X/Y projection으로 점 잡음과 작은 die 내부 무늬를 줄인 뒤 기존 Lab 경계쌍 결과와 결합합니다.
+
+```python
+dm = build_die_map_from_yolo(
+    wafer_bgr,
+    center_clip_bgr,
+    detections=results[0].boxes.xywh.cpu().numpy(),
+    detection_format="xywh",
+    refine=True,                         # 기본값이므로 생략 가능
+    refine_mode="auto",
+    refine_radius=24,                    # YOLO 중심 오차보다 크게
+    refine_corner_patch_ratio=0.22,      # 로컬 ROI 꼭짓점 reference 영역
+    refine_corner_reference_weight=0.70,
+    refine_noise_kernel=5,               # 강한 점 잡음은 5 또는 7
+    refine_min_confidence=0.15,          # 낮으면 YOLO 원좌표 유지
+)
+```
+
+모드의 차이:
+
+- `auto`: corner 색상 차이와 Lab 경계를 결합하는 기본 권장 모드입니다.
+- `corner_color`: 로컬 네 corner die 색상과 다른 band만 사용합니다.
+- `gradient`: 기존 Lab 양방향 경계쌍만 사용합니다.
+
+먼저 `refine_radius`를 실제 YOLO 중심 최대 오차보다 조금 크게 맞추십시오. 실제 교차점이 ROI 밖이면 어떤 방식도 올바른 중심을 찾을 수 없습니다. `refine_min_confidence`보다 낮은 결과는 자동 폐기되고 원래 YOLO 중심이 사용됩니다.
+
+```python
+grid = dm.grid_estimate
+print(grid.raw_points_clip)             # 보정 전
+print(grid.points_clip)                 # 보정 후/실제 사용 좌표
+print(grid.refinement_confidences)      # 점별 신뢰도
+
+debug = make_clip_overlay(center_clip_bgr, grid)
+cv2.imwrite("clip_refinement_overlay.png", debug)
+```
+
+진단 overlay에서 흰색 빈 원은 YOLO 원좌표, 노란 점은 보정 후 좌표, 둘 사이 회색 선은 이동량입니다. 초록점은 최종 center corner입니다. 실제 이미지에서 이동 방향이 일관되는지 확인한 뒤 `refine_radius`, `refine_noise_kernel`, `refine_corner_patch_ratio`를 조정하십시오.
 
 ### 4. `WaferBoundary`: wafer 외곽선 결과
 

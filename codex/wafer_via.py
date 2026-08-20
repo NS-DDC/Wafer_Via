@@ -22,6 +22,7 @@ Point = Tuple[float, float]
 DetectionFormat = Literal[
     "auto", "point", "point_conf", "xyxy", "xywh", "yolo_txt", "xyxy_conf_class"
 ]
+RefinementMode = Literal["auto", "gradient", "corner_color"]
 
 __all__ = [
     "GridEstimate",
@@ -82,6 +83,9 @@ class GridEstimate:
     angle_y_deg: float
     angle_confidence: float
     refined: bool = False
+    raw_points_clip: Tuple[Point, ...] = ()
+    refinement_confidences: Tuple[float, ...] = ()
+    refinement_mode: str = "none"
 
     def to_dict(self) -> Dict[str, Any]:
         return {
@@ -96,6 +100,9 @@ class GridEstimate:
             "angle_y_deg": self.angle_y_deg,
             "angle_confidence": self.angle_confidence,
             "refined": self.refined,
+            "raw_points_clip": list(self.raw_points_clip),
+            "refinement_confidences": list(self.refinement_confidences),
+            "refinement_mode": self.refinement_mode,
         }
 
 
@@ -444,19 +451,131 @@ def _profile_street_center(profile: np.ndarray, approximate: float, max_width: i
     return (best_center, confidence) if confidence >= 0.08 else (float(approximate), 0.0)
 
 
+def _odd_kernel(value: int, maximum: int) -> int:
+    kernel = max(1, int(value))
+    if kernel % 2 == 0:
+        kernel += 1
+    largest = max(1, int(maximum))
+    if largest % 2 == 0:
+        largest -= 1
+    return min(kernel, largest)
+
+
+def _profile_colour_band_center(
+    profile: np.ndarray,
+    approximate: float,
+    max_shift: float,
+) -> Tuple[float, float]:
+    """Find the centre of a high colour-distance band near an approximate point."""
+
+    values = np.asarray(profile, dtype=np.float32).reshape(-1)
+    if values.size < 7:
+        return float(approximate), 0.0
+    values = cv2.GaussianBlur(values.reshape(1, -1), (0, 0), 1.2).ravel()
+    baseline = float(np.percentile(values, 25))
+    high = float(np.percentile(values, 95))
+    contrast = high - baseline
+    if contrast <= 1e-6:
+        return float(approximate), 0.0
+
+    coordinates = np.arange(values.size, dtype=np.float32)
+    allowed = np.abs(coordinates - float(approximate)) <= float(max_shift)
+    proximity = np.exp(-np.abs(coordinates - float(approximate)) / max(2.0, max_shift * 0.45))
+    score = (values - baseline) * proximity
+    score[~allowed] = -np.inf
+    peak_index = int(np.argmax(score))
+    if not np.isfinite(score[peak_index]) or values[peak_index] <= baseline:
+        return float(approximate), 0.0
+
+    threshold = baseline + 0.45 * (float(values[peak_index]) - baseline)
+    left = peak_index
+    right = peak_index
+    while left > 0 and values[left - 1] >= threshold:
+        left -= 1
+    while right + 1 < values.size and values[right + 1] >= threshold:
+        right += 1
+    band_coordinates = coordinates[left:right + 1]
+    weights = np.maximum(values[left:right + 1] - baseline, 1e-6)
+    center = float(np.average(band_coordinates, weights=weights))
+    peak_contrast = max(0.0, float(values[peak_index]) - baseline)
+    confidence = float(np.clip(peak_contrast / contrast, 0.0, 1.0))
+    confidence *= float(math.exp(-abs(center - approximate) / max(2.0, max_shift)))
+    return center, confidence
+
+
+def _corner_colour_candidate(
+    roi_bgr: np.ndarray,
+    approximate_local: Point,
+    *,
+    corner_patch_ratio: float,
+    noise_kernel: int,
+) -> Tuple[Point, float]:
+    """Find a cross band unlike all four local corner-die reference colours."""
+
+    height, width = roi_bgr.shape[:2]
+    if min(height, width) < 9:
+        return approximate_local, 0.0
+    kernel = _odd_kernel(noise_kernel, min(height, width))
+    filtered = cv2.medianBlur(roi_bgr, kernel) if kernel >= 3 else roi_bgr
+    lab = cv2.cvtColor(filtered, cv2.COLOR_BGR2LAB).astype(np.float32)
+    patch = int(round(min(height, width) * float(corner_patch_ratio)))
+    patch = int(np.clip(patch, 3, max(3, min(height, width) // 3)))
+    corner_patches = (
+        lab[:patch, :patch],
+        lab[:patch, width - patch:],
+        lab[height - patch:, :patch],
+        lab[height - patch:, width - patch:],
+    )
+    references = np.asarray(
+        [np.median(corner.reshape(-1, 3), axis=0) for corner in corner_patches],
+        dtype=np.float32,
+    )
+    difference = lab[:, :, None, :] - references[None, None, :, :]
+    distance_to_die = np.sqrt(np.sum(difference * difference, axis=3)).min(axis=2)
+    # OpenCV supports large median kernels for uint8 images, while float32
+    # medianBlur is limited to small kernels. The source image already receives
+    # the requested denoising above, so a maximum 5x5 response filter is enough.
+    response_kernel = _odd_kernel(min(noise_kernel, 5), min(height, width))
+    if response_kernel >= 3:
+        distance_to_die = cv2.medianBlur(distance_to_die.astype(np.float32), response_kernel)
+
+    vertical_profile = np.median(distance_to_die, axis=0)
+    horizontal_profile = np.median(distance_to_die, axis=1)
+    max_shift = max(4.0, min(height, width) * 0.35)
+    center_x, confidence_x = _profile_colour_band_center(
+        vertical_profile, float(approximate_local[0]), max_shift
+    )
+    center_y, confidence_y = _profile_colour_band_center(
+        horizontal_profile, float(approximate_local[1]), max_shift
+    )
+    confidence = math.sqrt(confidence_x * confidence_y)
+    return (float(center_x), float(center_y)), float(confidence)
+
+
 def refine_cross_point(
     clip_image: ImageInput,
     approximate_point: Point,
     *,
     search_radius: int = 18,
     max_street_width: Optional[int] = None,
+    mode: RefinementMode = "auto",
+    corner_patch_ratio: float = 0.22,
+    corner_reference_weight: float = 0.70,
+    noise_kernel: int = 5,
 ) -> Tuple[Point, float]:
     """Optionally refine a model point to the centre of the crossing streets.
 
-    The two street centres are midpoints of paired Lab-gradient boundaries.
-    Median projection suppresses sparse marks/noise and no hue is hard-coded.
+    ``gradient`` uses paired Lab-gradient boundaries. ``corner_color`` learns
+    the four local corner-die colours and selects bands unlike all of them.
+    ``auto`` combines both, preferring the corner-colour cue under noise.
     """
 
+    if mode not in ("auto", "gradient", "corner_color"):
+        raise ValueError("mode must be 'auto', 'gradient', or 'corner_color'.")
+    if not (0.05 <= float(corner_patch_ratio) <= 0.33):
+        raise ValueError("corner_patch_ratio must be between 0.05 and 0.33.")
+    if not (0.0 <= float(corner_reference_weight) <= 1.0):
+        raise ValueError("corner_reference_weight must be between 0.0 and 1.0.")
     image = _load_bgr(clip_image)
     height, width = image.shape[:2]
     ax, ay = float(approximate_point[0]), float(approximate_point[1])
@@ -483,10 +602,48 @@ def refine_cross_point(
     street_width = int(max_street_width or max(8, radius))
     local_x, confidence_x = _profile_street_center(vertical_profile, ax - x1, street_width)
     local_y, confidence_y = _profile_street_center(horizontal_profile, ay - y1, street_width)
-    confidence = math.sqrt(confidence_x * confidence_y)
-    if confidence <= 0.0:
+    gradient_confidence = math.sqrt(confidence_x * confidence_y)
+    gradient_point = (float(x1 + local_x), float(y1 + local_y))
+
+    colour_local, colour_confidence = _corner_colour_candidate(
+        roi,
+        (ax - x1, ay - y1),
+        corner_patch_ratio=corner_patch_ratio,
+        noise_kernel=noise_kernel,
+    )
+    colour_point = (float(x1 + colour_local[0]), float(y1 + colour_local[1]))
+
+    if mode == "gradient":
+        return (gradient_point, float(gradient_confidence)) if gradient_confidence > 0.0 else ((ax, ay), 0.0)
+    if mode == "corner_color":
+        return (colour_point, float(colour_confidence)) if colour_confidence > 0.0 else ((ax, ay), 0.0)
+    if gradient_confidence <= 0.0 and colour_confidence <= 0.0:
         return (ax, ay), 0.0
-    return (float(x1 + local_x), float(y1 + local_y)), float(confidence)
+    if colour_confidence <= 0.0:
+        return gradient_point, float(gradient_confidence)
+    if gradient_confidence <= 0.0:
+        return colour_point, float(colour_confidence)
+
+    disagreement = math.dist(gradient_point, colour_point)
+    colour_weight = float(corner_reference_weight) * colour_confidence
+    gradient_weight = (1.0 - float(corner_reference_weight)) * gradient_confidence
+    if disagreement > max(4.0, radius * 0.55):
+        if colour_weight >= gradient_weight:
+            return colour_point, float(colour_confidence)
+        return gradient_point, float(gradient_confidence)
+    total_weight = colour_weight + gradient_weight
+    if total_weight <= 1e-9:
+        return colour_point, float(colour_confidence)
+    combined = (
+        (colour_point[0] * colour_weight + gradient_point[0] * gradient_weight) / total_weight,
+        (colour_point[1] * colour_weight + gradient_point[1] * gradient_weight) / total_weight,
+    )
+    combined_confidence = float(np.clip(
+        max(colour_confidence, gradient_confidence) * math.exp(-disagreement / max(4.0, radius)),
+        0.0,
+        1.0,
+    ))
+    return combined, combined_confidence
 
 
 # [SECTOR: 30_GRID_ESTIMATION] ------------------------------------------------
@@ -557,19 +714,33 @@ def estimate_grid_from_yolo(
     clip_image: ImageInput,
     detections: Union[str, Path, np.ndarray, Sequence[Any]],
     *,
+    reference_point_clip: Optional[Point] = None,
     detection_format: DetectionFormat = "auto",
     normalized: Optional[bool] = None,
     confidence_threshold: float = 0.25,
-    refine: bool = False,
+    refine: bool = True,
     refine_radius: int = 18,
+    refine_mode: RefinementMode = "auto",
+    refine_max_street_width: Optional[int] = None,
+    refine_corner_patch_ratio: float = 0.22,
+    refine_corner_reference_weight: float = 0.70,
+    refine_noise_kernel: int = 5,
+    refine_min_confidence: float = 0.15,
     max_rotation_deg: float = 20.0,
     axis_tolerance: float = 0.18,
     perpendicular_tolerance_px: float = 5.0,
     max_axis_disagreement_deg: float = 3.0,
     strict: bool = True,
 ) -> GridEstimate:
-    """Select the centre, adjacent side, and adjacent below cross-points."""
+    """Select the reference-nearest corner and its side/below neighbours.
 
+    ``reference_point_clip`` is normally the detected full-wafer centre
+    transformed into clip coordinates. Standalone calls fall back to the clip
+    image centre for backwards compatibility.
+    """
+
+    if not (0.0 <= float(refine_min_confidence) <= 1.0):
+        raise ValueError("refine_min_confidence must be between 0.0 and 1.0.")
     image = _load_bgr(clip_image)
     height, width = image.shape[:2]
     points = parse_yolo_points(
@@ -581,11 +752,36 @@ def estimate_grid_from_yolo(
     )
     if len(points) < 3:
         raise ValueError(f"At least three YOLO cross-points are required; received {len(points)}.")
+    raw_points = list(points)
+    refinement_confidences = [0.0] * len(points)
     if refine:
-        points = [refine_cross_point(image, point, search_radius=refine_radius)[0] for point in points]
+        refined_points: List[Point] = []
+        refinement_confidences = []
+        for point in raw_points:
+            candidate, candidate_confidence = refine_cross_point(
+                image,
+                point,
+                search_radius=refine_radius,
+                max_street_width=refine_max_street_width,
+                mode=refine_mode,
+                corner_patch_ratio=refine_corner_patch_ratio,
+                corner_reference_weight=refine_corner_reference_weight,
+                noise_kernel=refine_noise_kernel,
+            )
+            confidence_value = float(candidate_confidence)
+            refinement_confidences.append(confidence_value)
+            refined_points.append(
+                candidate if confidence_value >= float(refine_min_confidence) else point
+            )
+        points = refined_points
     array = np.asarray(points, dtype=np.float64)
-    clip_center = np.array((width / 2.0, height / 2.0), dtype=np.float64)
-    center_index = int(np.argmin(np.linalg.norm(array - clip_center, axis=1)))
+    selection_reference = np.asarray(
+        reference_point_clip if reference_point_clip is not None else (width / 2.0, height / 2.0),
+        dtype=np.float64,
+    ).reshape(-1)
+    if selection_reference.size != 2 or not np.all(np.isfinite(selection_reference)):
+        raise ValueError("reference_point_clip must contain two finite coordinates.")
+    center_index = int(np.argmin(np.linalg.norm(array - selection_reference, axis=1)))
     center = array[center_index]
     orientation = _estimate_grid_orientation(array, max_rotation_deg)
     angle = math.radians(orientation)
@@ -633,6 +829,9 @@ def estimate_grid_from_yolo(
         angle_y_deg=float(angle_y),
         angle_confidence=confidence,
         refined=bool(refine),
+        raw_points_clip=tuple(_point(point) for point in raw_points),
+        refinement_confidences=tuple(refinement_confidences),
+        refinement_mode=refine_mode if refine else "none",
     )
 
 
@@ -964,6 +1163,13 @@ def transform_point_to_original(die_map: WaferDieMap, point: Point) -> Point:
 # [SECTOR: 70_OVERLAY] --------------------------------------------------------
 def make_clip_overlay(clip_image: ImageInput, estimate: GridEstimate) -> np.ndarray:
     overlay = _load_bgr(clip_image).copy()
+    if estimate.raw_points_clip:
+        for raw_point, refined_point in zip(estimate.raw_points_clip, estimate.points_clip):
+            raw = tuple(np.rint(raw_point).astype(int))
+            refined = tuple(np.rint(refined_point).astype(int))
+            cv2.circle(overlay, raw, 3, (255, 255, 255), 1, cv2.LINE_AA)
+            if raw != refined:
+                cv2.line(overlay, raw, refined, (190, 190, 190), 1, cv2.LINE_AA)
     for point in estimate.points_clip:
         cv2.circle(overlay, tuple(np.rint(point).astype(int)), 4, (0, 215, 255), -1, cv2.LINE_AA)
     center = tuple(np.rint(estimate.center_corner_clip).astype(int))
@@ -972,7 +1178,10 @@ def make_clip_overlay(clip_image: ImageInput, estimate: GridEstimate) -> np.ndar
     cv2.circle(overlay, center, 7, (0, 255, 0), -1, cv2.LINE_AA)
     cv2.arrowedLine(overlay, center, side, (255, 120, 0), 2, cv2.LINE_AA, tipLength=0.12)
     cv2.arrowedLine(overlay, center, below, (255, 0, 255), 2, cv2.LINE_AA, tipLength=0.12)
-    label = f"Px={estimate.pitch_x:.2f} Py={estimate.pitch_y:.2f} A={estimate.angle_deg:.3f}deg"
+    label = (
+        f"Px={estimate.pitch_x:.2f} Py={estimate.pitch_y:.2f} "
+        f"A={estimate.angle_deg:.3f}deg R={estimate.refinement_mode}"
+    )
     cv2.putText(overlay, label, (8, max(20, overlay.shape[0] - 10)),
                 cv2.FONT_HERSHEY_SIMPLEX, 0.45, (0, 0, 0), 3, cv2.LINE_AA)
     cv2.putText(overlay, label, (8, max(20, overlay.shape[0] - 10)),
@@ -1011,7 +1220,14 @@ def build_die_map_from_yolo(
     detection_format: DetectionFormat = "auto",
     normalized: Optional[bool] = None,
     confidence_threshold: float = 0.25,
-    refine: bool = False,
+    refine: bool = True,
+    refine_radius: int = 18,
+    refine_mode: RefinementMode = "auto",
+    refine_max_street_width: Optional[int] = None,
+    refine_corner_patch_ratio: float = 0.22,
+    refine_corner_reference_weight: float = 0.70,
+    refine_noise_kernel: int = 5,
+    refine_min_confidence: float = 0.15,
     pixel_per_unit: float = 32.0,
     include_edge: bool = True,
     edge_margin: float = 1.0,
@@ -1035,16 +1251,28 @@ def build_die_map_from_yolo(
     clip_height, clip_width = clip.shape[:2]
     if clip_origin is None:
         clip_origin = ((full_width - clip_width) / 2.0, (full_height - clip_height) / 2.0)
+    boundary = detect_wafer_boundary(wafer, max_dimension=boundary_max_dimension)
+    wafer_center_clip = (
+        float(boundary.center_px[0]) - float(clip_origin[0]),
+        float(boundary.center_px[1]) - float(clip_origin[1]),
+    )
     estimate = estimate_grid_from_yolo(
         clip, detections,
+        reference_point_clip=wafer_center_clip,
         detection_format=detection_format,
         normalized=normalized,
         confidence_threshold=confidence_threshold,
         refine=refine,
+        refine_radius=refine_radius,
+        refine_mode=refine_mode,
+        refine_max_street_width=refine_max_street_width,
+        refine_corner_patch_ratio=refine_corner_patch_ratio,
+        refine_corner_reference_weight=refine_corner_reference_weight,
+        refine_noise_kernel=refine_noise_kernel,
+        refine_min_confidence=refine_min_confidence,
     )
     origin_full = (clip_origin[0] + estimate.center_corner_clip[0],
                    clip_origin[1] + estimate.center_corner_clip[1])
-    boundary = detect_wafer_boundary(wafer, max_dimension=boundary_max_dimension)
     die_map = generate_die_map(
         boundary, (full_height, full_width), origin_full,
         estimate.pitch_x, estimate.pitch_y, estimate.angle_deg,
@@ -1138,7 +1366,7 @@ build_die_map = build_die_map_from_yolo
 #     [256.1, 169.5],
 #     [345.9, 174.1],
 #     [161.5, 256.3],
-#     [251.4, 260.9],  # clip 중앙에 가장 가까운 점 -> center corner 후보
+#     [251.4, 260.9],  # 검출된 wafer 중심에 가장 가까운 점 -> center corner 후보
 #     [341.3, 265.6],  # center corner 옆 점 -> pitch_x 계산
 #     [246.7, 352.8],  # center corner 아래 점 -> pitch_y 계산
 # ], dtype=np.float32)
@@ -1227,7 +1455,10 @@ build_die_map = build_die_map_from_yolo
 #     detection_format="xyxy_conf_class",
 #     normalized=False,
 #     confidence_threshold=0.25,
-#     refine=False,                   # 기본 권장: YOLO box 중심을 그대로 사용
+#     refine=True,                    # 기본값: 코너 die 색상 + Lab 경계로 중심 보정
+#     refine_mode="auto",            # auto | corner_color | gradient
+#     refine_radius=18,               # YOLO 중심 주변 탐색 반경(px)
+#     refine_min_confidence=0.15,     # 이보다 낮으면 YOLO 원좌표 유지
 #     pixel_per_unit=32.0,            # 실좌표 환산용 px/unit
 #     include_edge=True,              # wafer 외곽의 partial die도 map에 포함
 #     edge_margin=1.0,
@@ -1238,6 +1469,9 @@ build_die_map = build_die_map_from_yolo
 #
 # exact center clip이면 clip_origin은 생략할 수 있습니다.
 # 하지만 생산 코드에서는 clip 위치 실수를 방지하기 위해 명시하는 것을 권장합니다.
+# 전체 image 중심과 실제 wafer 중심이 달라도 괜찮습니다. build_die_map_from_yolo()는
+# 먼저 wafer 외곽선을 검출하고, wafer 중심을 clip 좌표로 변환한 뒤 가장 가까운
+# YOLO 십자점을 (0,0) grid origin으로 선택합니다.
 #
 # -----------------------------------------------------------------------------
 # 예제 4. 반환값에서 center corner, pitch, angle 확인
@@ -1324,7 +1558,9 @@ build_die_map = build_die_map_from_yolo
 #   - 초록점: 선택된 center corner
 #   - 파란 화살표: pitch_x를 만든 옆 점 방향
 #   - 자홍 화살표: pitch_y를 만든 아래 점 방향
-#   - 노란점: YOLO가 전달한 전체 십자점
+#   - 흰색 빈 원: 보정 전 YOLO bbox 중심
+#   - 회색 선: 보정 전 중심에서 보정 후 중심까지의 이동량
+#   - 노란점: 실제 pitch/angle 계산에 사용한 보정 후 십자점
 #
 # -----------------------------------------------------------------------------
 # 예제 8-B. angle 보정된 full image 저장과 좌표 변환
@@ -1374,7 +1610,7 @@ build_die_map = build_die_map_from_yolo
 # 메모리가 부족하면 draw_dies=False로 외곽선/기준점만 확인하거나 작은 preview를 씁니다.
 #
 # -----------------------------------------------------------------------------
-# 예제 10. YOLO 중심좌표가 street 중앙에서 약간 벗어날 때만 refine 사용
+# 예제 10. 노이즈가 심하고 YOLO 중심좌표가 street 중앙에서 벗어난 경우
 # -----------------------------------------------------------------------------
 #
 # dm = build_die_map_from_yolo(
@@ -1382,18 +1618,51 @@ build_die_map = build_die_map_from_yolo
 #     center_clip_bgr,
 #     yolo_data,
 #     clip_origin=clip_origin,
-#     detection_format="xyxy_conf_class",
+#     detection_format="xywh",
 #     refine=True,
+#     refine_mode="auto",
+#     refine_radius=24,               # 예상 bbox 오차보다 조금 크게 설정
+#     refine_corner_patch_ratio=0.22,
+#     refine_corner_reference_weight=0.70,
+#     refine_noise_kernel=5,
+#     refine_min_confidence=0.15,
 # )
 #
 # refine=False:
-#   - 기본 권장값입니다.
 #   - 학습 모델의 bbox 중심을 신뢰하고 색상 영향을 전혀 받지 않습니다.
+#   - 보정 전/후 결과 비교 또는 영상에 실제 street가 보이지 않을 때 사용합니다.
 #
-# refine=True:
-#   - YOLO 좌표 주변의 Lab 양방향 경계를 이용해 street 중심을 미세 보정합니다.
-#   - 특정 빨강/초록/파랑 hue를 임계값으로 사용하지 않습니다.
-#   - YOLO 점이 실제 십자점에서 너무 멀면 잘못된 경계를 선택할 수 있으므로 overlay를 확인합니다.
+# refine=True (기본값), refine_mode="auto":
+#   1) 각 YOLO 점 주변 ROI의 네 꼭짓점 patch에서 die 대표색을 각각 median으로 학습합니다.
+#   2) 네 die 대표색 중 어느 것과도 다른 픽셀을 street 후보로 만듭니다.
+#   3) median filter와 X/Y projection으로 강한 점 노이즈를 억제하고 교차 중심을 찾습니다.
+#   4) 동시에 Lab 양방향 경계쌍으로 구한 중심과 결합합니다.
+#   5) 보정 confidence가 refine_min_confidence보다 낮으면 YOLO 원좌표를 그대로 씁니다.
+#
+# 색상 관련 중요 사항:
+#   - 특정 빨강/초록/파랑 hue나 고정 RGB/HSV threshold를 사용하지 않습니다.
+#   - 네 corner die가 서로 다른 색이어도 각각을 reference로 사용합니다.
+#   - street 색이 corner die 중 하나와 비슷하면 corner_color confidence가 낮아지고
+#     auto가 Lab gradient 결과를 사용합니다.
+#
+# 모드 선택:
+#   - auto: 기본 권장. corner_color와 gradient를 함께 사용합니다.
+#   - corner_color: 네 corner die 색상과 다른 band만 사용합니다.
+#   - gradient: 기존 Lab 경계쌍 방식만 사용합니다.
+#
+# 튜닝 순서:
+#   - 실제 중심이 탐색 범위 밖이면 refine_radius를 키웁니다(예: 18 -> 24/30).
+#   - salt-and-pepper 노이즈가 강하면 refine_noise_kernel을 5 또는 7로 둡니다.
+#   - die 내부 무늬가 corner patch를 많이 차지하면 refine_corner_patch_ratio를
+#     0.15~0.28 범위에서 조정합니다.
+#   - make_clip_overlay()로 흰 원 -> 노란 점 이동 방향을 반드시 확인합니다.
+#
+# 보정 상세값:
+# estimate = dm.grid_estimate
+# print(estimate.raw_points_clip)          # 보정 전 YOLO 중심들
+# print(estimate.points_clip)              # 실제 계산에 사용된 보정 후 중심들
+# print(estimate.refinement_confidences)   # 점별 보정 confidence
+# print(estimate.refinement_mode)          # auto / corner_color / gradient / none
 #
 # -----------------------------------------------------------------------------
 # 예제 11. 중앙이 아닌 위치에서 512 clip을 만든 경우
