@@ -70,6 +70,36 @@ class ViaCheckerMeanCenterTest(unittest.TestCase):
         self.assertEqual("VIA_MISSING", rows[0]["status"])
         self.assertEqual(0, int(np.count_nonzero(via_bin)))
 
+    def test_actual_center_pixel_accepts_blob_with_far_centroid(self):
+        # 덩어리 무게중심은 허용거리 밖이지만 실제 어두운 픽셀은 중앙영역에 닿습니다.
+        shifted = (self.CENTER[0] + 9, self.CENTER[1])
+        code, _, via_bin, rows = self._run(
+            lambda image: cv2.circle(image, shifted, 4, (5, 5, 5), -1))
+
+        self.assertEqual(CODE_OK, code)
+        self.assertEqual("OK", rows[0]["status"])
+        self.assertGreater(rows[0]["offset_px"], rows[0]["search_radius"])
+        self.assertLessEqual(
+            rows[0]["nearest_center_pixel_distance"], rows[0]["search_radius"])
+        self.assertGreater(rows[0]["center_zone_pixels"], 0)
+        self.assertGreater(int(np.count_nonzero(via_bin)), 0)
+
+    def test_best_prefers_nearest_actual_pixel_over_nearest_centroid(self):
+        # 오른쪽 작은 덩어리는 무게중심이 더 가깝지만, 왼쪽 큰 덩어리의 실제
+        # 픽셀이 PAD 중심에 더 가깝습니다. best는 왼쪽 덩어리여야 합니다.
+        def draw(image):
+            cv2.circle(image, (self.CENTER[0] - 9, self.CENTER[1]),
+                       7, (5, 5, 5), -1)
+            cv2.circle(image, (self.CENTER[0] + 5, self.CENTER[1]),
+                       2, (5, 5, 5), -1)
+
+        code, _, via_bin, rows = self._run(draw)
+
+        self.assertEqual(CODE_OK, code)
+        self.assertLess(rows[0]["via_center"][0], self.CENTER[0])
+        self.assertLess(rows[0]["nearest_center_pixel_distance"], 3.0)
+        self.assertGreater(int(np.count_nonzero(via_bin)), 0)
+
     def test_outer_black_line_is_ignored(self):
         # 검은 선의 연결성분 중심이 PAD 중심에서 멀어 VIA로 채택되지 않습니다.
         def draw(image):

@@ -17,8 +17,8 @@
 -------------
 * 컬러 이미지를 회색조로 바꾸고 PAD 평균 밝기보다 일정 수준 어두운 부분을
   이진화해 VIA 후보로 사용합니다.
-* 후보 연결성분의 중심이 PAD 중앙 허용거리 안에 있을 때만 VIA로 인정합니다.
-  PAD 외곽의 검은 선은 어두워도 중심 위치가 맞지 않아 제외됩니다.
+* 후보 연결성분의 실제 어두운 픽셀이 PAD 중앙 허용영역 안에 있을 때만 VIA로
+  인정합니다. 연결성분 무게중심 거리는 후보 선택에 사용하지 않습니다.
 * PAD 이진 마스크의 커버리지로 검사 대상을 제외하지 않습니다.
   ``PAD_PRESENT_MIN``과 ``VIA_EXCLUDE_RATIO`` 필터는 제거했습니다.
 * 쏠림(VIA_OFFSET)은 불량으로 판정하지 않습니다. 중앙 허용거리 안에서
@@ -32,9 +32,9 @@
    비어 있어도 검사를 건너뛰지 않고 원래 설계 PAD 중심을 사용합니다.
 3. ROI를 회색조로 바꾸고 PAD 내부 평균 밝기를 구합니다.
 4. ``PAD평균 - VIA_GRAY_DROP + dark_offset``보다 어두운 픽셀만 이진화합니다.
-5. 최소 면적을 넘는 연결성분 중 중심이
-   ``PAD반지름 * VIA_CENTER_SEARCH_RATIO`` 안에 있는 가장 가까운 덩어리를 VIA로
-   선택합니다. 색상, Black-hat, 원형도, 채움비 조건은 사용하지 않습니다.
+5. 최소 면적을 넘는 연결성분에서 PAD 중심에 가장 가까운 실제 픽셀을 구합니다.
+   그 픽셀이 ``PAD반지름 * VIA_CENTER_SEARCH_RATIO`` 안에 있는 덩어리 중 실제
+   픽셀이 중앙에 가장 가까운 덩어리를 VIA로 선택합니다.
 
 사용자가 수정할 곳
 ------------------
@@ -82,8 +82,8 @@ CODE_PRIORITY = [CODE_VIA_MISSING]
 # 설계도를 실물과 같은 크기로 그렸으면 0.
 DESIGN_PAD_SHRINK = 2
 
-# VIA 연결성분 중심의 허용거리 = PAD 등가반지름 * 이 값.
-# 0.30이면 후보 중심이 PAD 반지름의 30% 안쪽에 있을 때만 VIA입니다.
+# VIA 연결성분의 실제 픽셀 허용거리 = PAD 등가반지름 * 이 값.
+# 0.30이면 후보의 실제 어두운 픽셀이 PAD 반지름의 30% 안쪽에 있어야 VIA입니다.
 # 외곽 선을 VIA로 잘못 잡으면 낮추고, 정상 VIA가 빠지면 0.05씩 올리세요.
 VIA_CENTER_SEARCH_RATIO = 0.30
 
@@ -179,13 +179,16 @@ def debug_via(image: Union[str, np.ndarray],
         pad_id, status, pad_center, pad_radius, pad_area, pad_coverage,
         align_shift, design_via, via_center, via_area, offset_px, offset_norm,
         pad_median, pad_mean, dark_threshold, search_radius,
+        nearest_center_pixel_distance, center_zone_pixels,
         dark_candidate_pixels, color_candidate_pixels,
         via_aspect, via_radial_dev, shape_rejected, edge_rejected
       (해당 없는 항목은 None)
 
     align_shift 가 크게 나오면 설계도와 실물이 그만큼 어긋나 있다는 뜻입니다.
     dark_candidate_pixels는 PAD 평균 기반 이진화를 통과한 픽셀 수입니다.
-    search_radius는 VIA 연결성분 중심에 허용하는 PAD 중앙 거리입니다.
+    search_radius는 실제 후보 픽셀에 허용하는 PAD 중앙 거리입니다.
+    nearest_center_pixel_distance는 선택된 덩어리의 실제 픽셀 최소거리이고,
+    center_zone_pixels는 중앙 허용영역 안에 들어온 실제 픽셀 수입니다.
     pad_coverage는 이전 rows 호환용이며 항상 None입니다.
     shape_rejected와 edge_rejected는 예전 rows 호환용이며 항상 0입니다.
     """
@@ -378,6 +381,8 @@ def _run(image: Union[str, np.ndarray],
             "dark_threshold": None,
             "search_radius": None,
             "dark_candidate_pixels": 0,
+            "nearest_center_pixel_distance": None,
+            "center_zone_pixels": 0,
             # 아래 키는 이전 debug_via rows와의 호환용입니다.
             "pad_value_median": None,
             "black_value_max": None,
@@ -465,11 +470,12 @@ def _find_via(roi: np.ndarray,
     판정 조건은 세 개뿐입니다.
       1) PAD 평균보다 ``VIA_GRAY_DROP - dark_offset`` 이상 어둡다.
       2) 연결성분 면적이 ``VIA_MIN_AREA`` 이상이다.
-      3) 연결성분 중심이 PAD 중심에서
+      3) 연결성분의 실제 픽셀 중 하나 이상이 PAD 중심에서
          ``PAD반지름 * VIA_CENTER_SEARCH_RATIO`` 이내다.
 
     색상, Black-hat, 원형도, 채움비, 최대 면적 조건은 사용하지 않습니다.
-    조건을 만족하는 덩어리가 여러 개면 PAD 중심에 가장 가까운 것을 고릅니다.
+    조건을 만족하는 덩어리가 여러 개면 PAD 중심에 실제 픽셀이 가장 가까운
+    덩어리를 고릅니다. 무게중심은 선택 후 표시 좌표를 구할 때만 사용합니다.
     """
     inner = cv2.erode(shape, ero)
     pad_mask = inner > 0
@@ -496,25 +502,34 @@ def _find_via(roi: np.ndarray,
 
     num, lab, stats, cents = cv2.connectedComponentsWithStats(cand, 8)
 
-    # 2) 최소 면적을 넘는 덩어리 중 중심이 PAD 중앙에 가장 가까운 것을 찾습니다.
+    # 2) 최소 면적을 넘는 덩어리에서 PAD 중심에 가장 가까운 '실제 픽셀'을 찾습니다.
+    # 연결성분 무게중심(cents)은 best 선택에 쓰지 않고 최종 표시 좌표에만 씁니다.
     best = -1
     best_area = 0
-    best_distance = float("inf")
+    best_pixel_distance = float("inf")
+    best_center_zone_pixels = 0
     for i in range(1, num):
         a = int(stats[i, 4])
         if a < VIA_MIN_AREA:
             continue
-        component_x = float(cents[i][0])
-        component_y = float(cents[i][1])
-        center_distance = float(np.hypot(
-            component_x - center_x, component_y - center_y))
-        if center_distance > center_tolerance:
+
+        ys, xs = np.nonzero(lab == i)
+        pixel_distances = np.hypot(xs - center_x, ys - center_y)
+        nearest_pixel_distance = float(pixel_distances.min())
+        center_zone_pixels = int(np.count_nonzero(
+            pixel_distances <= center_tolerance))
+        if center_zone_pixels == 0:
             continue
-        if (center_distance < best_distance or
-                (abs(center_distance - best_distance) < 1e-6 and a > best_area)):
+
+        if (nearest_pixel_distance < best_pixel_distance or
+                (abs(nearest_pixel_distance - best_pixel_distance) < 1e-6 and
+                 center_zone_pixels > best_center_zone_pixels) or
+                (abs(nearest_pixel_distance - best_pixel_distance) < 1e-6 and
+                 center_zone_pixels == best_center_zone_pixels and a > best_area)):
             best = i
             best_area = a
-            best_distance = center_distance
+            best_pixel_distance = nearest_pixel_distance
+            best_center_zone_pixels = center_zone_pixels
 
     if best < 0:
         return None
@@ -522,6 +537,8 @@ def _find_via(roi: np.ndarray,
     blob = lab == best
     cx = float(cents[best][0])
     cy = float(cents[best][1])
+    row["nearest_center_pixel_distance"] = round(best_pixel_distance, 2)
+    row["center_zone_pixels"] = best_center_zone_pixels
 
     # [END SECTOR: VIA_DETECTION_CORE]
     return {"cx": cx, "cy": cy, "area": best_area, "mask": blob}
@@ -587,10 +604,11 @@ def _print_table(code: str, rows: List[Dict[str, Any]]) -> None:
     if not rows:
         return
 
-    head = ("PAD", "판정", "PAD중심", "VIA중심", "거리px", "거리비",
-            "중앙허용", "VIA면적", "PAD평균", "이진임계", "어두운px", "정합이동")
-    print("%4s %-12s %-16s %-16s %7s %8s %8s %8s %8s %8s %9s %12s" % head)
-    print("-" * 132)
+    head = ("PAD", "판정", "PAD중심", "VIA중심", "중심거리", "중심비",
+            "중앙허용", "근접픽셀", "중앙px", "VIA면적", "PAD평균", "이진임계",
+            "어두운px", "정합이동")
+    print("%4s %-12s %-16s %-16s %8s %8s %8s %8s %7s %8s %8s %8s %9s %12s" % head)
+    print("-" * 154)
 
     def pt(v):
         return "-" if v is None else "(%.1f,%.1f)" % (v[0], v[1])
@@ -600,9 +618,10 @@ def _print_table(code: str, rows: List[Dict[str, Any]]) -> None:
 
     for r in rows:
         flag = "NG" if r["status"] == "VIA_MISSING" else "  "
-        print("%4d %-12s %-16s %-16s %7s %8s %8s %8s %8s %8s %9s %12s %s" % (
+        print("%4d %-12s %-16s %-16s %8s %8s %8s %8s %7s %8s %8s %8s %9s %12s %s" % (
             r["pad_id"], r["status"], pt(r["pad_center"]), pt(r["via_center"]),
             num(r["offset_px"]), num(r["offset_norm"], "%.3f"),
-            num(r["search_radius"]), num(r["via_area"], "%d"),
+            num(r["search_radius"]), num(r["nearest_center_pixel_distance"]),
+            "%d" % r["center_zone_pixels"], num(r["via_area"], "%d"),
             num(r["pad_mean"], "%.1f"), num(r["dark_threshold"], "%.1f"),
             "%d" % r["dark_candidate_pixels"], pt(r["align_shift"]), flag))
