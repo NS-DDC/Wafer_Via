@@ -9,11 +9,11 @@ YOLO centre-clip cross-points를 이용하는 wafer die-map 모듈입니다.
 - 샘플: [`codex/sample_img/Clip_sample.png`](codex/sample_img/Clip_sample.png)
 - 테스트: [`tests/test_wafer_via.py`](tests/test_wafer_via.py)
 
-## via_codex — 중앙 검정·짙은 갈색 VIA 검사
+## via_codex — PAD 평균 밝기 기반 중앙 VIA 검사
 
 `pad-via-inspector`의 `via_checker.py`를 별도 변경한 Codex 버전입니다.
-PAD 중앙 원형 구역에서만 검정 또는 짙은 갈색 VIA를 찾고, 쏠림은 불량으로
-판정하지 않습니다. PAD 외곽의 검은 선은 검색영역과 형상 필터로 제외합니다.
+회색조에서 PAD 평균보다 충분히 어두운 연결성분을 뽑고, 그 중심이 PAD 중앙에
+가까울 때만 VIA로 인정합니다. 쏠림 불량 판정은 사용하지 않습니다.
 
 - 코드: [`via_codex/via_checker.py`](via_codex/via_checker.py)
 - 원리·임계값 수정 가이드: [`via_codex/README.md`](via_codex/README.md)
