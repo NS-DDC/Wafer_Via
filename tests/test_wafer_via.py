@@ -110,7 +110,46 @@ class YoloCoordinateTests(unittest.TestCase):
         self.assertEqual(estimate.refinement_mode, "auto")
         self.assertEqual(estimate.raw_points_clip, estimate.points_clip)
         self.assertEqual(len(estimate.refinement_confidences), len(points))
+        self.assertEqual(
+            estimate.pitch_x_points_clip,
+            (estimate.center_corner_clip, estimate.side_corner_clip),
+        )
+        self.assertEqual(
+            estimate.pitch_y_points_clip,
+            (estimate.center_corner_clip, estimate.below_corner_clip),
+        )
+        self.assertEqual(estimate.pitch_x_points_raw_clip, estimate.pitch_x_points_clip)
+        self.assertIn("pitch_x_points_clip", estimate.to_dict())
         self.assertEqual(make_clip_overlay(image, estimate).shape, image.shape)
+
+    def test_robust_angle_ignores_one_bad_center_point(self):
+        image = np.zeros((512, 512, 3), np.uint8)
+        points = rotated_points(angle_deg=3.25)
+        points[12] += np.asarray((5.0, -5.0))
+
+        robust = estimate_grid_from_yolo(
+            image,
+            points,
+            detection_format="point",
+            refine=False,
+            angle_mode="robust",
+        )
+        local = estimate_grid_from_yolo(
+            image,
+            points,
+            detection_format="point",
+            refine=False,
+            angle_mode="local",
+            strict=False,
+        )
+
+        self.assertAlmostEqual(robust.angle_deg, 3.25, places=6)
+        self.assertGreater(abs(local.angle_deg - 3.25), 3.0)
+        self.assertEqual(robust.angle_mode, "robust")
+        self.assertGreater(len(robust.angle_pairs_clip), 20)
+        self.assertGreater(robust.angle_candidate_count, len(robust.angle_pairs_clip))
+        self.assertEqual(len(robust.angle_pairs_clip), len(robust.angle_pair_axes))
+        self.assertEqual(len(robust.angle_pairs_clip), len(robust.angle_pair_angles_deg))
 
 
 class ColourInvariantRefinementTests(unittest.TestCase):
@@ -253,6 +292,37 @@ class WaferBoundaryAndMapTests(unittest.TestCase):
         self.assertTrue(result["in_wafer"])
         self.assertAlmostEqual(result["angle_deg"], 3.25)
 
+    def test_edge_dies_are_clipped_but_keep_indices_outside_image(self):
+        angles = np.linspace(0.0, 2.0 * math.pi, 360, endpoint=False)
+        contour = np.rint(np.column_stack((50 + 55 * np.cos(angles),
+                                           50 + 55 * np.sin(angles)))).astype(np.int32).reshape(-1, 1, 2)
+        boundary = WaferBoundary(
+            center_px=(50.0, 50.0), radius_px=55.0,
+            contour_px=contour, area_px=float(cv2.contourArea(contour)),
+            bbox_px=(-5, -5, 105, 105), method="synthetic_edge_test",
+        )
+        die_map = generate_die_map(
+            boundary, (100, 100), (50.0, 50.0), 40.0, 40.0, 0.0,
+            include_edge=True,
+        )
+
+        edge_die = die_map.get_die(1, 0)
+        self.assertIsNotNone(edge_die)  # centre x=110 is outside image and wafer
+        self.assertEqual(edge_die["rect_px"], (90, 10, 130, 50))
+        self.assertEqual(edge_die["crop_rect_px"][2], 100)
+        self.assertTrue(edge_die["is_edge_partial"])
+        self.assertTrue(edge_die["is_image_partial"])
+        self.assertGreater(edge_die["wafer_area_px"], 0.0)
+        self.assertGreater(edge_die["visible_area_px"], 0.0)
+        self.assertTrue(all(point[0] <= 105.0 for point in edge_die["wafer_polygon_px"]))
+        self.assertTrue(all(0.0 <= point[0] <= 100.0 for point in edge_die["visible_polygon_px"]))
+
+        without_edges = generate_die_map(
+            boundary, (100, 100), (50.0, 50.0), 40.0, 40.0, 0.0,
+            include_edge=False,
+        )
+        self.assertIsNone(without_edges.get_die(1, 0))
+
     def test_end_to_end_and_overlays(self):
         wafer = np.zeros((1200, 1200, 3), np.uint8)
         cv2.circle(wafer, (600, 600), 520, (80, 160, 205), -1)
@@ -264,6 +334,20 @@ class WaferBoundaryAndMapTests(unittest.TestCase):
         self.assertAlmostEqual(die_map.pitch_y, 90.0, places=4)
         self.assertAlmostEqual(die_map.grid_angle_deg, 2.0, places=4)
         self.assertGreater(die_map.num_dies, 100)
+        self.assertIsNotNone(die_map.pitch_x_points_full)
+        self.assertIsNotNone(die_map.pitch_y_points_full)
+        self.assertTrue(np.allclose(die_map.pitch_x_points_full[0], (die_map.x0, die_map.y0)))
+        self.assertAlmostEqual(
+            math.dist(*die_map.pitch_x_points_full), die_map.pitch_x, places=6
+        )
+        self.assertAlmostEqual(
+            math.dist(*die_map.pitch_y_points_full), die_map.pitch_y, places=6
+        )
+        self.assertGreater(len(die_map.angle_pairs_full), 10)
+        self.assertEqual(
+            len(die_map.angle_pairs_full),
+            len(die_map.grid_estimate.angle_pairs_clip),
+        )
         self.assertEqual(make_wafer_overlay(wafer, die_map).shape, wafer.shape)
 
     def test_end_to_end_memory_arrays_with_six_column_yolo(self):
@@ -280,6 +364,30 @@ class WaferBoundaryAndMapTests(unittest.TestCase):
         self.assertAlmostEqual(die_map.pitch_y, 90.0, places=3)
         self.assertAlmostEqual(die_map.grid_angle_deg, 2.0, places=3)
         self.assertEqual((die_map.x0, die_map.y0), (600.0, 600.0))
+
+    def test_manual_pitch_size_overrides_detected_pitch(self):
+        wafer = np.zeros((1200, 1200, 3), np.uint8)
+        cv2.circle(wafer, (600, 600), 520, (80, 160, 205), -1)
+        clip = wafer[344:856, 344:856].copy()
+        detections = np.asarray(rotated_points(pitch_x=80.0, pitch_y=90.0, angle_deg=2.0))
+
+        die_map = build_die_map_from_yolo(
+            wafer,
+            clip,
+            detections,
+            detection_format="point",
+            refine=False,
+            pitch_size=(81.25, 93.5),
+            return_aligned_image=False,
+        )
+
+        self.assertEqual(die_map.pitch_source, "manual")
+        self.assertAlmostEqual(die_map.pitch_x, 81.25)
+        self.assertAlmostEqual(die_map.pitch_y, 93.5)
+        self.assertAlmostEqual(die_map.detected_pitch_x, 80.0, places=5)
+        self.assertAlmostEqual(die_map.detected_pitch_y, 90.0, places=5)
+        self.assertAlmostEqual(die_map.grid_estimate.pitch_x, 80.0, places=5)
+        self.assertAlmostEqual(die_map.grid_estimate.pitch_y, 90.0, places=5)
 
     def test_grid_origin_uses_wafer_center_not_image_center(self):
         wafer = np.zeros((1200, 1200, 3), np.uint8)

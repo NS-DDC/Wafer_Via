@@ -1,514 +1,419 @@
 # Wafer_Via core
 
-학습된 YOLO가 512×512 중앙 clip에서 찾은 여러 십자점으로 다음 정보만 생성합니다.
+512×512 center clip의 YOLO 십자점 검출 결과를 이용해 다음 결과를 생성합니다.
 
-- 검출된 wafer 중심에 가장 가까운 `center_corner` (`(0,0)` die/grid origin)
-- 중앙 코너의 옆 점으로 `pitch_x`
-- 중앙 코너의 아래 점으로 `pitch_y`
-- 두 축 벡터로 회전 보정각 `angle_deg`
-- 원본 wafer 외곽 contour
-- 원본(예: 10000×10000) 좌표계의 회전 die map
-- `locate_die`와 clip/full-wafer overlay
+- 실제 wafer 중심에 가장 가까운 십자점을 `(0,0)` grid origin으로 선택
+- `pitch_x`, `pitch_y` 자동 측정 또는 수동 입력
+- 전체 YOLO 격자 벡터 기반 robust 회전각 추정
+- full wafer 외곽선 검출과 회전 die map 생성
+- wafer/image 경계에서 잘린 die polygon과 index 유지
+- angle 보정 이미지, 좌표 변환, `locate_die`, 진단 overlay 반환
 
-die/street의 고정 RGB·HSV 색상 임계값은 사용하지 않습니다. 기본 `refine=True`, `refine_mode="auto"`는 각 YOLO 점 주변 네 꼭짓점의 die 색상을 현장에서 학습하고, 그 색들과 다른 수직/수평 band 및 Lab 경계쌍을 결합해 street 교차 중심을 미세 보정합니다.
+특정 die/street의 RGB·HSV 색상을 고정하지 않습니다. 중심 미세 보정은 각 YOLO 점 주변 네 corner die의 Lab 색상과 경계 정보를 사용합니다.
 
-## 빠른 사용법
+## 1. 권장 사용법
 
 ```python
 import cv2
+
 from codex.wafer_via import (
     build_die_map_from_yolo,
     locate_die,
     make_clip_overlay,
     make_wafer_overlay,
-)
-
-dm = build_die_map_from_yolo(
-    wafer_image="wafer_10000.png",
-    clip_image="center_clip_512.png",
-    detections="center_clip_512.txt",  # YOLO: class cx cy w h (normalized)
-    refine=True,                        # 기본값: 노이즈 억제 + 로컬 corner 색상 보정
-    refine_mode="auto",                # auto | corner_color | gradient
-)
-
-print(dm.x0, dm.y0)                     # full image 기준 center corner
-print(dm.pitch_x, dm.pitch_y)
-print(dm.grid_angle_deg, dm.angle_confidence)
-cv2.imwrite("wafer_aligned.png", dm.aligned_image)  # angle 보정된 full image
-
-result = locate_die(dm, point=(5499, 4700))
-print(result["die_index"], result["die_polygon_px"])
-
-overlay = make_wafer_overlay("wafer_10000.png", dm)
-cv2.imwrite("wafer_overlay.png", overlay)
-```
-
-현재 사용 중인 Ultralytics `boxes.xywh`는 다음 형태가 가장 권장됩니다.
-
-```python
-detections = results[0].boxes.xywh.cpu().numpy()
-
-dm = build_die_map_from_yolo(
-    wafer_image,
-    clip_image,
-    detections=detections,
-    detection_format="xywh",
-)
-```
-
-Ultralytics의 `boxes.xyxy`도 바로 전달할 수 있습니다.
-
-```python
-dm = build_die_map_from_yolo(
-    wafer_image,
-    clip_image,
-    results[0].boxes.xyxy.cpu().numpy(),
-    detection_format="xyxy",
-)
-```
-
-이미지 경로 대신 OpenCV BGR `numpy.ndarray`를 그대로 전달할 수 있습니다.
-
-```python
-dm = build_die_map_from_yolo(
-    wafer_image=wafer_bgr,       # uint8 ndarray, 예: (10000, 10000, 3)
-    clip_image=center_clip_bgr,  # uint8 ndarray, 예: (512, 512, 3)
-    detections=yolo_array,       # Nx2/Nx3/Nx4/Nx5/Nx6 ndarray 또는 list
-)
-```
-
-`auto`가 지원하는 메모리 좌표 형식:
-
-- `x, y`
-- `x, y, confidence`
-- `x1, y1, x2, y2`
-- `class, cx, cy, w, h[, confidence]` (정규화 YOLO)
-- `x1, y1, x2, y2, confidence, class` (Ultralytics)
-
-픽셀 단위의 6열 `class,cx,cy,w,h,confidence`는 다른 6열 형식과 모호하므로 `detection_format="yolo_txt", normalized=False`를 지정합니다.
-
-중앙이 아닌 위치에서 clip했다면 `clip_origin=(full_x, full_y)`를 명시합니다. 생략하면 full image의 정확한 중앙 clip으로 계산합니다.
-
-## Ultralytics 결과 구조 출력하기
-
-`model(...)` 반환값의 list 길이가 1이면 일반적으로 입력 이미지가 한 장이라는 뜻입니다. 실제 검출 박스 수는 `len(results[0].boxes)`로 확인합니다.
-
-다음 진단 함수는 Ultralytics와 torch를 이 모듈에서 직접 import하지 않고도 결과 구조를 출력합니다.
-
-```python
-from codex.wafer_via import inspect_yolo_results
-
-results = model(center_clip_bgr)
-summary = inspect_yolo_results(results, max_rows=10)
-```
-
-출력 항목:
-
-- `results` 실제 type과 list 길이
-- 각 `Results`의 type, `orig_shape`, 입력 path
-- `boxes` type과 실제 detection 개수
-- tracking 결과인지 여부
-- `boxes.data`
-- `boxes.xywh`, `boxes.xywhn`
-- `boxes.xyxy`, `boxes.xyxyn`
-- `boxes.conf`, `boxes.cls`, `boxes.id`
-- 각 tensor의 shape, dtype, 앞쪽 `max_rows`개 값
-
-검출 수가 많아도 전체 tensor를 모두 출력하지 않습니다. `max_rows`만 출력하고 나머지 행 개수를 표시합니다. 반환되는 `summary`에도 전체 배열이 아니라 shape, dtype, preview만 들어갑니다.
-
-확인 후 현재 die-map 함수에는 다음 중 하나로 전달하는 것을 권장합니다.
-
-```python
-boxes = results[0].boxes
-
-# 방법 1: 십자점 box 중심을 직접 사용
-keep = (boxes.conf >= 0.25) & (boxes.cls == 0)
-detections_xywh = boxes.xywh[keep].cpu().numpy()
-
-dm = build_die_map_from_yolo(
-    wafer_bgr,
-    center_clip_bgr,
-    detections_xywh,
-    detection_format="xywh",
-    normalized=False,
-)
-```
-
-또는 confidence와 class가 포함된 raw data를 전달합니다.
-
-```python
-detections_data = boxes.data.cpu().numpy()
-
-dm = build_die_map_from_yolo(
-    wafer_bgr,
-    center_clip_bgr,
-    detections_data,
-    detection_format="xyxy_conf_class",
-    normalized=False,
-    confidence_threshold=0.25,
-)
-```
-
-## 결과값 한눈에 보기
-
-`build_die_map_from_yolo()`의 반환값은 `WaferDieMap` 객체입니다. 이 객체 하나에 wafer 외곽선, 선택된 십자점, pitch, angle, 전체 die map이 모두 들어 있습니다.
-
-```python
-dm = build_die_map_from_yolo(...)
-
-print(type(dm))                # WaferDieMap
-print(dm.pitch_x, dm.pitch_y)  # X/Y die pitch
-print(dm.grid_angle_deg)       # grid 회전각
-print(dm.num_dies)             # 생성된 die 개수
-```
-
-결과는 다음과 같은 구조입니다.
-
-```text
-WaferDieMap (dm)
-├─ wafer 중심/반지름
-├─ center corner, pitch, angle
-├─ grid_estimate       # 512 clip에서 선택한 점과 각도 계산 결과
-├─ wafer_boundary      # full image에서 검출한 wafer contour
-├─ aligned_image       # angle 보정된 full wafer 이미지
-├─ 좌표 변환 matrix    # original ↔ aligned
-├─ dies                # 전체 die entry list
-└─ dies_by_index       # (ix, iy)로 빠르게 조회하는 dictionary
-```
-
-### 1. `WaferDieMap` 주요 필드
-
-| 필드 | 형식 | 의미 |
-|---|---|---|
-| `wafer_cx`, `wafer_cy` | `int` | full image에서 검출한 wafer 중심 픽셀 |
-| `wafer_r` | `int` | wafer 외곽 contour의 최소 외접원 반지름 |
-| `x0`, `y0` | `float` | 검출된 wafer 중심에 가장 가까운 십자점. full image 좌표계의 `(0,0)` grid origin |
-| `pitch_x`, `pitch_y` | `float` | 옆 점과 아래 점으로 계산한 실제 grid 간격(px) |
-| `die_w`, `die_h` | `int` | `round(pitch_x)`, `round(pitch_y)` 호환 필드 |
-| `grid_angle_deg` | `float` | 오른쪽 grid축의 영상 기준 기울기(deg) |
-| `rotation_deg` | `float` | 기존 API 호환용 각도 필드. 현재는 `grid_angle_deg`와 같은 값 |
-| `angle_confidence` | `float` | X축 각도와 Y축 각도의 합의 정도, `0.0~1.0` |
-| `pixel_per_unit` | `float` | 픽셀 좌표를 실좌표로 환산할 때 사용하는 `px/unit` |
-| `image_shape` | `(H, W)` | full wafer 이미지 크기 |
-| `edge_mode` | `str` | `is_edge` 판정 기준: `circle`, `ring`, `both` |
-| `dies` | `list[dict]` | wafer 안에 생성된 모든 die 정보 |
-| `dies_by_index` | `dict` | `(ix, iy)`를 key로 하는 die 조회 dictionary |
-| `num_dies` | `int` property | `len(dm.dies)` |
-| `grid_estimate` | `GridEstimate` | 512 clip 좌표에서 계산한 상세 grid 결과 |
-| `wafer_boundary` | `WaferBoundary` | 검출된 full-image wafer 외곽선 결과 |
-| `aligned_image` | `ndarray \| None` | `grid_angle_deg`만큼 보정된 full wafer BGR 이미지 |
-| `original_to_aligned_matrix` | `ndarray` | 원본 좌표를 보정 이미지 좌표로 옮기는 2×3 affine matrix |
-| `aligned_to_original_matrix` | `ndarray` | 보정 이미지 좌표를 원본 좌표로 되돌리는 2×3 affine matrix |
-| `axis_x`, `axis_y` | `(float, float)` property | 회전된 grid의 단위 X/Y 벡터 |
-
-die map과 `locate_die()`는 기존 호환성을 위해 원본 이미지 좌표계를 유지합니다. `aligned_image`는 추가 반환 결과이며, 두 좌표계가 섞이지 않도록 변환 matrix와 point 변환 함수를 함께 제공합니다.
-
-### 2. 앵글 보정 이미지와 좌표 변환 결과
-
-기본 설정에서는 angle이 보정된 full wafer 이미지가 `dm.aligned_image`에 들어갑니다.
-
-```python
-dm = build_die_map_from_yolo(
-    wafer_bgr,
-    center_clip_bgr,
-    yolo_data,
-    return_aligned_image=True,  # 기본값
-)
-
-assert dm.aligned_image is not None
-print(dm.aligned_image.shape)  # 원본과 동일한 (H, W, 3)
-cv2.imwrite("wafer_aligned.png", dm.aligned_image)
-```
-
-보정 방식:
-
-- 검출한 wafer 중심 `(wafer_cx, wafer_cy)`을 회전 중심으로 사용합니다.
-- `grid_angle_deg`를 OpenCV 회전 보정각으로 적용합니다.
-- 출력 크기는 원본과 동일합니다.
-- 기본 보간법은 `cv2.INTER_CUBIC`입니다.
-- 회전으로 새로 생긴 이미지 바깥 영역은 기본 검정 `(0,0,0)`입니다.
-- angle이 0이어도 반환 이미지가 원본과 같은 객체가 되지 않도록 복사본을 반환합니다.
-
-10000×10000 BGR 이미지의 추가 300MB 메모리가 부담되면 이미지 생성만 끌 수 있습니다. 좌표 변환 matrix는 계속 반환됩니다.
-
-```python
-dm = build_die_map_from_yolo(
-    wafer_bgr,
-    center_clip_bgr,
-    yolo_data,
-    return_aligned_image=False,
-)
-
-assert dm.aligned_image is None
-assert dm.original_to_aligned_matrix is not None
-```
-
-원본 이미지의 검사 좌표를 보정 이미지에서 표시하려면 다음 함수를 사용합니다.
-
-```python
-from codex.wafer_via import (
     transform_point_to_aligned,
     transform_point_to_original,
 )
 
-original_point = (5499.0, 4700.0)
-aligned_point = transform_point_to_aligned(dm, original_point)
-restored_point = transform_point_to_original(dm, aligned_point)
-```
+# full image 중앙에서 YOLO용 512x512 clip 생성
+height, width = wafer_bgr.shape[:2]
+clip_x = width // 2 - 256
+clip_y = height // 2 - 256
+center_clip_bgr = wafer_bgr[clip_y:clip_y + 512, clip_x:clip_x + 512]
 
-`locate_die()`는 원본 좌표를 받습니다. 보정 이미지에서 새로 검출한 좌표라면 먼저 원본 좌표로 되돌립니다.
+results = model(center_clip_bgr)
+detections_xywh = results[0].boxes.xywh.cpu().numpy()
 
-```python
-aligned_defect_point = (5503.2, 4691.8)
-original_defect_point = transform_point_to_original(dm, aligned_defect_point)
-result = locate_die(dm, point=original_defect_point)
-```
+dm = build_die_map_from_yolo(
+    wafer_image=wafer_bgr,          # full wafer BGR ndarray
+    clip_image=center_clip_bgr,     # YOLO에 넣은 512x512 BGR ndarray
+    detections=detections_xywh,     # shape=(N,4), [cx,cy,w,h]
+    detection_format="xywh",
+    clip_origin=(clip_x, clip_y),   # full image에서 clip의 왼쪽 위
 
-직접 이미지만 보정하고 싶다면 다음 저수준 함수도 사용할 수 있습니다.
+    refine=True,
+    refine_mode="auto",
+    refine_radius=24,
+    refine_noise_kernel=5,
+    refine_min_confidence=0.15,
 
-```python
-aligned, forward_matrix, inverse_matrix = align_wafer_image(
-    wafer_bgr,
-    center_px=(dm.wafer_cx, dm.wafer_cy),
-    angle_deg=dm.grid_angle_deg,
+    angle_mode="robust",
+    angle_inlier_tolerance_deg=2.5,
+
+    pitch_size=None,               # None=자동, 또는 (pitch_x, pitch_y)
+    include_edge=True,
+    return_aligned_image=True,
 )
 ```
 
-### 3. `GridEstimate`: 512 clip 분석 결과
+`wafer_image`, `clip_image`는 경로 또는 OpenCV `numpy.ndarray`를 모두 지원합니다. 생산 코드에서는 이미지와 `clip_origin`의 대응을 명확히 하기 위해 메모리 배열과 실제 crop 원점을 전달하는 방식을 권장합니다.
+
+정확한 이미지 중앙에서 clip했다면 `clip_origin`을 생략할 수 있습니다.
+
+## 2. 입력 좌표 형식
+
+권장 Ultralytics 입력은 다음 형식입니다.
 
 ```python
-grid = dm.grid_estimate
-if grid is not None:
-    print(grid.center_corner_clip)
-    print(grid.side_corner_clip)
-    print(grid.below_corner_clip)
-    print(grid.to_dict())
+detections = results[0].boxes.xywh.cpu().numpy()
+detection_format = "xywh"
 ```
 
-| 필드 | 의미 |
+- 배열 shape: `(N, 4)`
+- 한 행: `[center_x, center_y, width, height]`
+- 단위: YOLO 입력 clip 기준 pixel
+- 원점: clip 왼쪽 위 `(0,0)`
+- `x`는 오른쪽, `y`는 아래로 증가
+- `xywhn`이 아닌 비정규화 `xywh`
+
+Confidence와 class를 먼저 필터링할 수 있습니다.
+
+```python
+boxes = results[0].boxes
+keep = (boxes.conf >= 0.25) & (boxes.cls == 0)
+detections = boxes.xywh[keep].cpu().numpy()
+```
+
+지원 형식:
+
+| `detection_format` | 한 행의 구조 |
 |---|---|
-| `points_clip` | confidence 필터링과 중복 제거 후 사용한 전체 YOLO 십자점 |
-| `center_corner_clip` | full wafer 중심을 clip 좌표로 변환한 기준점에 가장 가까워 선택된 십자점 |
-| `side_corner_clip` | center corner의 같은 row에서 선택한 가장 가까운 옆 점 |
-| `below_corner_clip` | center corner의 같은 column에서 선택한 가장 가까운 아래 점 |
-| `pitch_x` | center → side 벡터 길이 |
-| `pitch_y` | center → below 벡터 길이 |
-| `angle_x_deg` | center → side 벡터로 계산한 각도 |
-| `angle_y_deg` | center → below 벡터로 계산한 각도 |
-| `angle_deg` | `angle_x_deg`와 `angle_y_deg`를 결합한 최종 각도 |
-| `angle_confidence` | 두 각도가 얼마나 일치하는지 나타내는 값 |
-| `refined` | 중심 미세 보정 단계를 실행했는지 여부 |
-| `raw_points_clip` | 보정 전 YOLO bbox 중심 좌표들 |
-| `points_clip` | confidence 안전장치 적용 후 실제 pitch/angle 계산에 사용한 좌표들 |
-| `refinement_confidences` | 각 점의 중심 보정 confidence (`0.0~1.0`) |
-| `refinement_mode` | `auto`, `corner_color`, `gradient`, 또는 보정하지 않은 `none` |
+| `point` | `[x, y]` |
+| `point_conf` | `[x, y, confidence]` |
+| `xywh` | `[cx, cy, width, height]` pixel |
+| `xyxy` | `[x1, y1, x2, y2]` pixel |
+| `xyxy_conf_class` | `[x1, y1, x2, y2, confidence, class]` |
+| `yolo_txt` | `[class, cx, cy, width, height, (confidence)]` |
 
-`angle_confidence`는 YOLO 모델 confidence 평균이 아닙니다. 두 직교축에서 구한 회전각의 일치도를 나타냅니다.
+정규화 좌표는 `normalized=True`를 명시하십시오. 픽셀 단위 6열 데이터는 형식이 모호하므로 `detection_format`을 생략하지 않는 것이 안전합니다.
 
-### 3-A. 노이즈가 심한 이미지의 중심 보정
+결과 구조가 불확실하면 다음 진단 함수를 사용합니다.
 
-`auto` 모드는 각 YOLO bbox 중심 주위의 작은 ROI만 사용합니다. ROI의 네 꼭짓점 patch에서 각각 median Lab 색상을 구한 후, 네 die 색상 중 어느 것과도 닮지 않은 픽셀을 street 후보로 만듭니다. 따라서 네 die가 서로 다른 색이어도 되고, 특정 초록색 또는 빨간색을 코드에 고정하지 않습니다. Median filter와 X/Y projection으로 점 잡음과 작은 die 내부 무늬를 줄인 뒤 기존 Lab 경계쌍 결과와 결합합니다.
+```python
+from codex.wafer_via import inspect_yolo_results
+
+summary = inspect_yolo_results(results, max_rows=10)
+```
+
+## 3. 좌표계와 `(0,0)` 기준
+
+이 모듈에는 세 좌표계가 있습니다.
+
+| 좌표계 | 대표 값 |
+|---|---|
+| clip 좌표 | `dm.grid_estimate.*_clip` |
+| 원본 full-image 좌표 | `dm.x0`, `dm.y0`, `dm.dies` |
+| angle 보정 이미지 좌표 | `dm.aligned_image` |
+
+`dm.x0`, `dm.y0`는 이미지 중심이나 wafer 중심 그 자체가 아닙니다. 검출된 wafer 중심을 clip 좌표로 변환한 뒤, 그 위치에 가장 가까운 YOLO 십자점을 선택한 full-image 좌표입니다.
+
+```python
+print("wafer center:", (dm.wafer_cx, dm.wafer_cy))
+print("grid origin:", (dm.x0, dm.y0))
+```
+
+`locate_die()`와 die map은 원본 full-image 좌표를 사용합니다. 보정 이미지의 좌표는 변환 후 사용하십시오.
+
+```python
+aligned_point = transform_point_to_aligned(dm, original_point)
+original_point = transform_point_to_original(dm, aligned_point)
+result = locate_die(dm, point=original_point)
+```
+
+## 4. Pitch 설정과 진단
+
+### 자동 측정
+
+```python
+dm = build_die_map_from_yolo(..., pitch_size=None)
+
+print(dm.pitch_source)       # "detected"
+print(dm.pitch_x, dm.pitch_y)
+```
+
+### 수동 입력
 
 ```python
 dm = build_die_map_from_yolo(
-    wafer_bgr,
-    center_clip_bgr,
-    detections=results[0].boxes.xywh.cpu().numpy(),
-    detection_format="xywh",
-    refine=True,                         # 기본값이므로 생략 가능
-    refine_mode="auto",
-    refine_radius=24,                    # YOLO 중심 오차보다 크게
-    refine_corner_patch_ratio=0.22,      # 로컬 ROI 꼭짓점 reference 영역
-    refine_corner_reference_weight=0.70,
-    refine_noise_kernel=5,               # 강한 점 잡음은 5 또는 7
-    refine_min_confidence=0.15,          # 낮으면 YOLO 원좌표 유지
+    ...,
+    pitch_size=(81.25, 93.50),
 )
+
+print(dm.pitch_source)                    # "manual"
+print(dm.pitch_x, dm.pitch_y)             # DM에 사용한 값
+print(dm.detected_pitch_x, dm.detected_pitch_y)  # YOLO 자동 측정 비교값
 ```
 
-모드의 차이:
+수동 pitch를 사용해도 `(0,0)` 기준과 angle은 YOLO/wafer 결과에서 계산합니다.
 
-- `auto`: corner 색상 차이와 Lab 경계를 결합하는 기본 권장 모드입니다.
-- `corner_color`: 로컬 네 corner die 색상과 다른 band만 사용합니다.
-- `gradient`: 기존 Lab 양방향 경계쌍만 사용합니다.
-
-먼저 `refine_radius`를 실제 YOLO 중심 최대 오차보다 조금 크게 맞추십시오. 실제 교차점이 ROI 밖이면 어떤 방식도 올바른 중심을 찾을 수 없습니다. `refine_min_confidence`보다 낮은 결과는 자동 폐기되고 원래 YOLO 중심이 사용됩니다.
+### Pitch 계산 좌표
 
 ```python
 grid = dm.grid_estimate
-print(grid.raw_points_clip)             # 보정 전
-print(grid.points_clip)                 # 보정 후/실제 사용 좌표
-print(grid.refinement_confidences)      # 점별 신뢰도
 
-debug = make_clip_overlay(center_clip_bgr, grid)
-cv2.imwrite("clip_refinement_overlay.png", debug)
+print(grid.pitch_x_points_clip)       # (P0, PX), 보정 후 clip 좌표
+print(grid.pitch_y_points_clip)       # (P0, PY), 보정 후 clip 좌표
+print(grid.pitch_x_points_raw_clip)   # 중심 보정 전 YOLO 좌표
+print(grid.pitch_y_points_raw_clip)
+
+print(dm.pitch_x_points_full)         # full-image 좌표
+print(dm.pitch_y_points_full)
+print(dm.pitch_x_points_raw_full)
+print(dm.pitch_y_points_raw_full)
 ```
 
-진단 overlay에서 흰색 빈 원은 YOLO 원좌표, 노란 점은 보정 후 좌표, 둘 사이 회색 선은 이동량입니다. 초록점은 최종 center corner입니다. 실제 이미지에서 이동 방향이 일관되는지 확인한 뒤 `refine_radius`, `refine_noise_kernel`, `refine_corner_patch_ratio`를 조정하십시오.
-
-### 4. `WaferBoundary`: wafer 외곽선 결과
+자동 pitch는 다음 거리와 같습니다.
 
 ```python
-boundary = dm.wafer_boundary
-if boundary is not None:
-    print(boundary.center_px)
-    print(boundary.radius_px)
-    print(boundary.bbox_px)
-    print(boundary.method)
+import math
+
+print(math.dist(*dm.pitch_x_points_full), dm.detected_pitch_x)
+print(math.dist(*dm.pitch_y_points_full), dm.detected_pitch_y)
 ```
 
-| 필드 | 의미 |
+`PX` 또는 `PY`가 바로 인접한 십자점이 아니라면 점 선택 문제입니다. 점은 정확하지만 wafer 외곽으로 갈수록 실제 간격이 달라지면 단일 pitch 문제가 아니라 렌즈 왜곡·원근 변화 가능성이 큽니다.
+
+## 5. Angle 보정과 진단
+
+기본 `angle_mode="robust"`는 전체 YOLO 점에서 가까운 X/Y 방향 벡터를 모으고 이상치를 제거합니다. 기존 두 벡터 방식은 비교용 `local` 모드로 유지됩니다.
+
+```python
+grid = dm.grid_estimate
+
+print("final:", dm.grid_angle_deg)
+print("robust:", grid.robust_angle_deg)
+print("local:", grid.local_angle_deg)
+print("confidence:", dm.angle_confidence)
+print("used/candidate:", len(grid.angle_pairs_clip), grid.angle_candidate_count)
+```
+
+Angle에 사용된 좌표와 개별 잔차:
+
+```python
+for pair, axis, measured, residual in zip(
+    grid.angle_pairs_clip,
+    grid.angle_pair_axes,
+    grid.angle_pair_angles_deg,
+    grid.angle_pair_residuals_deg,
+):
+    print(axis, pair, measured, residual)
+
+print(dm.angle_pairs_full)       # 보정 후 full-image 좌표쌍
+print(dm.angle_pairs_raw_full)   # 중심 보정 전 full-image 좌표쌍
+```
+
+튜닝 기준:
+
+- 기본값: `angle_inlier_tolerance_deg=2.5`
+- 좌표가 정밀하면 `1.0~1.5`
+- 노이즈가 강하면 `3.0~4.0`
+- 너무 크게 설정하면 잘못된 좌표쌍도 포함될 수 있음
+- 위치에 따라 angle이 계속 변하면 homography 또는 렌즈 왜곡 보정 필요
+
+기존 방식과 비교하려면 다음 옵션을 사용합니다.
+
+```python
+dm_local = build_die_map_from_yolo(..., angle_mode="local")
+```
+
+## 6. 중심 미세 보정
+
+기본 `refine_mode="auto"` 처리:
+
+1. YOLO 점 주변 ROI의 네 corner patch에서 die 대표 Lab 색상 계산
+2. 네 색상과 모두 다른 vertical/horizontal street 후보 계산
+3. Median filter와 projection으로 점 노이즈 억제
+4. Lab gradient 경계쌍 결과와 결합
+5. `refine_min_confidence` 미만이면 YOLO 원좌표 유지
+
+```python
+dm = build_die_map_from_yolo(
+    ...,
+    refine=True,
+    refine_mode="auto",        # auto | corner_color | gradient
+    refine_radius=24,
+    refine_noise_kernel=5,
+    refine_min_confidence=0.15,
+)
+
+grid = dm.grid_estimate
+print(grid.raw_points_clip)
+print(grid.points_clip)
+print(grid.refinement_confidences)
+```
+
+실제 교차점이 ROI 밖이면 `refine_radius`를 키우십시오. 보정 후가 더 부정확하면 `refine=False` 결과와 비교합니다.
+
+## 7. 진단 Overlay
+
+### Clip overlay
+
+```python
+clip_overlay = make_clip_overlay(center_clip_bgr, dm.grid_estimate)
+cv2.imwrite("clip_grid_debug.png", clip_overlay)
+```
+
+표시 의미:
+
+- 흰색 빈 원: 보정 전 YOLO 중심
+- 노란 점: 보정 후 실제 사용 좌표
+- 회색 선: 중심 보정 이동량
+- `P0`: `(0,0)` 기준 십자점
+- `PX`, `PY`: pitch 계산점
+- 청록/자홍 선: robust angle에 사용된 X/Y 좌표쌍
+- `N=사용 개수/전체 후보`: angle 이상치 제거 결과
+
+### Full wafer overlay
+
+```python
+wafer_overlay = make_wafer_overlay(
+    wafer_bgr,
+    dm,
+    draw_dies=True,
+    thickness=1,
+)
+cv2.imwrite("wafer_die_map.png", wafer_overlay)
+```
+
+## 8. Wafer 경계, edge die와 이미지 밖 index
+
+`include_edge=True`가 기본값입니다. Die 중심이 wafer나 이미지 밖이어도 polygon 일부가 wafer에 걸리면 index를 생성합니다.
+
+개별 die entry:
+
+| key | 의미 |
 |---|---|
-| `center_px` | contour 최소 외접원의 중심 |
-| `radius_px` | contour 최소 외접원의 반지름 |
-| `contour_px` | OpenCV contour 배열. full image 좌표 기준 |
-| `area_px` | contour 면적(px²) |
-| `bbox_px` | wafer contour의 `(x1, y1, x2, y2)` bounding box |
-| `method` | 선택된 외곽선 후보 방식: Lab border distance 또는 grayscale Otsu 계열 |
-
-정확한 die 포함 여부는 단순 원이 아니라 `contour_px`를 기준으로 계산합니다. `wafer_r`은 표시와 호환을 위한 외접원 값입니다.
-
-### 5. 개별 die entry 결과
+| `index` | `(ix, iy)`, X+ 오른쪽, Y+ 위쪽 |
+| `center_px` | 자르지 않은 die 중심 |
+| `polygon_px` | index용 전체 polygon, 이미지 밖 좌표 유지 |
+| `wafer_polygon_px` | wafer 외곽으로 자른 polygon |
+| `visible_polygon_px` | wafer와 이미지 범위로 자른 polygon |
+| `rect_px` | 전체 `polygon_px` bounding rectangle |
+| `crop_rect_px` | 이미지 안에서 crop 가능한 rectangle |
+| `full_area_px` | 자르기 전 면적 |
+| `wafer_area_px` | wafer 경계로 자른 면적 |
+| `visible_area_px` | 이미지에서 실제 보이는 면적 |
+| `is_edge_partial` | 일부가 wafer 밖인지 여부 |
+| `is_image_partial` | 일부가 이미지 밖인지 여부 |
+| `is_outside_image` | 이미지에 보이는 부분이 없는지 여부 |
 
 ```python
 die = dm.get_die(ix=2, iy=-3)
 if die is not None:
-    print(die)
+    print(die["polygon_px"])
+    print(die["wafer_polygon_px"])
+    print(die["visible_polygon_px"])
+    print(die["crop_rect_px"])
 ```
 
-| key | 의미 |
-|---|---|
-| `index` | `(ix, iy)`. X+는 오른쪽, Y+는 위쪽 |
-| `center_px` | die 중심의 full-image 픽셀 좌표 |
-| `polygon_px` | 회전이 반영된 die의 네 꼭짓점. 실제 die geometry 확인에 사용 |
-| `rect_px` | `polygon_px` 전체를 포함하는 축 정렬 bounding rectangle |
-| `crop_rect_px` | 현재는 `rect_px`와 동일한 crop 후보 영역 |
-| `real_coord` | wafer 중심 기준 die 중심의 실좌표 |
-| `is_edge_partial` | die polygon 일부가 wafer contour 밖에 있는지 여부 |
-| `is_edge_ring` | 주변 8개 index 중 하나라도 없어 grid 최외곽인지 여부 |
-| `is_edge` | `edge_mode`에 따라 선택된 최종 edge 판정 |
+`polygon_px`는 index/격자 계산용으로 자르지 않습니다. 표시와 crop에는 `visible_polygon_px`, `crop_rect_px`를 사용합니다. `include_edge=False`이면 wafer 경계에 걸린 partial die를 제외합니다.
 
-회전각이 0이 아니면 `rect_px`에는 polygon 바깥 영역도 포함됩니다. 정확한 die 영역이 필요하면 `polygon_px`를 mask 또는 perspective crop에 사용합니다.
+## 9. `locate_die()`
 
-### 6. `locate_die()` 반환 dictionary
+Point 또는 bbox 중심으로 die index를 찾습니다.
 
 ```python
 result = locate_die(dm, point=(5499, 4700))
+
 # 또는
 result = locate_die(dm, bbox=(4880, 5080, 4980, 5180))
 ```
 
-| key | 의미 |
+주요 반환값:
+
+```python
+print(result["die_index"])
+print(result["die_center_px"])
+print(result["die_polygon_px"])
+print(result["wafer_polygon_px"])
+print(result["visible_polygon_px"])
+print(result["crop_rect_px"])
+print(result["in_wafer"])
+print(result["is_edge"])
+```
+
+Query가 wafer 또는 이미지 밖이어도 격자 수식으로 `die_index`를 계산합니다. 실제 wafer 내부 여부는 `in_wafer`로 확인하십시오.
+
+## 10. 주요 반환 객체
+
+### `WaferDieMap`
+
+| 필드 | 의미 |
 |---|---|
-| `input_type` | 입력 방식: `point` 또는 `bbox` |
-| `query_px` | 실제 index 계산에 사용한 좌표. bbox 입력이면 bbox 중심 |
-| `die_index` | 계산된 `(ix, iy)` |
-| `die_center_px` | 해당 index die의 중심 |
-| `die_polygon_px` | 회전된 die의 네 꼭짓점 |
-| `die_rect_px` | die polygon을 포함하는 축 정렬 rectangle |
-| `crop_rect_px` | 현재 crop 후보 rectangle |
-| `real_coord` | query 좌표의 wafer 중심 기준 실좌표 |
-| `real_distance` | wafer 중심부터 query까지의 실좌표 거리 |
-| `die_real_coord` | query가 아니라 die 중심의 실좌표 |
-| `wafer_center_px` | 검출된 wafer 중심 |
-| `corner_px` | full-image center corner/grid origin |
-| `pitch_x`, `pitch_y` | map 생성에 사용한 pitch |
-| `angle_deg` | map 생성에 사용한 회전각 |
-| `is_edge_partial` | die 일부가 contour 밖인지 여부 |
-| `is_edge_ring` | grid 최외곽인지 여부 |
-| `is_edge` | `edge_mode` 기준 최종 edge 여부 |
-| `edge_mode` | 현재 edge 판정 방식 |
-| `in_wafer` | query 점 자체가 wafer contour 안인지 여부 |
+| `wafer_cx`, `wafer_cy`, `wafer_r` | 검출된 wafer 중심과 반지름 |
+| `x0`, `y0` | `(0,0)` grid origin의 full-image 좌표 |
+| `pitch_x`, `pitch_y` | DM에 실제 사용한 pitch |
+| `detected_pitch_x`, `detected_pitch_y` | YOLO에서 자동 측정한 pitch |
+| `pitch_source` | `detected`, `manual`, `direct` |
+| `grid_angle_deg` | DM과 aligned image에 사용한 angle |
+| `angle_confidence` | 선택된 angle 방식의 신뢰도 |
+| `grid_estimate` | clip 기반 중심/pitch/angle 상세 진단 |
+| `wafer_boundary` | full-image wafer contour |
+| `dies`, `dies_by_index` | die entry 목록과 index dictionary |
+| `aligned_image` | angle 보정된 full BGR 이미지 또는 `None` |
+| `original_to_aligned_matrix` | 원본 → 보정 좌표 affine matrix |
+| `aligned_to_original_matrix` | 보정 → 원본 좌표 affine matrix |
+| `num_dies` | 생성된 die 수 |
 
-`locate_die()`는 query가 wafer 밖이어도 해석적으로 index와 polygon을 계산합니다. 실제 wafer 내부인지는 반드시 `in_wafer`로 확인합니다.
-
-실좌표 계산식은 다음과 같습니다.
+### Angle 보정 이미지
 
 ```python
-real_x = (query_x - wafer_cx) / pixel_per_unit
-real_y = (wafer_cy - query_y) / pixel_per_unit  # 영상 위쪽이 +Y
+if dm.aligned_image is not None:
+    cv2.imwrite("wafer_aligned.png", dm.aligned_image)
 ```
 
-### 7. 오버레이 반환값
+10000×10000 BGR 이미지는 한 장당 약 300MB입니다. 메모리가 부족하면 다음 옵션을 사용합니다.
 
 ```python
-clip_overlay = make_clip_overlay(center_clip_bgr, dm.grid_estimate)
-wafer_overlay = make_wafer_overlay(wafer_bgr, dm)
-
-print(type(clip_overlay))   # numpy.ndarray
-print(type(wafer_overlay))  # numpy.ndarray
+dm = build_die_map_from_yolo(..., return_aligned_image=False)
 ```
 
-- 두 함수 모두 OpenCV BGR `numpy.ndarray`를 반환합니다.
-- `make_clip_overlay()`는 center/side/below 선택과 pitch/angle을 표시합니다.
-- `make_wafer_overlay()`는 wafer contour, center corner, wafer center, die polygon을 표시합니다.
-- 저장하지 않고 다음 영상처리 단계에 그대로 전달해도 됩니다.
-- `make_wafer_overlay()`는 full image 복사본을 만들기 때문에 10000×10000 BGR 기준 약 300MB가 추가로 필요합니다.
+좌표 변환 matrix는 이 경우에도 반환됩니다.
 
-### 8. 테스트에서 확인한 실제 결과 예시
+## 11. 문제 확인 순서
 
-아래 값은 반지름 4700px의 10000×10000 합성 wafer, `pitch_x=90`, `pitch_y=92`, `angle=3.25°` 조건의 검증 결과입니다. 실제 이미지의 결과값은 YOLO 좌표와 wafer 외곽선에 따라 달라집니다.
+1. `results[0].orig_shape == center_clip_bgr.shape[:2]`인지 확인
+2. `detections_xywh`를 clip에 직접 그려 YOLO 중심 확인
+3. `make_clip_overlay()`에서 흰 원 → 노란 점 이동 확인
+4. `P0/PX/PY`가 바로 인접한 십자점인지 확인
+5. `robust_angle_deg`, `local_angle_deg`, pair residual 비교
+6. `clip_origin`이 실제 crop 왼쪽 위 좌표인지 확인
+7. `dm.wafer_cx/cy`와 `dm.x0/y0`를 full image에서 확인
+8. 외곽으로 갈수록 pitch/angle이 변하면 렌즈 왜곡 또는 homography 검토
 
-```python
-{
-    "wafer_center_px": (5000, 5000),
-    "wafer_r": 4700,
-    "corner_px": (5000.0, 5000.0),
-    "pitch_x": 90.0,
-    "pitch_y": 92.0,
-    "angle_deg": 3.25,
-    "num_dies": 8376,
-}
+## 12. 파일 복사와 테스트
+
+별도 패키지 설치 없이 사용하려면 [wafer_via.py](./wafer_via.py) 파일 전체를 프로젝트에 복사하십시오. `build_die_map_from_yolo()` 함수 하나만 복사하면 내부 helper와 dataclass가 없어 동작하지 않습니다.
+
+필수 라이브러리:
+
+```bash
+pip install numpy opencv-python
 ```
 
-index `(2, -3)` die 중심을 다시 `locate_die()`에 입력한 결과입니다.
+테스트:
 
-```python
-{
-    "input_type": "point",
-    "query_px": (5212.0, 5242.0),
-    "die_index": (2, -3),
-    "die_center_px": (5212, 5242),
-    "die_rect_px": (5164, 5193, 5260, 5291),
-    "real_coord": (6.625, -7.5625),
-    "real_distance": 10.053956,
-    "is_edge": False,
-    "in_wafer": True,
-}
+```bash
+python -B -m unittest discover -s tests -v
 ```
 
-### 9. 결과 승인 전에 확인할 항목
+현재 회귀 테스트는 다음을 포함합니다.
 
-1. `center_corner_clip`이 실제 512 clip 중앙의 원하는 십자점인지 확인합니다.
-2. `side_corner_clip`과 `below_corner_clip`이 바로 인접한 점인지 확인합니다.
-3. `angle_x_deg`와 `angle_y_deg` 차이가 허용 범위 안인지 확인합니다.
-4. `pitch_x`, `pitch_y`가 장비의 예상 die 크기와 일치하는지 확인합니다.
-5. clip overlay에서 세 기준점과 화살표 방향을 확인합니다.
-6. wafer overlay에서 외곽 contour와 회전 die polygon 정합을 확인합니다.
-7. 검사 좌표 조회 시 `die_index`뿐 아니라 `in_wafer`, `is_edge`도 함께 확인합니다.
-
-## 각도와 좌표 규칙
-
-- `angle_deg > 0`: 오른쪽 이웃으로 갈수록 영상 Y가 증가하는 기울기입니다.
-- 같은 값은 `cv2.getRotationMatrix2D(..., angle_deg, 1)`로 수평 보정할 때 쓸 수 있습니다.
-- die lattice와 `locate_die()`는 원본 좌표를 유지합니다. `aligned_image`에서 얻은 좌표만 `transform_point_to_original()`로 되돌립니다.
-- index는 기존 규칙처럼 `X+ = 오른쪽`, `Y+ = 위쪽`입니다.
-
-## 구현 위치(Edit map)
-
-- `[SECTOR: 10_YOLO_COORDINATES]`: YOLO txt/point/bbox 파싱
-- `[SECTOR: 20_COLOR_INVARIANT_REFINEMENT]`: 선택형 Lab 미세 보정
-- `[SECTOR: 30_GRID_ESTIMATION]`: center/side/below, pitch, angle
-- `[SECTOR: 40_WAFER_BOUNDARY]`: wafer 외곽 contour
-- `[SECTOR: 50_DIE_MAP]`: 회전 die map 생성
-- `[SECTOR: 60_LOCATE_DIE]`: point/bbox → die index
-- `[SECTOR: 65_ANGLE_ALIGNED_IMAGE]`: angle 보정 이미지와 원본↔보정 좌표 변환
-- `[SECTOR: 70_OVERLAY]`: clip/wafer overlay
-- `[SECTOR: 80_PIPELINE]`: end-to-end API
-- `[SECTOR: 90_USAGE_REFERENCE]`: 단일 파일 복사용 상세 한국어 주석 예제
-
-## 검증
-
-```powershell
-python -m py_compile codex\wafer_via.py tests\test_wafer_via.py
-python -m unittest discover -s tests -v
-```
+- Ultralytics/YOLO 좌표 형식
+- 다양한 die 색상과 강한 노이즈 중심 보정
+- 한 중심점이 틀린 경우 robust angle 복원
+- 수동 pitch override
+- image center와 wafer center가 다른 경우 `(0,0)` 선택
+- wafer/image 경계 die clipping과 index 유지
+- 10000×10000 die-map geometry와 `locate_die`
+- angle 보정 이미지와 좌표 왕복 변환

@@ -19,10 +19,12 @@ import numpy as np
 
 ImageInput = Union[str, Path, np.ndarray]
 Point = Tuple[float, float]
+PointPair = Tuple[Point, Point]
 DetectionFormat = Literal[
     "auto", "point", "point_conf", "xyxy", "xywh", "yolo_txt", "xyxy_conf_class"
 ]
 RefinementMode = Literal["auto", "gradient", "corner_color"]
+AngleMode = Literal["robust", "local"]
 
 __all__ = [
     "GridEstimate",
@@ -86,6 +88,48 @@ class GridEstimate:
     raw_points_clip: Tuple[Point, ...] = ()
     refinement_confidences: Tuple[float, ...] = ()
     refinement_mode: str = "none"
+    center_corner_raw_clip: Optional[Point] = None
+    side_corner_raw_clip: Optional[Point] = None
+    below_corner_raw_clip: Optional[Point] = None
+    angle_mode: str = "local"
+    robust_angle_deg: Optional[float] = None
+    local_angle_deg: Optional[float] = None
+    angle_pairs_clip: Tuple[PointPair, ...] = ()
+    angle_pairs_raw_clip: Tuple[PointPair, ...] = ()
+    angle_pair_axes: Tuple[str, ...] = ()
+    angle_pair_angles_deg: Tuple[float, ...] = ()
+    angle_pair_residuals_deg: Tuple[float, ...] = ()
+    angle_candidate_count: int = 0
+
+    @property
+    def pitch_x_points_clip(self) -> PointPair:
+        """Refined/accepted centre and side points used for ``pitch_x``."""
+
+        return self.center_corner_clip, self.side_corner_clip
+
+    @property
+    def pitch_y_points_clip(self) -> PointPair:
+        """Refined/accepted centre and below points used for ``pitch_y``."""
+
+        return self.center_corner_clip, self.below_corner_clip
+
+    @property
+    def pitch_x_points_raw_clip(self) -> PointPair:
+        """Original YOLO centres corresponding to the X-pitch point pair."""
+
+        return (
+            self.center_corner_raw_clip or self.center_corner_clip,
+            self.side_corner_raw_clip or self.side_corner_clip,
+        )
+
+    @property
+    def pitch_y_points_raw_clip(self) -> PointPair:
+        """Original YOLO centres corresponding to the Y-pitch point pair."""
+
+        return (
+            self.center_corner_raw_clip or self.center_corner_clip,
+            self.below_corner_raw_clip or self.below_corner_clip,
+        )
 
     def to_dict(self) -> Dict[str, Any]:
         return {
@@ -103,6 +147,22 @@ class GridEstimate:
             "raw_points_clip": list(self.raw_points_clip),
             "refinement_confidences": list(self.refinement_confidences),
             "refinement_mode": self.refinement_mode,
+            "center_corner_raw_clip": self.center_corner_raw_clip,
+            "side_corner_raw_clip": self.side_corner_raw_clip,
+            "below_corner_raw_clip": self.below_corner_raw_clip,
+            "pitch_x_points_clip": self.pitch_x_points_clip,
+            "pitch_y_points_clip": self.pitch_y_points_clip,
+            "pitch_x_points_raw_clip": self.pitch_x_points_raw_clip,
+            "pitch_y_points_raw_clip": self.pitch_y_points_raw_clip,
+            "angle_mode": self.angle_mode,
+            "robust_angle_deg": self.robust_angle_deg,
+            "local_angle_deg": self.local_angle_deg,
+            "angle_pairs_clip": self.angle_pairs_clip,
+            "angle_pairs_raw_clip": self.angle_pairs_raw_clip,
+            "angle_pair_axes": self.angle_pair_axes,
+            "angle_pair_angles_deg": self.angle_pair_angles_deg,
+            "angle_pair_residuals_deg": self.angle_pair_residuals_deg,
+            "angle_candidate_count": self.angle_candidate_count,
         }
 
 
@@ -140,6 +200,15 @@ class WaferDieMap:
     aligned_image: Optional[np.ndarray] = field(default=None, repr=False)
     original_to_aligned_matrix: Optional[np.ndarray] = field(default=None, repr=False)
     aligned_to_original_matrix: Optional[np.ndarray] = field(default=None, repr=False)
+    pitch_x_points_full: Optional[PointPair] = None
+    pitch_y_points_full: Optional[PointPair] = None
+    pitch_x_points_raw_full: Optional[PointPair] = None
+    pitch_y_points_raw_full: Optional[PointPair] = None
+    detected_pitch_x: Optional[float] = None
+    detected_pitch_y: Optional[float] = None
+    pitch_source: str = "direct"
+    angle_pairs_full: Tuple[PointPair, ...] = ()
+    angle_pairs_raw_full: Tuple[PointPair, ...] = ()
 
     @property
     def num_dies(self) -> int:
@@ -658,30 +727,89 @@ def _weighted_median(values: np.ndarray, weights: np.ndarray) -> float:
     return float(sorted_values[min(index, len(sorted_values) - 1)])
 
 
-def _estimate_grid_orientation(points: np.ndarray, max_rotation_deg: float) -> float:
+@dataclass(frozen=True)
+class _RobustAngleEstimate:
+    angle_deg: float
+    confidence: float
+    pair_indices: Tuple[Tuple[int, int], ...]
+    pair_axes: Tuple[str, ...]
+    pair_angles_deg: Tuple[float, ...]
+    pair_residuals_deg: Tuple[float, ...]
+    candidate_count: int
+
+
+def _estimate_grid_orientation(
+    points: np.ndarray,
+    max_rotation_deg: float,
+    inlier_tolerance_deg: float,
+) -> _RobustAngleEstimate:
     angles: List[float] = []
     weights: List[float] = []
-    neighbour_count = min(6, len(points) - 1)
+    pair_indices: List[Tuple[int, int]] = []
+    pair_axes: List[str] = []
+    seen_pairs: set[Tuple[int, int]] = set()
+    neighbour_count = min(8, len(points) - 1)
     for index, point in enumerate(points):
         delta = points - point
         distances = np.linalg.norm(delta, axis=1)
         neighbours = np.argsort(distances)[1:neighbour_count + 1]
-        for neighbour in neighbours:
-            if distances[neighbour] < 3.0:
+        for neighbour_value in neighbours:
+            neighbour = int(neighbour_value)
+            pair = (min(index, neighbour), max(index, neighbour))
+            if pair in seen_pairs or distances[neighbour] < 3.0:
                 continue
-            angle = _fold_grid_angle(math.degrees(math.atan2(delta[neighbour, 1], delta[neighbour, 0])))
-            if abs(angle) <= max_rotation_deg:
-                angles.append(angle)
-                weights.append(1.0 / distances[neighbour])
+            seen_pairs.add(pair)
+            vector = points[pair[1]] - points[pair[0]]
+            folded_angle = _fold_grid_angle(
+                math.degrees(math.atan2(float(vector[1]), float(vector[0])))
+            )
+            if abs(folded_angle) > max_rotation_deg:
+                continue
+            pair_indices.append(pair)
+            pair_axes.append("x" if abs(float(vector[0])) >= abs(float(vector[1])) else "y")
+            angles.append(folded_angle)
+            # Longer grid-aligned spans are less sensitive to a 1~2 px point
+            # localisation error. sqrt prevents a long span from dominating.
+            weights.append(math.sqrt(float(distances[neighbour])))
     if not angles:
         raise ValueError("No horizontal/vertical YOLO point pairs were found within max_rotation_deg.")
-    values = np.asarray(angles)
-    weight_array = np.asarray(weights)
+
+    values = np.asarray(angles, dtype=np.float64)
+    weight_array = np.asarray(weights, dtype=np.float64)
     first = _weighted_median(values, weight_array)
-    keep = np.abs(values - first) <= 4.0
-    if not np.any(keep):
-        return first
-    return _weighted_median(values[keep], weight_array[keep])
+    broad_keep = np.abs(values - first) <= max(4.0, inlier_tolerance_deg * 2.0)
+    robust_angle = _weighted_median(values[broad_keep], weight_array[broad_keep])
+    residuals = np.abs(values - robust_angle)
+    inliers = residuals <= inlier_tolerance_deg
+    if not np.any(inliers):
+        inliers[int(np.argmin(residuals))] = True
+    robust_angle = _weighted_median(values[inliers], weight_array[inliers])
+    residuals = np.abs(values - robust_angle)
+    inliers = residuals <= inlier_tolerance_deg
+
+    inlier_indices = np.flatnonzero(inliers)
+    inlier_ratio = float(len(inlier_indices) / len(values))
+    inlier_spread = _weighted_median(
+        residuals[inliers], weight_array[inliers]
+    ) if np.any(inliers) else inlier_tolerance_deg
+    axes_used = {pair_axes[int(index)] for index in inlier_indices}
+    axis_coverage = 1.0 if axes_used == {"x", "y"} else 0.70
+    confidence = float(np.clip(
+        inlier_ratio
+        * math.exp(-inlier_spread / max(inlier_tolerance_deg, 1e-6))
+        * axis_coverage,
+        0.0,
+        1.0,
+    ))
+    return _RobustAngleEstimate(
+        angle_deg=float(robust_angle),
+        confidence=confidence,
+        pair_indices=tuple(pair_indices[int(index)] for index in inlier_indices),
+        pair_axes=tuple(pair_axes[int(index)] for index in inlier_indices),
+        pair_angles_deg=tuple(float(values[int(index)]) for index in inlier_indices),
+        pair_residuals_deg=tuple(float(residuals[int(index)]) for index in inlier_indices),
+        candidate_count=len(values),
+    )
 
 
 def _select_axis_neighbour(
@@ -726,6 +854,8 @@ def estimate_grid_from_yolo(
     refine_corner_reference_weight: float = 0.70,
     refine_noise_kernel: int = 5,
     refine_min_confidence: float = 0.15,
+    angle_mode: AngleMode = "robust",
+    angle_inlier_tolerance_deg: float = 2.5,
     max_rotation_deg: float = 20.0,
     axis_tolerance: float = 0.18,
     perpendicular_tolerance_px: float = 5.0,
@@ -741,6 +871,10 @@ def estimate_grid_from_yolo(
 
     if not (0.0 <= float(refine_min_confidence) <= 1.0):
         raise ValueError("refine_min_confidence must be between 0.0 and 1.0.")
+    if angle_mode not in ("robust", "local"):
+        raise ValueError("angle_mode must be 'robust' or 'local'.")
+    if not (0.05 <= float(angle_inlier_tolerance_deg) <= 10.0):
+        raise ValueError("angle_inlier_tolerance_deg must be between 0.05 and 10.0.")
     image = _load_bgr(clip_image)
     height, width = image.shape[:2]
     points = parse_yolo_points(
@@ -783,8 +917,10 @@ def estimate_grid_from_yolo(
         raise ValueError("reference_point_clip must contain two finite coordinates.")
     center_index = int(np.argmin(np.linalg.norm(array - selection_reference, axis=1)))
     center = array[center_index]
-    orientation = _estimate_grid_orientation(array, max_rotation_deg)
-    angle = math.radians(orientation)
+    robust_angle = _estimate_grid_orientation(
+        array, max_rotation_deg, angle_inlier_tolerance_deg
+    )
+    angle = math.radians(robust_angle.angle_deg)
     axis_x = np.array((math.cos(angle), math.sin(angle)))
     axis_y = np.array((-math.sin(angle), math.cos(angle)))
     delta = array - center
@@ -810,13 +946,27 @@ def estimate_grid_from_yolo(
     angle_x = _fold_grid_angle(math.degrees(math.atan2(side_vector[1], side_vector[0])))
     angle_y = _fold_grid_angle(math.degrees(math.atan2(-below_vector[0], below_vector[1])))
     disagreement = abs(angle_x - angle_y)
-    if strict and disagreement > max_axis_disagreement_deg:
+    if angle_mode == "local" and strict and disagreement > max_axis_disagreement_deg:
         raise ValueError(
             f"X/Y angle disagreement is {disagreement:.3f} deg, above "
             f"{max_axis_disagreement_deg:.3f} deg. Check YOLO false positives."
         )
-    combined_angle = float((angle_x + angle_y) / 2.0)
-    confidence = float(np.clip(1.0 - disagreement / max(max_axis_disagreement_deg * 2.0, 1e-6), 0.0, 1.0))
+    local_angle = float((angle_x + angle_y) / 2.0)
+    local_confidence = float(np.clip(
+        1.0 - disagreement / max(max_axis_disagreement_deg * 2.0, 1e-6),
+        0.0,
+        1.0,
+    ))
+    combined_angle = robust_angle.angle_deg if angle_mode == "robust" else local_angle
+    confidence = robust_angle.confidence if angle_mode == "robust" else local_confidence
+    angle_pairs = tuple(
+        (_point(array[first]), _point(array[second]))
+        for first, second in robust_angle.pair_indices
+    )
+    raw_angle_pairs = tuple(
+        (_point(raw_points[first]), _point(raw_points[second]))
+        for first, second in robust_angle.pair_indices
+    )
     return GridEstimate(
         points_clip=tuple(_point(point) for point in array),
         center_corner_clip=_point(center),
@@ -832,6 +982,18 @@ def estimate_grid_from_yolo(
         raw_points_clip=tuple(_point(point) for point in raw_points),
         refinement_confidences=tuple(refinement_confidences),
         refinement_mode=refine_mode if refine else "none",
+        center_corner_raw_clip=_point(raw_points[center_index]),
+        side_corner_raw_clip=_point(raw_points[side_index]),
+        below_corner_raw_clip=_point(raw_points[below_index]),
+        angle_mode=angle_mode,
+        robust_angle_deg=robust_angle.angle_deg,
+        local_angle_deg=local_angle,
+        angle_pairs_clip=angle_pairs,
+        angle_pairs_raw_clip=raw_angle_pairs,
+        angle_pair_axes=robust_angle.pair_axes,
+        angle_pair_angles_deg=robust_angle.pair_angles_deg,
+        angle_pair_residuals_deg=robust_angle.pair_residuals_deg,
+        angle_candidate_count=robust_angle.candidate_count,
     )
 
 
@@ -937,6 +1099,27 @@ def _die_polygon(origin: Point, ix: int, iy: int, pitch_x: float, pitch_y: float
     )
 
 
+def _convex_intersection(
+    first: np.ndarray,
+    second: np.ndarray,
+) -> Tuple[float, np.ndarray]:
+    first_polygon = np.asarray(first, dtype=np.float32).reshape(-1, 2)
+    second_polygon = np.asarray(second, dtype=np.float32).reshape(-1, 2)
+    if len(first_polygon) < 3 or len(second_polygon) < 3:
+        return 0.0, np.empty((0, 2), dtype=np.float64)
+    area, intersection = cv2.intersectConvexConvex(first_polygon, second_polygon)
+    if intersection is None or float(area) <= 1e-6:
+        return 0.0, np.empty((0, 2), dtype=np.float64)
+    return float(area), np.asarray(intersection, dtype=np.float64).reshape(-1, 2)
+
+
+def _polygon_points(polygon: np.ndarray) -> Tuple[Point, ...]:
+    return tuple(
+        (float(point[0]), float(point[1]))
+        for point in np.asarray(polygon).reshape(-1, 2)
+    )
+
+
 def generate_die_map(
     boundary: WaferBoundary,
     image_shape: Tuple[int, int],
@@ -961,6 +1144,17 @@ def generate_die_map(
     mode = _normalize_edge_mode(edge_mode)
     contour = np.asarray(boundary.contour_px, dtype=np.int32).reshape(-1, 1, 2)
     contour_points = contour.reshape(-1, 2).astype(np.float64)
+    wafer_hull = cv2.convexHull(contour).reshape(-1, 2).astype(np.float64)
+    image_height, image_width = int(image_shape[0]), int(image_shape[1])
+    image_polygon = np.asarray(
+        (
+            (0.0, 0.0),
+            (float(image_width), 0.0),
+            (float(image_width), float(image_height)),
+            (0.0, float(image_height)),
+        ),
+        dtype=np.float64,
+    )
     origin = np.asarray(origin_full, dtype=np.float64)
     angle = math.radians(angle_deg)
     axis_x = np.array((math.cos(angle), math.sin(angle)), dtype=np.float64)
@@ -983,23 +1177,46 @@ def generate_die_map(
             polygon = _die_polygon(origin_full, ix, iy, pitch_x, pitch_y, angle_deg)
             center = polygon.mean(axis=0)
             signed_distance = cv2.pointPolygonTest(contour, (float(center[0]), float(center[1])), True)
-            if signed_distance < margin_distance:
+            if edge_margin < 1.0 and signed_distance < margin_distance:
                 continue
-            corner_inside = [cv2.pointPolygonTest(contour, (float(p[0]), float(p[1])), False) >= 0 for p in polygon]
-            partial = not all(corner_inside)
+            full_area = abs(float(cv2.contourArea(polygon.astype(np.float32))))
+            wafer_area, wafer_polygon = _convex_intersection(polygon, wafer_hull)
+            if wafer_area <= 1e-6:
+                continue
+            partial = wafer_area < full_area - max(1e-3, full_area * 1e-6)
             if not include_edge and partial:
                 continue
+            visible_area, visible_polygon = _convex_intersection(wafer_polygon, image_polygon)
+            image_partial = visible_area < wafer_area - max(1e-3, wafer_area * 1e-6)
             x1, y1 = np.floor(polygon.min(axis=0)).astype(int)
             x2, y2 = np.ceil(polygon.max(axis=0)).astype(int)
+            if len(visible_polygon) >= 3:
+                crop_x1, crop_y1 = np.floor(visible_polygon.min(axis=0)).astype(int)
+                crop_x2, crop_y2 = np.ceil(visible_polygon.max(axis=0)).astype(int)
+                crop_rect = (
+                    int(np.clip(crop_x1, 0, image_width)),
+                    int(np.clip(crop_y1, 0, image_height)),
+                    int(np.clip(crop_x2, 0, image_width)),
+                    int(np.clip(crop_y2, 0, image_height)),
+                )
+            else:
+                crop_rect = (0, 0, 0, 0)
             cx, cy = int(round(float(center[0]))), int(round(float(center[1])))
             entry: Dict[str, Any] = {
                 "index": (ix, iy),
                 "center_px": (cx, cy),
                 "rect_px": (int(x1), int(y1), int(x2), int(y2)),
-                "crop_rect_px": (int(x1), int(y1), int(x2), int(y2)),
-                "polygon_px": tuple((float(p[0]), float(p[1])) for p in polygon),
+                "crop_rect_px": crop_rect,
+                "polygon_px": _polygon_points(polygon),
+                "wafer_polygon_px": _polygon_points(wafer_polygon),
+                "visible_polygon_px": _polygon_points(visible_polygon),
+                "full_area_px": full_area,
+                "wafer_area_px": wafer_area,
+                "visible_area_px": visible_area,
                 "real_coord": ((cx - wafer_cx) / pixel_per_unit, (wafer_cy - cy) / pixel_per_unit),
                 "is_edge_partial": bool(partial),
+                "is_image_partial": bool(image_partial),
+                "is_outside_image": bool(visible_area <= 1e-6),
                 "is_edge_ring": False,
                 "is_edge": False,
             }
@@ -1060,11 +1277,37 @@ def locate_die(
     if entry is not None:
         partial = bool(entry["is_edge_partial"])
         ring = bool(entry["is_edge_ring"])
+        die_rect = entry["rect_px"]
+        crop_rect = entry["crop_rect_px"]
+        wafer_polygon = entry.get("wafer_polygon_px", ())
+        visible_polygon = entry.get("visible_polygon_px", ())
+        image_partial = bool(entry.get("is_image_partial", False))
+        outside_image = bool(entry.get("is_outside_image", False))
     elif contour is not None:
         partial = not all(cv2.pointPolygonTest(contour, (float(p[0]), float(p[1])), False) >= 0 for p in polygon)
         ring = True
+        die_rect = (int(x1), int(y1), int(x2), int(y2))
+        crop_rect = (
+            int(np.clip(x1, 0, die_map.image_shape[1])),
+            int(np.clip(y1, 0, die_map.image_shape[0])),
+            int(np.clip(x2, 0, die_map.image_shape[1])),
+            int(np.clip(y2, 0, die_map.image_shape[0])),
+        )
+        wafer_polygon, visible_polygon = (), ()
+        image_partial = bool(
+            x1 < 0 or y1 < 0
+            or x2 > die_map.image_shape[1] or y2 > die_map.image_shape[0]
+        )
+        outside_image = bool(
+            x2 <= 0 or y2 <= 0
+            or x1 >= die_map.image_shape[1] or y1 >= die_map.image_shape[0]
+        )
     else:
         partial, ring = True, True
+        die_rect = (int(x1), int(y1), int(x2), int(y2))
+        crop_rect = die_rect
+        wafer_polygon, visible_polygon = (), ()
+        image_partial, outside_image = False, False
     rx = (qx - die_map.wafer_cx) / die_map.pixel_per_unit
     ry = (die_map.wafer_cy - qy) / die_map.pixel_per_unit
     cx, cy = int(round(float(center[0]))), int(round(float(center[1])))
@@ -1073,9 +1316,11 @@ def locate_die(
         "query_px": (qx, qy),
         "die_index": (ix, iy),
         "die_center_px": (cx, cy),
-        "die_rect_px": (int(x1), int(y1), int(x2), int(y2)),
-        "crop_rect_px": (int(x1), int(y1), int(x2), int(y2)),
+        "die_rect_px": die_rect,
+        "crop_rect_px": crop_rect,
         "die_polygon_px": tuple((float(p[0]), float(p[1])) for p in polygon),
+        "wafer_polygon_px": wafer_polygon,
+        "visible_polygon_px": visible_polygon,
         "real_coord": (rx, ry),
         "real_distance": math.hypot(rx, ry),
         "die_real_coord": ((cx - die_map.wafer_cx) / die_map.pixel_per_unit,
@@ -1087,6 +1332,8 @@ def locate_die(
         "angle_deg": die_map.grid_angle_deg,
         "is_edge": bool(_edge_flag(partial, ring, die_map.edge_mode)),
         "is_edge_partial": partial,
+        "is_image_partial": image_partial,
+        "is_outside_image": outside_image,
         "is_edge_ring": ring,
         "edge_mode": die_map.edge_mode,
         "in_wafer": in_wafer,
@@ -1163,6 +1410,14 @@ def transform_point_to_original(die_map: WaferDieMap, point: Point) -> Point:
 # [SECTOR: 70_OVERLAY] --------------------------------------------------------
 def make_clip_overlay(clip_image: ImageInput, estimate: GridEstimate) -> np.ndarray:
     overlay = _load_bgr(clip_image).copy()
+    if estimate.angle_pairs_clip:
+        angle_layer = overlay.copy()
+        for pair, axis in zip(estimate.angle_pairs_clip, estimate.angle_pair_axes):
+            first = tuple(np.rint(pair[0]).astype(int))
+            second = tuple(np.rint(pair[1]).astype(int))
+            colour = (255, 170, 40) if axis == "x" else (210, 80, 255)
+            cv2.line(angle_layer, first, second, colour, 1, cv2.LINE_AA)
+        overlay = cv2.addWeighted(angle_layer, 0.45, overlay, 0.55, 0.0)
     if estimate.raw_points_clip:
         for raw_point, refined_point in zip(estimate.raw_points_clip, estimate.points_clip):
             raw = tuple(np.rint(raw_point).astype(int))
@@ -1178,9 +1433,24 @@ def make_clip_overlay(clip_image: ImageInput, estimate: GridEstimate) -> np.ndar
     cv2.circle(overlay, center, 7, (0, 255, 0), -1, cv2.LINE_AA)
     cv2.arrowedLine(overlay, center, side, (255, 120, 0), 2, cv2.LINE_AA, tipLength=0.12)
     cv2.arrowedLine(overlay, center, below, (255, 0, 255), 2, cv2.LINE_AA, tipLength=0.12)
+    for text, point, colour in (
+        ("P0", center, (0, 255, 0)),
+        ("PX", side, (255, 120, 0)),
+        ("PY", below, (255, 0, 255)),
+    ):
+        cv2.putText(
+            overlay, text, (point[0] + 6, point[1] - 6),
+            cv2.FONT_HERSHEY_SIMPLEX, 0.42, (0, 0, 0), 3, cv2.LINE_AA,
+        )
+        cv2.putText(
+            overlay, text, (point[0] + 6, point[1] - 6),
+            cv2.FONT_HERSHEY_SIMPLEX, 0.42, colour, 1, cv2.LINE_AA,
+        )
     label = (
         f"Px={estimate.pitch_x:.2f} Py={estimate.pitch_y:.2f} "
-        f"A={estimate.angle_deg:.3f}deg R={estimate.refinement_mode}"
+        f"A={estimate.angle_deg:.3f}deg({estimate.angle_mode}) "
+        f"N={len(estimate.angle_pairs_clip)}/{estimate.angle_candidate_count} "
+        f"R={estimate.refinement_mode}"
     )
     cv2.putText(overlay, label, (8, max(20, overlay.shape[0] - 10)),
                 cv2.FONT_HERSHEY_SIMPLEX, 0.45, (0, 0, 0), 3, cv2.LINE_AA)
@@ -1201,7 +1471,12 @@ def make_wafer_overlay(
         cv2.drawContours(overlay, [die_map.wafer_boundary.contour_px], -1, (0, 255, 255), max(2, thickness * 2))
     if draw_dies:
         for die in die_map.dies:
-            polygon = np.rint(np.asarray(die["polygon_px"])).astype(np.int32)
+            polygon_points = die.get("visible_polygon_px", die["polygon_px"])
+            if not polygon_points:
+                continue
+            polygon = np.rint(np.asarray(polygon_points)).astype(np.int32)
+            if len(polygon) < 3:
+                continue
             colour = (0, 80, 255) if die["is_edge"] else (0, 220, 0)
             cv2.polylines(overlay, [polygon], True, colour, thickness, cv2.LINE_AA)
     cv2.circle(overlay, (die_map.wafer_cx, die_map.wafer_cy), max(4, thickness * 3), (0, 0, 255), -1)
@@ -1228,6 +1503,9 @@ def build_die_map_from_yolo(
     refine_corner_reference_weight: float = 0.70,
     refine_noise_kernel: int = 5,
     refine_min_confidence: float = 0.15,
+    angle_mode: AngleMode = "robust",
+    angle_inlier_tolerance_deg: float = 2.5,
+    pitch_size: Optional[Tuple[float, float]] = None,
     pixel_per_unit: float = 32.0,
     include_edge: bool = True,
     edge_margin: float = 1.0,
@@ -1270,12 +1548,27 @@ def build_die_map_from_yolo(
         refine_corner_reference_weight=refine_corner_reference_weight,
         refine_noise_kernel=refine_noise_kernel,
         refine_min_confidence=refine_min_confidence,
+        angle_mode=angle_mode,
+        angle_inlier_tolerance_deg=angle_inlier_tolerance_deg,
     )
     origin_full = (clip_origin[0] + estimate.center_corner_clip[0],
                    clip_origin[1] + estimate.center_corner_clip[1])
+    if pitch_size is None:
+        map_pitch_x, map_pitch_y = estimate.pitch_x, estimate.pitch_y
+        pitch_source = "detected"
+    else:
+        pitch_values = np.asarray(pitch_size, dtype=np.float64).reshape(-1)
+        if (
+            pitch_values.size != 2
+            or not np.all(np.isfinite(pitch_values))
+            or np.any(pitch_values <= 0.0)
+        ):
+            raise ValueError("pitch_size must be a positive finite (pitch_x, pitch_y) pair.")
+        map_pitch_x, map_pitch_y = float(pitch_values[0]), float(pitch_values[1])
+        pitch_source = "manual"
     die_map = generate_die_map(
         boundary, (full_height, full_width), origin_full,
-        estimate.pitch_x, estimate.pitch_y, estimate.angle_deg,
+        map_pitch_x, map_pitch_y, estimate.angle_deg,
         pixel_per_unit=pixel_per_unit,
         include_edge=include_edge,
         edge_margin=edge_margin,
@@ -1283,6 +1576,30 @@ def build_die_map_from_yolo(
         angle_confidence=estimate.angle_confidence,
         grid_estimate=estimate,
     )
+
+    def pair_to_full(pair: PointPair) -> PointPair:
+        return (
+            (
+                float(clip_origin[0]) + float(pair[0][0]),
+                float(clip_origin[1]) + float(pair[0][1]),
+            ),
+            (
+                float(clip_origin[0]) + float(pair[1][0]),
+                float(clip_origin[1]) + float(pair[1][1]),
+            ),
+        )
+
+    die_map.pitch_x_points_full = pair_to_full(estimate.pitch_x_points_clip)
+    die_map.pitch_y_points_full = pair_to_full(estimate.pitch_y_points_clip)
+    die_map.pitch_x_points_raw_full = pair_to_full(estimate.pitch_x_points_raw_clip)
+    die_map.pitch_y_points_raw_full = pair_to_full(estimate.pitch_y_points_raw_clip)
+    die_map.angle_pairs_full = tuple(pair_to_full(pair) for pair in estimate.angle_pairs_clip)
+    die_map.angle_pairs_raw_full = tuple(
+        pair_to_full(pair) for pair in estimate.angle_pairs_raw_clip
+    )
+    die_map.detected_pitch_x = float(estimate.pitch_x)
+    die_map.detected_pitch_y = float(estimate.pitch_y)
+    die_map.pitch_source = pitch_source
     matrix, inverse = _alignment_matrices(
         (die_map.wafer_cx, die_map.wafer_cy), die_map.grid_angle_deg
     )
@@ -1459,6 +1776,9 @@ build_die_map = build_die_map_from_yolo
 #     refine_mode="auto",            # auto | corner_color | gradient
 #     refine_radius=18,               # YOLO 중심 주변 탐색 반경(px)
 #     refine_min_confidence=0.15,     # 이보다 낮으면 YOLO 원좌표 유지
+#     angle_mode="robust",           # robust=전체 점, local=기존 P0/PX/PY
+#     angle_inlier_tolerance_deg=2.5,
+#     pitch_size=None,               # None=자동, 또는 (pitch_x, pitch_y)
 #     pixel_per_unit=32.0,            # 실좌표 환산용 px/unit
 #     include_edge=True,              # wafer 외곽의 partial die도 map에 포함
 #     edge_margin=1.0,
@@ -1482,8 +1802,16 @@ build_die_map = build_die_map_from_yolo
 # print("center corner(full image):", (dm.x0, dm.y0))
 # print("pitch_x:", dm.pitch_x)
 # print("pitch_y:", dm.pitch_y)
+# print("pitch source:", dm.pitch_source)  # detected / manual
+# print("detected pitch:", (dm.detected_pitch_x, dm.detected_pitch_y))
+# print("pitch_x points(full):", dm.pitch_x_points_full)
+# print("pitch_y points(full):", dm.pitch_y_points_full)
+# print("pitch_x raw points(full):", dm.pitch_x_points_raw_full)
+# print("pitch_y raw points(full):", dm.pitch_y_points_raw_full)
 # print("grid angle(deg):", dm.grid_angle_deg)
 # print("angle confidence:", dm.angle_confidence)
+# print("angle pairs(full):", dm.angle_pairs_full)
+# print("angle pairs raw(full):", dm.angle_pairs_raw_full)
 # print("number of dies:", dm.num_dies)
 # print("full image shape:", dm.image_shape)
 # print("aligned image:", None if dm.aligned_image is None else dm.aligned_image.shape)
@@ -1494,8 +1822,17 @@ build_die_map = build_die_map_from_yolo
 #     print("center corner in clip:", estimate.center_corner_clip)
 #     print("side corner in clip:", estimate.side_corner_clip)
 #     print("below corner in clip:", estimate.below_corner_clip)
+#     print("pitch_x points(clip):", estimate.pitch_x_points_clip)
+#     print("pitch_y points(clip):", estimate.pitch_y_points_clip)
+#     print("pitch_x raw points(clip):", estimate.pitch_x_points_raw_clip)
+#     print("pitch_y raw points(clip):", estimate.pitch_y_points_raw_clip)
 #     print("angle from X vector:", estimate.angle_x_deg)
 #     print("angle from Y vector:", estimate.angle_y_deg)
+#     print("robust angle:", estimate.robust_angle_deg)
+#     print("local angle:", estimate.local_angle_deg)
+#     print("angle pairs(clip):", estimate.angle_pairs_clip)
+#     print("angle pair axes:", estimate.angle_pair_axes)
+#     print("angle pair residuals:", estimate.angle_pair_residuals_deg)
 #
 # angle 규칙:
 #   - angle > 0이면 오른쪽 이웃으로 갈수록 영상의 Y가 증가하는 기울기입니다.
@@ -1523,6 +1860,10 @@ build_die_map = build_die_map_from_yolo
 #   - ix + 방향 = 영상 오른쪽
 #   - iy + 방향 = 영상 위쪽
 #   - 회전각이 있어도 위 규칙은 grid 축 기준으로 유지됩니다.
+#   - include_edge=True이면 중심이 wafer/image 밖이어도 일부가 wafer에 걸치는
+#     die index는 유지됩니다.
+#   - polygon_px는 index용 전체 polygon, wafer_polygon_px는 wafer 외곽 절단 결과,
+#     visible_polygon_px는 wafer와 이미지 범위로 모두 절단한 결과입니다.
 #
 # -----------------------------------------------------------------------------
 # 예제 6. 검사/불량 BBox 중심이 어느 die인지 찾기
@@ -1719,5 +2060,5 @@ build_die_map = build_die_map_from_yolo
 #   2) side_corner_clip이 같은 row의 바로 옆 점인지
 #   3) below_corner_clip이 같은 column의 바로 아래 점인지
 #   4) pitch_x/pitch_y가 실제 die 간격과 일치하는지
-#   5) angle_x_deg와 angle_y_deg 차이가 작은지
+#   5) robust/local angle 차이와 angle_pair_residuals_deg가 작은지
 #   6) clip overlay와 wafer overlay가 실제 street/grid에 맞는지
