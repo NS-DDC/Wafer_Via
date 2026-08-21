@@ -19,6 +19,8 @@
   이진화해 VIA 후보로 사용합니다.
 * 후보 연결성분의 중심이 PAD 중앙 허용거리 안에 있을 때만 VIA로 인정합니다.
   PAD 외곽의 검은 선은 어두워도 중심 위치가 맞지 않아 제외됩니다.
+* PAD 이진 마스크의 커버리지로 검사 대상을 제외하지 않습니다.
+  ``PAD_PRESENT_MIN``과 ``VIA_EXCLUDE_RATIO`` 필터는 제거했습니다.
 * 쏠림(VIA_OFFSET)은 불량으로 판정하지 않습니다. 중앙 허용거리 안에서
   검출된 VIA는 중심 오차가 있더라도 OK입니다. 기존 호출부 import 호환을 위해
   CODE_VIA_OFFSET 상수만 남지만 code "99"는 반환하지 않습니다.
@@ -26,7 +28,8 @@
 검출 순서
 ---------
 1. VIA 설계도에 점이 있는 PAD만 검사합니다.
-2. 설계 PAD를 실측 PAD와 국소 정합한 뒤 그 중심과 등가반지름을 구합니다.
+2. 실측 이진 마스크가 충분하면 설계 PAD를 국소 정합합니다. 커버리지가 낮거나
+   비어 있어도 검사를 건너뛰지 않고 원래 설계 PAD 중심을 사용합니다.
 3. ROI를 회색조로 바꾸고 PAD 내부 평균 밝기를 구합니다.
 4. ``PAD평균 - VIA_GRAY_DROP + dark_offset``보다 어두운 픽셀만 이진화합니다.
 5. 최소 면적을 넘는 연결성분 중 중심이
@@ -102,15 +105,6 @@ VIA_MIN_AREA = 4
 # 크게 깎으면 작은 VIA가 사라질 수 있으므로 기본 1px만 사용합니다.
 PAD_ERODE = 1
 
-# 실물 PAD 존재 판정. 커버리지가 이 값 미만이면 PAD 없음.
-# 커버리지는 full 과 excl 중 큰 값입니다 (아래 VIA_EXCLUDE_RATIO 설명 참고).
-PAD_PRESENT_MIN = 0.55
-
-# excl 커버리지에서 제외할 원의 반지름 = PAD반지름 * 이 값.
-# 실물 VIA 는 이진화 마스크에 구멍으로 뚫리므로, VIA 가 있어야 할 자리를 빼고 재면
-# 구멍 크기와 무관하게 PAD 존재 여부를 판정할 수 있습니다 (구멍 메우기 불필요).
-VIA_EXCLUDE_RATIO = 0.75
-
 # 설계도 잡티 제거용 최소 px. 검사 대상은 "VIA 설계도에 점이 있는 PAD" 로만 정해지므로
 # 여기서는 1~3px 짜리 노이즈만 걸러내면 됩니다. 값이 작아 스케일이 바뀌어도 안전합니다.
 MIN_PAD_AREA = 4
@@ -119,7 +113,6 @@ MIN_VIA_AREA = 1              # VIA 설계 점의 최소 px
 # 결과 이미지 마커 색 (BGR)
 COLOR_OK = (0, 220, 0)          # 초록 : 정상
 COLOR_MISSING = (0, 0, 255)     # 빨강 : VIA 없음
-COLOR_ABSENT = (150, 150, 150)  # 회색 : PAD 없음
 COLOR_VIA = (255, 255, 0)       # 하늘 : 찾아낸 VIA 위치 (판정과 무관하게 항상 표기)
 
 # [END SECTOR: VIA_DETECTION_CONFIG]
@@ -142,6 +135,10 @@ def check_via(image: Union[str, np.ndarray],
     호환용 CODE_VIA_OFFSET 상수는 남지만 code "99"는 반환하지 않습니다.
     via_bin 은 검출한 VIA 만 흰색인 0/255 마스크입니다 (원본과 같은 해상도).
     "-1" 이면 result 와 via_bin 은 None 이고, 이유가 표준에러로 출력됩니다.
+
+    bin_mask는 설계 PAD 중심을 실측 쪽으로 미세 정합할 때만 사용합니다.
+    PAD 존재/커버리지 필터에는 사용하지 않으므로 비어 있거나 VIA 구멍이 커도
+    해당 PAD의 VIA 검사를 건너뛰지 않습니다.
 
     dark_offset : 회색조 이진화 임계값을 조절합니다 (기본 0).
 
@@ -189,6 +186,7 @@ def debug_via(image: Union[str, np.ndarray],
     align_shift 가 크게 나오면 설계도와 실물이 그만큼 어긋나 있다는 뜻입니다.
     dark_candidate_pixels는 PAD 평균 기반 이진화를 통과한 픽셀 수입니다.
     search_radius는 VIA 연결성분 중심에 허용하는 PAD 중앙 거리입니다.
+    pad_coverage는 이전 rows 호환용이며 항상 None입니다.
     shape_rejected와 edge_rejected는 예전 rows 호환용이며 항상 0입니다.
     """
     code, src, via_bin, rows, err = _run(image, bin_mask, pad_design, via_design,
@@ -392,15 +390,6 @@ def _run(image: Union[str, np.ndarray],
             "edge_rejected": 0,
         }
 
-        # ---- 실물 PAD 가 그 자리에 있는지 ----
-        row["pad_coverage"] = round(
-            _coverage(shape, act, area, radius, dvx - x0, dvy - y0), 3)
-        if row["pad_coverage"] < PAD_PRESENT_MIN:
-            # PAD 가 없으면 VIA 가 없는 게 당연하므로 VIA 불량으로 세지 않는다.
-            row["status"] = "PAD_ABSENT"
-            rows.append(row)
-            continue
-
         # ---- VIA 찾기: PAD 평균보다 어둡고 중심이 중앙에 가까운 덩어리 ----
         found = _find_via(roi, shape, cx, cy, radius, ero, row, dark_offset)
         if found is None:
@@ -461,34 +450,6 @@ def _align(shape: np.ndarray,
     moved = cv2.warpAffine(shape, np.float32([[1, 0, sx], [0, 1, sy]]),
                            (shape.shape[1], shape.shape[0]), flags=cv2.INTER_NEAREST)
     return moved, cx + sx, cy + sy, (sx, sy)
-
-
-def _coverage(shape: np.ndarray,
-              act: np.ndarray,
-              area: float,
-              radius: float,
-              vx: float,
-              vy: float) -> float:
-    """실측 마스크가 설계 PAD 를 얼마나 덮는지. 두 방식 중 큰 값을 쓴다.
-
-      full : 설계 PAD 전체 대비        -> 실물 PAD 가 설계보다 작을 때 강함
-      excl : VIA 자리를 뺀 영역 대비   -> VIA 구멍이 뚫려 있을 때 강함
-
-    실물 이미지에서는 VIA 가 이진화 마스크에 구멍으로 남는다. full 만 보면 그 구멍
-    때문에 멀쩡한 PAD 가 PAD_ABSENT 로 빠지므로, VIA 가 있어야 할 자리를 제외하고
-    한 번 더 잰다. 구멍을 메우지 않고도 구멍의 영향을 없앨 수 있다.
-    """
-    hit = (shape > 0) & (act > 0)
-    full = float(np.count_nonzero(hit)) / area if area > 0 else 0.0
-
-    ex = np.zeros(shape.shape, np.uint8)
-    cv2.circle(ex, (int(round(vx)), int(round(vy))),
-               max(2, int(round(radius * VIA_EXCLUDE_RATIO))), 255, -1)
-    ref = (shape > 0) & (ex == 0)
-    n = np.count_nonzero(ref)
-    excl = float(np.count_nonzero(ref & hit)) / n if n else 0.0
-
-    return max(full, excl)
 
 
 def _find_via(roi: np.ndarray,
@@ -575,7 +536,6 @@ def _draw(src: np.ndarray, rows: List[Dict[str, Any]], numbering: bool) -> np.nd
         PAD 판정 마커
           정상    : 초록 원
           VIA없음 : 빨강 X
-          PAD없음 : 회색 원
 
         찾아낸 VIA (판정과 무관하게 항상)
           하늘색 원 + 중심점. 원 크기는 실제로 검출된 덩어리 크기입니다.
@@ -594,9 +554,11 @@ def _draw(src: np.ndarray, rows: List[Dict[str, Any]], numbering: bool) -> np.nd
             cv2.drawMarker(out, (px, py), COLOR_MISSING, cv2.MARKER_TILTED_CROSS,
                            max(rad * 2, 7), 1, cv2.LINE_AA)
             color = COLOR_MISSING
-        else:   # PAD_ABSENT
-            cv2.circle(out, (px, py), rad, COLOR_ABSENT, 1, cv2.LINE_AA)
-            color = COLOR_ABSENT
+        else:
+            # 현재 내부 상태는 OK/VIA_MISSING뿐이지만 예외 상태도 빨간 X로 보입니다.
+            cv2.drawMarker(out, (px, py), COLOR_MISSING, cv2.MARKER_TILTED_CROSS,
+                           max(rad * 2, 7), 1, cv2.LINE_AA)
+            color = COLOR_MISSING
 
         # 찾아낸 VIA를 실제 크기의 하늘색 원으로 표기합니다.
         if r["via_center"] is not None:

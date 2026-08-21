@@ -98,6 +98,19 @@ class ViaCheckerMeanCenterTest(unittest.TestCase):
         self.assertEqual("OK", rows[0]["status"])
         self.assertGreater(int(np.count_nonzero(via_bin)), 0)
 
+    def test_empty_bin_mask_does_not_skip_via_check(self):
+        image, actual, pad_design, via_design = self._case()
+        actual.fill(0)  # 예전 PAD_PRESENT_MIN 필터라면 PAD_ABSENT로 건너뛰던 입력
+        cv2.circle(image, self.CENTER, 4, (8, 8, 8), -1)
+
+        code, _, via_bin, rows = debug_via(
+            image, actual, pad_design, via_design, quiet=True)
+
+        self.assertEqual(CODE_OK, code)
+        self.assertEqual("OK", rows[0]["status"])
+        self.assertIsNone(rows[0]["pad_coverage"])
+        self.assertGreater(int(np.count_nonzero(via_bin)), 0)
+
 
 if __name__ == "__main__":
     unittest.main()

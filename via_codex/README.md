@@ -14,6 +14,19 @@
 `CODE_VIA_OFFSET = "99"`는 기존 import 호환을 위해 상수만 남아 있습니다.
 쏠림 판정 분기는 제거했으므로 code `"99"`는 반환되지 않습니다.
 
+## PAD 존재 필터 제거
+
+`PAD_PRESENT_MIN`과 `VIA_EXCLUDE_RATIO` 상수 및 `_coverage()` 판정은 제거했습니다.
+따라서 VIA 설계도에 점이 있는 PAD는 `bin_mask`의 커버리지가 낮거나 VIA 구멍이
+커도 `_find_via()` 검사를 반드시 수행합니다.
+
+`bin_mask`는 설계 PAD 중심을 실측 PAD 쪽으로 조금 이동시키는 국소 정합에만
+사용됩니다. `bin_mask`가 비어 있거나 정합에 필요한 픽셀이 부족하면 이동을
+생략하고 설계 PAD의 원래 중심으로 계속 검사합니다.
+
+`debug_via()`의 `row["pad_coverage"]` 키는 기존 호출부 호환을 위해 남지만 값은
+항상 `None`입니다.
+
 ## `_find_via` 원리
 
 결정 조건은 세 개뿐입니다.
@@ -100,4 +113,4 @@ python -m unittest -v test_via_checker.py
 ```
 
 중앙의 어두운 VIA 검출, 상대 밝기 임계, `dark_offset`, 중앙 위치 허용, 외곽 검은
-선 제외를 합성 영상으로 확인합니다.
+선 제외, 빈 `bin_mask`에서도 VIA 검사가 진행되는지를 합성 영상으로 확인합니다.
