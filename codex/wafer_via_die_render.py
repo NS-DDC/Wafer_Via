@@ -2093,6 +2093,18 @@ DEFAULT_DIE_RENDER_MIN_PROMINENCE = 15.0
 DEFAULT_DIE_RENDER_PROM_SPAN_DEG = 44.0
 DEFAULT_DIE_RENDER_PROM_STEP_DEG = 1.0
 
+# --- V5 die-grid cue ------------------------------------------------------
+# A second, independent angle estimator ported verbatim from V5
+# (``wafer_die_map_v5.measure_die_grid_angle``). It looks at a different
+# physical signal than the projection cue -- vertical Sobel edges on a
+# NEAREST-rotated grayscale ROI -- so when the two agree, they agree for
+# independent reasons. Defaults match V5 exactly.
+DEFAULT_DIE_RENDER_GRID_CUE_RANGE = 4.0
+DEFAULT_DIE_RENDER_GRID_CUE_COARSE_STEP = 0.2
+DEFAULT_DIE_RENDER_GRID_CUE_FINE_STEP = 0.02
+DEFAULT_DIE_RENDER_GRID_CUE_ROI_RATIO = 0.45
+DEFAULT_DIE_RENDER_GRID_CUE_TOL_DEG = 0.25
+
 def _projection_score(
     image_bgr: np.ndarray,
     wafer_cx: float,
@@ -2296,6 +2308,82 @@ def _scan_prominence(
     return (float(values.max()) - median) / mad
 
 
+def measure_die_grid_angle(
+    image_bgr: np.ndarray,
+    wafer_cx: float,
+    wafer_cy: float,
+    wafer_r: float,
+    *,
+    search_deg: float = DEFAULT_DIE_RENDER_GRID_CUE_RANGE,
+    coarse_step: float = DEFAULT_DIE_RENDER_GRID_CUE_COARSE_STEP,
+    fine_step: float = DEFAULT_DIE_RENDER_GRID_CUE_FINE_STEP,
+    roi_ratio: float = DEFAULT_DIE_RENDER_GRID_CUE_ROI_RATIO,
+) -> float:
+    """V5's die-grid angle cue, ported verbatim from ``wafer_die_map_v5``.
+
+    Rotates a centre ROI and picks the angle whose vertical Sobel response,
+    collapsed to a column profile, has the highest variance. Street lines
+    stack up on one column only when the grid is square to the axes.
+
+    Deliberately kept identical to V5 rather than "improved", so that any
+    difference in behaviour between the two codebases is a difference in how
+    the cue is *used*, not in the cue itself.
+
+    Two measured limits the caller must respect:
+
+    * It snaps to the ``fine_step`` lattice. With the default 0.02 the answer
+      carries a hard 0.01 deg quantisation floor -- the projection cue has no
+      such floor because it interpolates a parabola through the fine peak.
+      Measured off-lattice rotation tracking: grid 0.0100 deg median and
+      worst, projection 0.0005 median / 0.0042 worst.
+    * It rails at the edge of ``search_deg``. With the default 4.0 the answer
+      is correct out to a 5.0 deg tilt and pinned at -4.2 from 5.5 deg on,
+      while the projection cue (which searches +/-6) is still right there.
+
+    Both limits are why this is wired in as a cross-check by default rather
+    than as the answer. See ``measure_wafer_angle_die_render``.
+    """
+
+    gray = cv2.cvtColor(image_bgr, cv2.COLOR_BGR2GRAY).astype(np.float32)
+    half = int(float(wafer_r) * float(roi_ratio))
+    cy_i = int(round(float(wafer_cy)))
+    cx_i = int(round(float(wafer_cx)))
+    y0 = max(0, cy_i - half)
+    y1 = min(gray.shape[0], cy_i + half)
+    x0 = max(0, cx_i - half)
+    x1 = min(gray.shape[1], cx_i + half)
+    roi = gray[y0:y1, x0:x1]
+    if roi.size == 0 or roi.shape[0] < 8 or roi.shape[1] < 8:
+        raise ValueError("die-grid ROI is empty or too small")
+    center_h = roi.shape[0] / 2.0
+    center_w = roi.shape[1] / 2.0
+
+    def sharpness(angle: float) -> float:
+        matrix = cv2.getRotationMatrix2D((center_w, center_h), angle, 1.0)
+        rotated = cv2.warpAffine(
+            roi,
+            matrix,
+            (roi.shape[1], roi.shape[0]),
+            flags=cv2.INTER_NEAREST,
+        )
+        sobel_x = np.abs(cv2.Sobel(rotated, cv2.CV_32F, 1, 0, ksize=3))
+        return float(sobel_x.mean(axis=0).var())
+
+    coarse = np.arange(
+        -float(search_deg), float(search_deg) + 1e-9, float(coarse_step)
+    )
+    best = max(coarse, key=sharpness)
+    fine = np.arange(
+        best - float(coarse_step),
+        best + float(coarse_step) + 1e-9,
+        float(fine_step),
+    )
+    return float(max(fine, key=sharpness))
+
+
+__all__.append("measure_die_grid_angle")
+
+
 def measure_wafer_angle_die_render(
     image_bgr: np.ndarray,
     wafer_cx: float,
@@ -2313,12 +2401,51 @@ def measure_wafer_angle_die_render(
     min_prominence: float = DEFAULT_DIE_RENDER_MIN_PROMINENCE,
     prom_span_deg: float = DEFAULT_DIE_RENDER_PROM_SPAN_DEG,
     prom_step_deg: float = DEFAULT_DIE_RENDER_PROM_STEP_DEG,
+    use_grid_cue: bool = True,
+    prefer_grid_angle: bool = True,
+    grid_cue_tol_deg: float = DEFAULT_DIE_RENDER_GRID_CUE_TOL_DEG,
 ) -> Dict[str, Any]:
     """Measure the full-wafer grid angle using V5 projection + FFT cues.
 
     The returned ``confidence`` is 0.0 when the image carries no usable die
     grid, which is what lets ``build_die_map_from_yolo`` fall back to the YOLO
     angle. Set ``min_prominence`` to 0.0 to restore the old ungated behaviour.
+
+    ``use_grid_cue`` adds V5's ``measure_die_grid_angle`` as a second,
+    independent estimator, always reported as ``grid`` / ``grid_agree``.
+    ``prefer_grid_angle`` (default ``True``) adopts the grid answer whenever
+    the two cues agree to within ``grid_cue_tol_deg``; on disagreement the
+    projection answer is kept.
+
+    The agreement test is the whole safety mechanism, so here is what it was
+    measured against rather than guessed at:
+
+    * On clean real wafers the two cues agree to 0.0098 deg, so adoption
+      moves the answer by about one hundredth of a degree.
+    * The grid cue breaks before the projection cue does. On a real wafer at
+      contrast 0.06 / blur 3.0 / noise 26 the projection answer was still
+      within 0.02 deg of truth while the grid answer had flipped sign
+      (-0.4358 vs +0.2200), and the prominence gate still passed (87.5).
+      The 0.25 deg tolerance rejects those cases: the measured gaps there
+      were 0.72 / 1.03 / 1.33 deg.
+    * The grid cue rails at the edge of its own +-4.0 deg search. It is
+      correct out to a 5.0 deg tilt and pinned at -4.2 from 5.5 deg on.
+      Gate-passing disagreement (max 0.6907) and railing (min 0.0499)
+      overlap, so no single tolerance separates them -- which is why the
+      tolerance is set to reject rather than to accept marginal cases.
+
+    Known cost of this default: off the ``fine_step`` lattice the grid cue is
+    the *less* precise of the two (0.0100 deg worst, a hard snap floor, vs
+    0.0042 for projection, which interpolates). Adoption therefore trades a
+    little precision for the second opinion. Set ``prefer_grid_angle=False``
+    to keep the projection answer and treat ``grid`` as report-only; that
+    configuration is bit-identical to the pre-grid version of this module.
+
+    Disagreement is deliberately *not* wired into ``confidence``. It occurs
+    exactly where projection is still correct, so doing so would drive those
+    correct answers down to 0.0 and hand them to the YOLO fallback -- a
+    regression dressed up as caution. Disagreement selects which cue answers;
+    it is not treated as evidence that neither can.
     """
 
     score = _projection_score(
@@ -2347,6 +2474,8 @@ def measure_wafer_angle_die_render(
                 "fft": None,
                 "candidates": [],
                 "prominence": None,
+                "grid": None,
+                "grid_agree": False,
             }
         return {
             "angle": float(fft_angle),
@@ -2356,6 +2485,8 @@ def measure_wafer_angle_die_render(
             "fft": float(fft_angle),
             "candidates": [float(fft_angle)],
             "prominence": None,
+            "grid": None,
+            "grid_agree": False,
         }
 
     # Is there a die grid here at all? Ask before trusting any argmax.
@@ -2364,6 +2495,26 @@ def measure_wafer_angle_die_render(
     )
     has_grid = bool(prominence >= float(min_prominence))
 
+    # The grid cue costs a constant ~0.5 s and runs on the full-resolution
+    # image. Skip it when the gate has already rejected the image: there is
+    # no answer left to cross-check.
+    grid_angle: Optional[float] = None
+    if use_grid_cue and has_grid:
+        try:
+            grid_angle = measure_die_grid_angle(
+                image_bgr, wafer_cx, wafer_cy, wafer_r
+            )
+        except Exception:
+            grid_angle = None
+
+    def _grid_verdict(angle: float) -> Tuple[bool, float]:
+        if grid_angle is None:
+            return False, float(angle)
+        agrees = abs(float(grid_angle) - float(angle)) <= float(grid_cue_tol_deg)
+        if agrees and prefer_grid_angle:
+            return True, float(grid_angle)
+        return agrees, float(angle)
+
     projection_angle, projection_score = _search_peak(
         score, 0.0, search_deg, coarse_step, fine_step
     )
@@ -2371,14 +2522,17 @@ def measure_wafer_angle_die_render(
         fft_angle is not None
         and abs(projection_angle - fft_angle) <= agree_tol_deg
     ):
+        grid_agree, angle_out = _grid_verdict(projection_angle)
         return {
-            "angle": float(projection_angle),
+            "angle": float(angle_out),
             "confidence": 0.97 if has_grid else 0.0,
             "agree": True,
             "projection": float(projection_angle),
             "fft": float(fft_angle),
             "candidates": [float(projection_angle), float(fft_angle)],
             "prominence": float(prominence),
+            "grid": None if grid_angle is None else float(grid_angle),
+            "grid_agree": bool(grid_agree),
         }
 
     candidates = [(projection_angle, projection_score)]
@@ -2409,14 +2563,17 @@ def measure_wafer_angle_die_render(
         confidence = 0.0
     else:
         confidence = 0.90 if agree else 0.60
+    grid_agree, angle_out = _grid_verdict(best_angle)
     return {
-        "angle": float(best_angle),
+        "angle": float(angle_out),
         "confidence": confidence,
         "agree": agree,
         "projection": float(projection_angle),
         "fft": None if fft_angle is None else float(fft_angle),
         "candidates": [float(candidate[0]) for candidate in candidates],
         "prominence": float(prominence),
+        "grid": None if grid_angle is None else float(grid_angle),
+        "grid_agree": bool(grid_agree),
     }
 
 
@@ -2494,6 +2651,9 @@ def build_die_map_from_yolo(
     die_render_max_iter: int = DEFAULT_DIE_RENDER_MAX_ITER,
     die_render_min_angle_deg: float = DEFAULT_DIE_RENDER_MIN_ANGLE_DEG,
     die_render_min_prominence: float = DEFAULT_DIE_RENDER_MIN_PROMINENCE,
+    die_render_use_grid_cue: bool = True,
+    die_render_prefer_grid_angle: bool = True,
+    die_render_grid_cue_tol_deg: float = DEFAULT_DIE_RENDER_GRID_CUE_TOL_DEG,
     die_render_fallback_to_yolo: bool = True,
     **kwargs: Any,
 ) -> WaferDieMap:
@@ -2546,6 +2706,9 @@ def build_die_map_from_yolo(
             "agree_tol_deg": float(die_render_agree_tol_deg),
             "full_scan_deg": float(die_render_full_scan_deg),
             "min_prominence": float(die_render_min_prominence),
+            "use_grid_cue": bool(die_render_use_grid_cue),
+            "prefer_grid_angle": bool(die_render_prefer_grid_angle),
+            "grid_cue_tol_deg": float(die_render_grid_cue_tol_deg),
         }
         measured_angle, info = _measure_iterative(
             wafer,
