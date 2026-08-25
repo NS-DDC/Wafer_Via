@@ -1,5 +1,9 @@
 import math
+import runpy
+import tempfile
 import unittest
+from pathlib import Path
+from shutil import copy2
 
 import cv2
 import numpy as np
@@ -31,6 +35,20 @@ def synthetic_rotated_wafer(angle_deg=2.4):
 
 
 class DieRenderAngleTests(unittest.TestCase):
+    def test_single_file_runs_without_base_module(self):
+        source = Path(__file__).parents[1] / "codex" / "wafer_via_die_render.py"
+        source_text = source.read_text(encoding="utf-8")
+        self.assertNotIn("import wafer_via", source_text)
+        self.assertNotIn("from .wafer_via", source_text)
+
+        with tempfile.TemporaryDirectory() as directory:
+            isolated = Path(directory) / "wafer_via_die_render.py"
+            copy2(source, isolated)
+            namespace = runpy.run_path(str(isolated))
+
+        self.assertTrue(callable(namespace["build_die_map_from_yolo"]))
+        self.assertTrue(callable(namespace["measure_wafer_angle_die_render"]))
+
     def test_projection_and_fft_recover_full_wafer_angle(self):
         wafer, _, center, radius, _, _ = synthetic_rotated_wafer(2.4)
         result = measure_wafer_angle_die_render(

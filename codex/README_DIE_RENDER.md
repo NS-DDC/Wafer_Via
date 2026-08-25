@@ -1,21 +1,23 @@
 # Wafer_Via die_render variant
 
-`wafer_via_die_render.py`는 기존 `wafer_via.py`를 변경하지 않고 V5의 full-wafer `die_render` angle 측정만 추가한 별도 버전입니다.
+`wafer_via_die_render.py`는 기존 `wafer_via.py`를 변경하지 않고 V5의 full-wafer `die_render` angle 측정을 추가한 단일 파일 독립 버전입니다. 기존 파이프라인도 파일 안에 모두 포함되어 있으므로 이 파일 하나만 통째로 복사하면 됩니다.
 
 ## 사용법
 
-두 파일을 같은 폴더에 둡니다.
+아래 파일 하나만 복사합니다.
 
 ```text
-codex/
-├─ wafer_via.py
-└─ wafer_via_die_render.py
+wafer_via_die_render.py
 ```
 
-Import 대상만 별도 버전으로 변경합니다.
+프로젝트 안의 일반 Python 파일처럼 바로 import합니다. `codex` 패키지 폴더에 넣었다면 첫 번째 방식을, 실행 파일과 같은 폴더에 복사했다면 두 번째 방식을 사용합니다.
 
 ```python
+# codex 폴더에 넣은 경우
 from codex.wafer_via_die_render import build_die_map_from_yolo
+
+# 같은 폴더에 파일 하나만 복사한 경우
+# from wafer_via_die_render import build_die_map_from_yolo
 
 dm = build_die_map_from_yolo(
     wafer_image=wafer_bgr,
@@ -28,7 +30,7 @@ dm = build_die_map_from_yolo(
 )
 ```
 
-나머지 인수와 반환 형식은 기존 `wafer_via.build_die_map_from_yolo()`와 같습니다.
+별도의 `wafer_via.py` import나 파일은 필요하지 않습니다. 나머지 인수와 반환 형식은 기존 `wafer_via.build_die_map_from_yolo()`와 같습니다.
 
 ## 지원 방식
 
@@ -137,4 +139,4 @@ print(info)
 - Particle, 회로 내부 패턴 또는 banding이 격자보다 강하면 projection/FFT가 다른 주기를 선택할 수 있습니다.
 - `angle_agree=False`이면 `projection`, `fft`, `yolo_angle_deg`를 함께 비교하십시오.
 - 위치별 pitch/angle이 달라지는 렌즈 왜곡이나 원근 왜곡은 단일 회전으로 해결되지 않습니다.
-- 별도 버전은 `wafer_via.py`를 import하므로 두 파일을 함께 배포해야 합니다.
+- `wafer_via_die_render.py` 하나에 기본 YOLO 파이프라인과 `die_render` 방식이 모두 들어 있습니다.
