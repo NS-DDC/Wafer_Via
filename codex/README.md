@@ -11,6 +11,8 @@
 
 특정 die/street의 RGB·HSV 색상을 고정하지 않습니다. 중심 미세 보정은 각 YOLO 점 주변 네 corner die의 Lab 색상과 경계 정보를 사용합니다.
 
+전체 10000×10000 wafer 픽셀의 projection+FFT로 angle을 다시 측정하는 별도 버전은 [wafer_via_die_render.py](./wafer_via_die_render.py)와 [README_DIE_RENDER.md](./README_DIE_RENDER.md)를 참고하십시오. 기존 `wafer_via.py`는 그대로 유지됩니다.
+
 ## 1. 권장 사용법
 
 ```python
