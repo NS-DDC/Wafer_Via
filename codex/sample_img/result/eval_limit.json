@@ -1,0 +1,260 @@
+{
+  "natural_amber_olive_bronze": [
+    {
+      "theta": -12.0,
+      "expected": 12.0017,
+      "measured": -6.15,
+      "err": -18.1517,
+      "verdict": "CLAMP"
+    },
+    {
+      "theta": -10.0,
+      "expected": 10.0017,
+      "measured": -3.8155,
+      "err": -13.8172,
+      "verdict": "WRONG"
+    },
+    {
+      "theta": -8.0,
+      "expected": 8.0017,
+      "measured": 6.15,
+      "err": -1.8517,
+      "verdict": "CLAMP"
+    },
+    {
+      "theta": -7.0,
+      "expected": 7.0017,
+      "measured": 6.15,
+      "err": -0.8517,
+      "verdict": "CLAMP"
+    },
+    {
+      "theta": -6.0,
+      "expected": 6.0017,
+      "measured": 6.0207,
+      "err": 0.019,
+      "verdict": "OK"
+    },
+    {
+      "theta": -5.0,
+      "expected": 5.0017,
+      "measured": 5.0201,
+      "err": 0.0184,
+      "verdict": "OK"
+    },
+    {
+      "theta": 5.0,
+      "expected": -4.9983,
+      "measured": -4.9812,
+      "err": 0.017,
+      "verdict": "OK"
+    },
+    {
+      "theta": 6.0,
+      "expected": -5.9983,
+      "measured": -5.9804,
+      "err": 0.0179,
+      "verdict": "OK"
+    },
+    {
+      "theta": 7.0,
+      "expected": -6.9983,
+      "measured": -6.15,
+      "err": 0.8483,
+      "verdict": "CLAMP"
+    },
+    {
+      "theta": 8.0,
+      "expected": -7.9983,
+      "measured": -6.15,
+      "err": 1.8483,
+      "verdict": "CLAMP"
+    },
+    {
+      "theta": 10.0,
+      "expected": -9.9983,
+      "measured": 6.15,
+      "err": 16.1483,
+      "verdict": "CLAMP"
+    },
+    {
+      "theta": 12.0,
+      "expected": -11.9983,
+      "measured": 6.15,
+      "err": 18.1483,
+      "verdict": "CLAMP"
+    }
+  ],
+  "natural_rose_violet_iceblue": [
+    {
+      "theta": -12.0,
+      "expected": 12.001,
+      "measured": -6.15,
+      "err": -18.151,
+      "verdict": "CLAMP"
+    },
+    {
+      "theta": -10.0,
+      "expected": 10.001,
+      "measured": -6.15,
+      "err": -16.151,
+      "verdict": "CLAMP"
+    },
+    {
+      "theta": -8.0,
+      "expected": 8.001,
+      "measured": 6.15,
+      "err": -1.851,
+      "verdict": "CLAMP"
+    },
+    {
+      "theta": -7.0,
+      "expected": 7.001,
+      "measured": 6.15,
+      "err": -0.851,
+      "verdict": "CLAMP"
+    },
+    {
+      "theta": -6.0,
+      "expected": 6.001,
+      "measured": 6.0111,
+      "err": 0.0101,
+      "verdict": "OK"
+    },
+    {
+      "theta": -5.0,
+      "expected": 5.001,
+      "measured": 5.0102,
+      "err": 0.0092,
+      "verdict": "OK"
+    },
+    {
+      "theta": 5.0,
+      "expected": -4.999,
+      "measured": -4.9881,
+      "err": 0.0109,
+      "verdict": "OK"
+    },
+    {
+      "theta": 6.0,
+      "expected": -5.999,
+      "measured": -5.9872,
+      "err": 0.0118,
+      "verdict": "OK"
+    },
+    {
+      "theta": 7.0,
+      "expected": -6.999,
+      "measured": -6.15,
+      "err": 0.849,
+      "verdict": "CLAMP"
+    },
+    {
+      "theta": 8.0,
+      "expected": -7.999,
+      "measured": -6.15,
+      "err": 1.849,
+      "verdict": "CLAMP"
+    },
+    {
+      "theta": 10.0,
+      "expected": -9.999,
+      "measured": -6.15,
+      "err": 3.849,
+      "verdict": "CLAMP"
+    },
+    {
+      "theta": 12.0,
+      "expected": -11.999,
+      "measured": 6.15,
+      "err": 18.149,
+      "verdict": "CLAMP"
+    }
+  ],
+  "natural_teal_bluegray": [
+    {
+      "theta": -12.0,
+      "expected": 12.0013,
+      "measured": -6.15,
+      "err": -18.1513,
+      "verdict": "CLAMP"
+    },
+    {
+      "theta": -10.0,
+      "expected": 10.0013,
+      "measured": -6.15,
+      "err": -16.1513,
+      "verdict": "CLAMP"
+    },
+    {
+      "theta": -8.0,
+      "expected": 8.0013,
+      "measured": 6.15,
+      "err": -1.8513,
+      "verdict": "CLAMP"
+    },
+    {
+      "theta": -7.0,
+      "expected": 7.0013,
+      "measured": 6.15,
+      "err": -0.8513,
+      "verdict": "CLAMP"
+    },
+    {
+      "theta": -6.0,
+      "expected": 6.0013,
+      "measured": 6.0155,
+      "err": 0.0141,
+      "verdict": "OK"
+    },
+    {
+      "theta": -5.0,
+      "expected": 5.0013,
+      "measured": 5.0139,
+      "err": 0.0126,
+      "verdict": "OK"
+    },
+    {
+      "theta": 5.0,
+      "expected": -4.9987,
+      "measured": -4.9883,
+      "err": 0.0104,
+      "verdict": "OK"
+    },
+    {
+      "theta": 6.0,
+      "expected": -5.9987,
+      "measured": -5.9875,
+      "err": 0.0112,
+      "verdict": "OK"
+    },
+    {
+      "theta": 7.0,
+      "expected": -6.9987,
+      "measured": -6.15,
+      "err": 0.8487,
+      "verdict": "CLAMP"
+    },
+    {
+      "theta": 8.0,
+      "expected": -7.9987,
+      "measured": 5.7943,
+      "err": 13.793,
+      "verdict": "CLAMP"
+    },
+    {
+      "theta": 10.0,
+      "expected": -9.9987,
+      "measured": 6.15,
+      "err": 16.1487,
+      "verdict": "CLAMP"
+    },
+    {
+      "theta": 12.0,
+      "expected": -11.9987,
+      "measured": 6.15,
+      "err": 18.1487,
+      "verdict": "CLAMP"
+    }
+  ]
+}
