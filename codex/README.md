@@ -11,7 +11,9 @@
 
 특정 die/street의 RGB·HSV 색상을 고정하지 않습니다. 중심 미세 보정은 각 YOLO 점 주변 네 corner die의 Lab 색상과 경계 정보를 사용합니다.
 
-전체 10000×10000 wafer 픽셀의 projection+FFT로 angle을 다시 측정하는 복붙용 단일 파일 버전은 [wafer_via_die_render.py](./wafer_via_die_render.py)와 [README_DIE_RENDER.md](./README_DIE_RENDER.md)를 참고하십시오. 이 파일은 단독 실행되며 기존 `wafer_via.py`는 그대로 유지됩니다.
+이전 projection+FFT 방식인 [wafer_via_die_render.py](./wafer_via_die_render.py)는 비교·보관용 legacy입니다. 새 pipeline에서는 사용하지 않습니다.
+
+새 notch 단독 angle 방식은 [wafer_via_notch_standalone.py](./wafer_via_notch_standalone.py)와 [README_NOTCH.md](./README_NOTCH.md)를 사용하십시오. 이 버전은 YOLO/die-render angle을 사용하거나 fallback하지 않습니다.
 
 ## 1. 권장 사용법
 
