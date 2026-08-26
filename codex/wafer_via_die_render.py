@@ -2405,47 +2405,50 @@ def measure_wafer_angle_die_render(
     prefer_grid_angle: bool = True,
     grid_cue_tol_deg: float = DEFAULT_DIE_RENDER_GRID_CUE_TOL_DEG,
 ) -> Dict[str, Any]:
-    """Measure the full-wafer grid angle using V5 projection + FFT cues.
+    """Measure the full-wafer die grid angle.
 
-    The returned ``confidence`` is 0.0 when the image carries no usable die
-    grid, which is what lets ``build_die_map_from_yolo`` fall back to the YOLO
-    angle. Set ``min_prominence`` to 0.0 to restore the old ungated behaviour.
+    The reported ``angle`` is V5's ``measure_die_grid_angle`` result whenever
+    that cue produced one. The projection and FFT cues are still computed,
+    but they serve two other jobs: they decide *whether there is a die grid
+    here at all*, and they are reported alongside as a cross-check.
 
-    ``use_grid_cue`` adds V5's ``measure_die_grid_angle`` as a second,
-    independent estimator, always reported as ``grid`` / ``grid_agree``.
-    ``prefer_grid_angle`` (default ``True``) adopts the grid answer whenever
-    the two cues agree to within ``grid_cue_tol_deg``; on disagreement the
-    projection answer is kept.
+    Why keep them if they no longer answer: the ``confidence`` gate is derived
+    from the projection score's prominence, not from the grid cue. On images
+    with no die grid (blank wafer, random via scatter) the grid cue still
+    returns an angle -- it fired on 10 of 10 such images with a 0.92 deg
+    spread -- so it cannot detect its own failure. Removing the projection
+    scan would remove the only thing that can. ``confidence`` is 0.0 on those
+    images and the grid cue is skipped entirely.
 
-    The agreement test is the whole safety mechanism, so here is what it was
-    measured against rather than guessed at:
+    Fields:
 
-    * On clean real wafers the two cues agree to 0.0098 deg, so adoption
-      moves the answer by about one hundredth of a degree.
-    * The grid cue breaks before the projection cue does. On a real wafer at
-      contrast 0.06 / blur 3.0 / noise 26 the projection answer was still
-      within 0.02 deg of truth while the grid answer had flipped sign
-      (-0.4358 vs +0.2200), and the prominence gate still passed (87.5).
-      The 0.25 deg tolerance rejects those cases: the measured gaps there
-      were 0.72 / 1.03 / 1.33 deg.
-    * The grid cue rails at the edge of its own +-4.0 deg search. It is
-      correct out to a 5.0 deg tilt and pinned at -4.2 from 5.5 deg on.
-      Gate-passing disagreement (max 0.6907) and railing (min 0.0499)
-      overlap, so no single tolerance separates them -- which is why the
-      tolerance is set to reject rather than to accept marginal cases.
+    * ``angle`` -- the answer. Grid cue if available, else the projection
+      answer (which only happens when the grid cue raised or was disabled).
+    * ``grid`` -- the raw grid cue, or ``None`` if it did not run.
+    * ``projection`` / ``fft`` -- the other two cues, report-only.
+    * ``grid_agree`` -- whether ``projection`` is within ``grid_cue_tol_deg``
+      of ``grid``. Diagnostic only; it does not veto the grid answer.
+    * ``prominence`` / ``confidence`` -- the die-grid presence gate.
 
-    Known cost of this default: off the ``fine_step`` lattice the grid cue is
-    the *less* precise of the two (0.0100 deg worst, a hard snap floor, vs
-    0.0042 for projection, which interpolates). Adoption therefore trades a
-    little precision for the second opinion. Set ``prefer_grid_angle=False``
-    to keep the projection answer and treat ``grid`` as report-only; that
-    configuration is bit-identical to the pre-grid version of this module.
+    Two measured limits of the grid cue, so its answers are read with the
+    right expectations rather than assumed sound:
 
-    Disagreement is deliberately *not* wired into ``confidence``. It occurs
-    exactly where projection is still correct, so doing so would drive those
-    correct answers down to 0.0 and hand them to the YOLO fallback -- a
-    regression dressed up as caution. Disagreement selects which cue answers;
-    it is not treated as evidence that neither can.
+    * It rails at the edge of its own +-4.0 deg search (``search_deg`` here is
+      +-6.0). It is correct out to a 5.0 deg tilt and pinned at -4.2 from
+      5.5 deg on. ``grid_agree`` goes false there.
+    * It degrades before the projection cue does. On a real wafer at contrast
+      0.06 / blur 3.0 / noise 26 the projection answer was still within
+      0.02 deg of truth while the grid answer had flipped sign (-0.4358 vs
+      +0.2200), and the prominence gate still passed (87.5). ``grid_agree``
+      is false there too -- the measured gaps were 0.72 / 1.03 / 1.33 deg.
+
+    On clean real wafers the two cues agree to 0.0098 deg, so on good input
+    the choice of cue moves the answer by about one hundredth of a degree.
+
+    ``prefer_grid_angle=False`` makes the projection cue answer instead and
+    demotes ``grid`` to report-only; that configuration is bit-identical to
+    the pre-grid version of this module. ``use_grid_cue=False`` additionally
+    skips computing it. Set ``min_prominence`` to 0.0 to disable the gate.
     """
 
     score = _projection_score(
@@ -2508,11 +2511,14 @@ def measure_wafer_angle_die_render(
             grid_angle = None
 
     def _grid_verdict(angle: float) -> Tuple[bool, float]:
+        # The grid cue is the answer when it exists. ``grid_agree`` reports
+        # whether the projection cue concurs, but does not veto: this module
+        # is asked for V5's angle, not for the one the two cues can agree on.
         if grid_angle is None:
             return False, float(angle)
         agrees = abs(float(grid_angle) - float(angle)) <= float(grid_cue_tol_deg)
-        if agrees and prefer_grid_angle:
-            return True, float(grid_angle)
+        if prefer_grid_angle:
+            return agrees, float(grid_angle)
         return agrees, float(angle)
 
     projection_angle, projection_score = _search_peak(
@@ -2605,7 +2611,17 @@ def _measure_iterative(
         )
         if first_info is None:
             first_info = dict(info)
-        delta = float(info.get("angle") or 0.0)
+        # Iterate on the projection cue, the way V5's align_wafer_by_die_render
+        # does. The grid cue must not drive this loop: it misreads a perfectly
+        # axis-aligned wafer by roughly -0.16 deg, and every iteration steers
+        # the image closer to exactly that blind spot, so feeding it back turns
+        # one correct measurement into a compounding error.
+        projection = info.get("projection")
+        delta = (
+            float(info.get("angle") or 0.0)
+            if projection is None
+            else float(projection)
+        )
         deltas.append(delta)
         if float(info.get("confidence") or 0.0) <= 0.0 or abs(delta) < min_angle_deg:
             break
@@ -2615,10 +2631,17 @@ def _measure_iterative(
         "confidence": 0.0,
         "agree": False,
     }
-    result["total_angle"] = float(total_angle)
+    # The grid cue reads the input image's absolute tilt in a single shot, so
+    # when it is the chosen cue that reading is the answer. Iteration exists
+    # only to converge the projection estimate.
+    grid_angle = result.get("grid")
+    chosen = float(total_angle)
+    if grid_angle is not None and float(result.get("angle") or 0.0) == float(grid_angle):
+        chosen = float(grid_angle)
+    result["total_angle"] = chosen
     result["iteration_deltas"] = tuple(float(value) for value in deltas)
     result["final_residual"] = float(deltas[-1]) if deltas else 0.0
-    return float(total_angle), result
+    return chosen, result
 
 
 def _copy_geometry_diagnostics(source: Any, target: Any) -> None:
@@ -2654,15 +2677,32 @@ def build_die_map_from_yolo(
     die_render_use_grid_cue: bool = True,
     die_render_prefer_grid_angle: bool = True,
     die_render_grid_cue_tol_deg: float = DEFAULT_DIE_RENDER_GRID_CUE_TOL_DEG,
-    die_render_fallback_to_yolo: bool = True,
+    angle_align_enabled: bool = True,
     **kwargs: Any,
 ) -> WaferDieMap:
-    """Build a YOLO die map with optional V5 full-wafer die-render angle.
+    """Build a YOLO die map whose angle comes from the V5 die-grid cue.
 
-    ``angle_align_method="die_render"`` replaces only the final map/aligned
-    image angle. Centre selection, pitch, wafer boundary, clipping, indexing,
-    and all other behavior remain the current :mod:`wafer_via` implementation.
-    Use ``"yolo"`` to retain the centre-clip angle unchanged.
+    Only the final map/aligned-image angle is affected. Centre selection,
+    pitch, wafer boundary, clipping, indexing, and all other behavior remain
+    the current :mod:`wafer_via` implementation.
+
+    ``angle_align_enabled`` is the on/off switch. When ``False`` no angle is
+    measured at all: ``grid_angle_deg`` is 0.0, the alignment matrices are the
+    identity, and ``aligned_image`` is still produced -- as an exact copy of
+    the input, since rotating by 0.0 deg does no resampling. Turning alignment
+    off therefore changes what the image *is*, never whether it exists.
+
+    The YOLO centre-clip angle never becomes the answer. It is measured by the
+    base builder anyway, so it is reported as ``yolo_angle_deg`` for
+    comparison, but nothing selects it. When the die-grid cue finds no grid
+    (``confidence`` 0.0) the angle is 0.0 and ``angle_align_method`` is
+    ``"die_render_no_signal"``: no measurement means no rotation, which is a
+    safer answer than rotating by a noise argmax or by a clip-local angle
+    measured from a different signal.
+
+    ``angle_align_method="yolo"`` remains available to reproduce the old
+    centre-clip behaviour for comparison, but it is not reachable by default
+    or by any automatic path.
     """
 
     method = str(angle_align_method).strip().lower().replace("-", "_")
@@ -2695,7 +2735,23 @@ def build_die_map_from_yolo(
     }
 
     final_angle = yolo_angle
-    if method == "die_render":
+    if not angle_align_enabled:
+        # Off means "do not rotate", not "do not produce an image".
+        final_angle = 0.0
+        info = {
+            "angle": 0.0,
+            "total_angle": 0.0,
+            "confidence": 0.0,
+            "agree": False,
+            "source": "off",
+            "projection": None,
+            "fft": None,
+            "grid": None,
+            "grid_agree": False,
+            "prominence": None,
+            "candidates": [],
+        }
+    elif method == "die_render":
         measure_kwargs = {
             "roi_ratio": float(die_render_roi_ratio),
             "max_dim": int(die_render_max_dim),
@@ -2721,15 +2777,14 @@ def build_die_map_from_yolo(
         if float(info.get("confidence") or 0.0) > 0.0:
             final_angle = float(measured_angle)
             info["source"] = "die_render"
-        elif die_render_fallback_to_yolo:
-            final_angle = yolo_angle
-            info["source"] = "yolo_fallback"
         else:
-            final_angle = float(measured_angle)
+            # No die grid was found. The measured argmax is noise and the
+            # YOLO angle is not a substitute, so decline to rotate.
+            final_angle = 0.0
             info["source"] = "die_render_no_signal"
 
     final_source = str(info.get("source") or method)
-    uses_pixel_angle = final_source.startswith("die_render")
+    uses_pixel_angle = final_source.startswith("die_render") or final_source == "off"
 
     grid_estimate = base_dm.grid_estimate
     if grid_estimate is not None:
@@ -2813,20 +2868,23 @@ build_die_map = build_die_map_from_yolo
 #       detections=results[0].boxes.xywh.cpu().numpy(),
 #       detection_format="xywh",
 #       clip_origin=(clip_x, clip_y),           # full image 안의 실제 clip 좌상단
-#       angle_align_method="die_render",       # full-wafer projection + FFT
+#       angle_align_method="die_render",       # V5 die-grid angle
+#       angle_align_enabled=True,              # angle 보정 on/off (기본 on)
 #       return_aligned_image=True,
 #   )
 #
-# 기존 512 clip YOLO 좌표 기반 angle을 그대로 쓰려면:
+# angle 은 V5 die-grid cue 가 정합니다. YOLO angle 은 dm.yolo_angle_deg 에
+# 비교용으로 남지만 자동으로 선택되는 경로는 없습니다. 굳이 YOLO angle 로
+# 보정하고 싶다면 명시적으로:
 #
 #   dm = build_die_map_from_yolo(..., angle_align_method="yolo")
 #
 # 주요 결과:
 #
 #   dm.grid_angle_deg       # DM과 aligned_image에 실제 사용한 angle
-#   dm.angle_align_method   # die_render / yolo_fallback / yolo
-#   dm.yolo_angle_deg       # 비교용 기존 YOLO angle
-#   dm.die_render_info      # projection, FFT, 반복 보정과 잔여 angle
+#   dm.angle_align_method   # die_render / die_render_no_signal / off / yolo
+#   dm.yolo_angle_deg       # 비교용 기존 YOLO angle (선택되지 않음)
+#   dm.die_render_info      # grid, projection, 반복 보정과 잔여 angle
 #   dm.aligned_image        # return_aligned_image=True일 때 보정된 전체 이미지
 #   dm.pitch_x, dm.pitch_y
 #   dm.x0, dm.y0
@@ -2837,35 +2895,89 @@ build_die_map = build_die_map_from_yolo
 # 비어 있습니다. 비교용 YOLO angle 좌표는 dm.yolo_angle_pairs_full에
 # 그대로 보존됩니다.
 #
+# --- angle 보정 on/off -------------------------------------------------------
+#
+#   dm = build_die_map_from_yolo(..., angle_align_enabled=False)
+#
+# off 는 "회전하지 마라"이지 "이미지를 만들지 마라"가 아닙니다. off 여도
+# return_aligned_image=True 면 dm.aligned_image 는 그대로 채워집니다.
+# 0.0도 회전은 warpAffine 을 아예 타지 않고 입력을 복사만 하므로
+# (align_wafer_image 의 조기 반환), 이때 aligned_image 는 입력 이미지와
+# 바이트 단위로 동일합니다. 재샘플링이 없으니 미세한 흐려짐도 없습니다.
+#
+#   off 일 때: dm.grid_angle_deg              == 0.0
+#              dm.angle_align_method          == "off"
+#              dm.aligned_image               == 입력 이미지 (bit-identical)
+#              dm.original_to_aligned_matrix  == 항등 변환
+#              dm.aligned_to_original_matrix  == 항등 변환
+#
 # --- 신호 게이트 (die_render 전용) ------------------------------------------
 # angle 탐색은 항상 최대값을 하나 돌려줍니다. die 격자가 아예 없는 이미지
-# (민웨이퍼, via/hole 만 흩어진 이미지)에서도 돌려줍니다. 그래서 이전에는
-# dm.angle_align_method 가 "yolo_fallback" 이 되는 경우가 실제로는 한 번도
-# 없었고, 격자가 없을 때 노이즈 최대값이 YOLO angle 을 조용히 덮어썼습니다.
+# (민웨이퍼, via/hole 만 흩어진 이미지)에서도 돌려줍니다. V5 grid cue 도
+# 마찬가지입니다 — 격자 없는 합성 이미지 10장에서 10번 다 각도를 냈고
+# 편차는 0.92도였습니다. 즉 grid cue 는 자기가 실패했다는 걸 스스로
+# 알아채지 못합니다.
 #
-# 지금은 각도를 믿기 전에 "여기에 격자가 있긴 한가"를 먼저 묻습니다.
-# 판정값은 44도 구간을 1도 간격으로 훑어서 얻은
+# 그래서 projection 스캔은 답을 고르는 데는 쓰지 않지만 삭제하지도
+# 않았습니다. "여기에 격자가 있긴 한가"를 물을 수 있는 유일한 수단이라서
+# 게이트로 남겨둡니다. 판정값은 44도 구간을 1도 간격으로 훑어서 얻은
 #     prominence = (최대값 - 중앙값) / MAD
 # 이고, 이 값이 die_render_min_prominence (기본 15.0) 미만이면
-# confidence 를 0.0 으로 내려 YOLO angle 로 되돌립니다.
+# 회전을 포기합니다: angle 은 0.0, dm.angle_align_method 는
+# "die_render_no_signal". 노이즈 최대값으로 돌리는 것보다 안 돌리는 쪽이
+# 낫고, YOLO angle 은 대체재가 아니므로 되돌리지 않습니다.
 #
 # 실측 (실제 웨이퍼 3장을 0~2도로 기울여 12회 + 합성 노이즈 10장):
 #     실제 웨이퍼 prominence 최악값 115.7
 #     격자 없는 이미지 최대값        5.51
 # 임계 15.0 은 이 21배 간격 안에 있고, 양쪽 어디에도 붙어 있지 않습니다.
+# 다만 격자 없는 표본이 전부 합성입니다. 실제 민웨이퍼 스캔으로는 아직
+# 확인하지 못했습니다.
 #
 #   dm.die_render_info["prominence"]   # 실제로 측정된 값 (진단용)
+#   dm.die_render_info["grid"]         # V5 grid cue 원값
+#   dm.die_render_info["projection"]   # 교차확인용 projection 값
+#   dm.die_render_info["grid_agree"]   # 두 값이 tol 안에 있는지 (진단 전용)
 #
-# 게이트를 끄고 예전 동작으로 돌아가려면:
+# grid_agree 는 보고만 합니다. False 여도 grid 값을 그대로 씁니다.
+#
+# 게이트를 끄려면:
 #
 #   dm = build_die_map_from_yolo(..., die_render_min_prominence=0.0)
 #
-# 게이트에 걸렸을 때 YOLO 로 되돌리지 않고 측정값을 그대로 쓰려면
-# die_render_fallback_to_yolo=False 를 주면 되고, 이때
-# dm.angle_align_method 는 "die_render_no_signal" 이 됩니다.
+# grid cue 대신 projection 값을 답으로 쓰려면 (grid cue 도입 전 동작과
+# 바이트 단위로 같아집니다):
+#
+#   dm = build_die_map_from_yolo(..., die_render_prefer_grid_angle=False)
+#
+# --- grid cue 의 측정된 한계 -------------------------------------------------
+# grid cue 를 무조건 답으로 쓰기 때문에, projection 이 맞고 grid 가 틀린
+# 구간에서는 틀린 값이 그대로 나갑니다. 실측으로 확인된 구간은 두 곳입니다.
+#
+# 1) 기울기 5.5도 이상
+#    grid cue 의 탐색 범위가 +-4.0도라 5.5도부터는 -4.2도에 붙어버립니다.
+#    (5.0도까지는 정상.) projection 은 이 구간에서도 맞습니다.
+#
+# 2) 심하게 열화된 이미지
+#    대비 0.06 / 블러 3.0 / 노이즈 26 에서 grid 가 부호까지 뒤집혔습니다
+#    (-0.4358 vs 정답 +0.2200). 이때도 prominence 는 87.5 라서 게이트를
+#    통과합니다 — 게이트는 "격자가 있나"만 보지 "grid cue 가 맞나"는
+#    보지 않습니다. 두 cue 의 차이는 0.72 / 1.03 / 1.33도였습니다.
+#
+# 두 경우 모두 die_render_info["grid_agree"] 가 False 로 남습니다.
+# 값을 바꾸지는 않지만, 로그로 잡아낼 수는 있습니다.
+#
+# 깨끗한 실제 웨이퍼에서는 두 cue 가 0.0098도 안에서 일치했습니다
+# (개별 차 0.0094 / 0.0098 / 0.0003). 격자 위에 있지 않은 각도를 추적할
+# 때는 grid 가 0.0100도(자기 snap 격자의 절반)에서 바닥을 치고,
+# projection 은 보간을 하므로 0.0042도까지 갑니다.
 #
 # 비용: 웨이퍼 한 장당 약 0.5초가 고정으로 늘어납니다(89회 평가).
 # 게이트만 저해상도로 돌리면 2.8배 싸지는 것까지는 확인했지만, 가진 실제
 # 웨이퍼 3장이 모두 pitch 84~92px 로 비슷해서 미세 pitch 웨이퍼에서
 # 축소가 격자를 지워버릴 위험을 배제하지 못했습니다. 그래서 게이트는
 # 자기가 지키는 측정과 같은 해상도(max_dim)로 돌립니다.
+# grid cue 는 여기에 웨이퍼당 약 0.30초(+12~42%)를 더 얹습니다. 반복
+# 보정 1회마다 한 번씩 돌기 때문에 최악의 경우 3배까지 늡니다.
+# 필요 없으면 die_render_use_grid_cue=False 로 끕니다 (이때는 projection
+# 이 답이 되고, grid cue 도입 전과 같아집니다).
