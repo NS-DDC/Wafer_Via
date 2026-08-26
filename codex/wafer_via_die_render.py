@@ -13,7 +13,7 @@ from __future__ import annotations
 import math
 from dataclasses import dataclass, field, replace
 from pathlib import Path
-from typing import Any, Callable, Dict, Iterable, List, Literal, Mapping, Optional, Sequence, Tuple, Union
+from typing import Any, Dict, Iterable, List, Literal, Mapping, Optional, Sequence, Tuple, Union
 
 import cv2
 import numpy as np
@@ -2345,6 +2345,12 @@ def build_die_map_from_yolo(
             # die_render consumes full-wafer pixels, not discrete YOLO pairs.
             # Keep pair fields empty so the regular clip overlay cannot imply
             # that the centre-clip vectors produced the final angle.
+            #
+            # "off" 도 여기에 포함된다. off 일 때 최종 각도는 0.0 이고 이것도
+            # pair 가 만든 값이 아니므로, pair 를 남겨두면 "이 pair 가 각도를
+            # 정했다" 는 잘못된 인상을 준다. 원본 pair 는 아래에서 항상
+            # result.yolo_angle_pairs_full / _raw_full 에 그대로 보존되므로
+            # 여기서 비워도 정보 손실은 없다.
             replacement.update({
                 "angle_pairs_clip": (),
                 "angle_pairs_raw_clip": (),
@@ -2466,8 +2472,23 @@ build_die_map = build_die_map_from_yolo
 #      긴 변이 max_dim=1400 을 넘으면 축소).
 #   2) 후보 각도로 ROI 를 회전하며 열/행 투영의 분산(주기성)을 잰다.
 #   3) 그 점수가 최대인 각도가 웨이퍼 기울기.
-#      center +-search_deg(6.0) 를 coarse_step(0.15) 로 훑고
-#      최대 근방을 fine_step(0.02) 로 다시 훑는다.
+#
+# 탐색은 3단계입니다 (실측: score() 총 97회 호출).
+#
+#   1차 coarse   center +-search_deg(6.0) 를 coarse_step(0.15) 로 훑는다
+#                -> 81회 호출
+#   2차 fine     1차 최대의 +-coarse_step 구간만 fine_step(0.02) 로 다시 훑는다
+#                -> 16회 호출
+#   3차 보간     2차 최대와 그 좌우 이웃, 이미 잰 세 점으로 포물선을 세워
+#                꼭짓점으로 옮긴다 (_search_peak L2168-2174).
+#                -> 추가 호출 0회
+#
+#                best_angle += 0.5*(before-after)/(before-2*current+after) * fine_step
+#
+#   따라서 반환값은 fine_step(0.02) 격자 위에 있지 않습니다.
+#   실측 예: 2차 최대 0.0100 도 -> 보간 -0.008710 도 -> 최종 0.001290 도.
+#   단, 2차 최대가 배열 양끝(인덱스 0 또는 마지막)에 걸리면 3차는 건너뛰고
+#   그때만 0.02 도 격자 위 값이 그대로 나옵니다.
 #
 # 조정 인자:
 #
