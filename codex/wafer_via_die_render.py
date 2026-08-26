@@ -2481,18 +2481,340 @@ build_die_map = build_die_map_from_yolo
 #   )
 #
 # --- 이 방식의 한계 (반드시 알고 쓰세요) --------------------------------------
-# 탐색은 항상 최대값을 하나 돌려줍니다. die 격자가 아예 없는 이미지
-# (민웨이퍼, via/hole 만 흩어진 이미지)에서도 돌려줍니다. 즉 "여기 격자가
-# 없다"를 스스로 알아채지 못합니다. angle 이 None 이 되는 경우는 ROI 를
-# 만들 수 없을 때(웨이퍼가 너무 작거나 프레임 밖) 뿐입니다.
 #
-#   dm.angle_align_method == "die_render_no_signal"  # ROI 실패일 때만
+# 1) search_deg 밖은 조용히 틀립니다.
+#    탐색 범위는 0도 +-die_render_search_deg(기본 6.0) 입니다. 실제 기울기가
+#    이 범위 밖이면(예: -10도) 예외도 None 도 나오지 않고, 범위 안에서
+#    점수가 가장 높은 각도(예: -3.8도)를 그럴듯하게 돌려줍니다.
+#    기울기가 클 수 있는 라인이면 die_render_search_deg 를 먼저 키우세요.
 #
-# 따라서 격자가 없는 이미지에서는 노이즈 최대값으로 회전할 수 있습니다.
-# 상위 코드에서 걸러야 한다면 dm.grid_angle_deg 와 pitch/die 검출 결과를
-# 함께 보고 판단하세요.
+# 2) 탐색은 항상 최대값을 하나 돌려줍니다.
+#    "여기엔 주기 신호가 없다"를 스스로 알아채지 못합니다. 다만 이 파이프라인
+#    에서는 YOLO die map 이 먼저 만들어진 뒤에 angle 을 재므로, die 격자가
+#    전혀 없는 입력은 애초에 여기까지 오지 않습니다. 이 한계가 문제가 되는
+#    경우는 measure_die_render_angle 을 단독으로 임의 이미지에 쓸 때입니다.
+#
+# 3) angle 이 None 이 되는 경우는 ROI 를 만들 수 없을 때
+#    (웨이퍼가 너무 작거나 프레임 밖) 뿐입니다.
+#
+#      dm.angle_align_method == "die_render_no_signal"  # ROI 실패일 때만
 #
 # dm.angle_confidence 는 품질 점수가 아니라 "측정값이 나왔는가" 의 이진
 # 표시입니다 (1.0 = 나옴, 0.0 = off 또는 ROI 실패).
 # dm.angle_agree 는 항상 False 이고, dm.die_render_info 에는 angle /
 # confidence / agree / source 네 개만 들어갑니다.
+
+
+# =============================================================================
+# [SECTOR: 95_IO_CONTRACT]  INPUT / OUTPUT 형식 전체
+# =============================================================================
+#
+# 이 파일은 통짜 복붙용 단일 모듈입니다.
+#   외부 의존: cv2 (opencv-python), numpy.  나머지는 전부 표준 라이브러리.
+#   로컬 모듈 import 없음 -> 파일 하나만 복사하면 그대로 돕니다.
+#
+# 아래 필드/키 목록은 코드를 읽고 적은 것이 아니라 실제로 한 번 돌린 뒤
+# inspect.signature / dataclasses.fields / vars() 로 뽑은 값입니다.
+#
+#
+# -----------------------------------------------------------------------------
+# 0. 최소 사용 예
+# -----------------------------------------------------------------------------
+#
+#   import cv2, numpy as np
+#   from wafer_via_die_render import build_die_map_from_yolo, locate_die
+#
+#   wafer = cv2.imread("wafer.png", cv2.IMREAD_COLOR)     # 전체 웨이퍼
+#   clip  = wafer[cy-256:cy+256, cx-256:cx+256].copy()    # YOLO 를 돌린 조각
+#   pts   = np.array([[x, y], ...], dtype=np.float64)     # clip 좌표계 die 중심
+#
+#   dm = build_die_map_from_yolo(wafer, clip, pts, clip_origin=(cx-256, cy-256))
+#
+#   dm.pitch_x, dm.pitch_y      # 38.02, 29.03
+#   dm.grid_angle_deg           # 0.0013
+#   len(dm.dies)                # 1137
+#   dm.aligned_image            # 회전 보정된 전체 웨이퍼 이미지
+#   locate_die(dm, point=(cx, cy))
+#
+#
+# =============================================================================
+# INPUT
+# =============================================================================
+#
+# -----------------------------------------------------------------------------
+# 1. 필수 인자 3개
+# -----------------------------------------------------------------------------
+#
+#   wafer_image   ImageInput   전체 웨이퍼 이미지.
+#                              np.ndarray (BGR 또는 그레이) / str / Path 허용.
+#   clip_image    ImageInput   YOLO 를 실제로 돌린 조각 이미지. 같은 형식.
+#   detections    다형          YOLO 검출 결과. 아래 4가지 중 아무거나.
+#
+#     (a) np.ndarray  shape (N, 2)  -> die 중심 좌표 (x, y). 가장 단순.
+#     (b) np.ndarray  shape (N, 4)  -> bbox (x1, y1, x2, y2) 또는 (cx, cy, w, h)
+#     (c) str | Path                -> YOLO txt 라벨 파일 경로
+#     (d) Sequence[Any]             -> ultralytics Results / dict / 리스트 등
+#
+#     좌표계는 clip_image 기준입니다. clip_origin 을 주면 내부에서
+#     wafer_image 좌표로 옮깁니다.
+#     detection_format='auto' 가 (N,2)/(N,4)/txt 를 자동 판별하고,
+#     normalized=None 이면 값이 전부 0~1 인지 보고 정규화 여부를 추정합니다.
+#
+# -----------------------------------------------------------------------------
+# 2. die_render angle 관련 인자 (이 파일에서 추가된 부분)
+# -----------------------------------------------------------------------------
+#
+#   angle_align_method      AngleAlignMethod  'die_render'
+#                             'die_render' = 픽셀 투영으로 각도 측정 (기본)
+#                             'off'        = 회전하지 않음 (0.0도)
+#   angle_align_enabled     bool   True    False 면 method 와 무관하게 off
+#   die_render_roi_ratio    float  0.55    웨이퍼 반지름 대비 ROI 크기
+#   die_render_max_dim      int    1400    ROI 긴 변 상한 (넘으면 축소)
+#   die_render_search_deg   float  6.0     +-이 각도만 탐색 (한계 1 참고)
+#   die_render_coarse_step  float  0.15    1차 스텝
+#   die_render_fine_step    float  0.02    2차 스텝 = 실질 각도 해상도
+#
+# -----------------------------------------------------------------------------
+# 3. **kwargs 로 그대로 넘어가는 인자 26개 (기존 YOLO 파이프라인 쪽)
+# -----------------------------------------------------------------------------
+#
+#   clip_origin                    Optional[Point]        None
+#       clip_image 의 좌상단이 wafer_image 어디인지. (ox, oy).
+#       주지 않으면 clip 좌표를 그대로 wafer 좌표로 씁니다.
+#
+#   detection_format               DetectionFormat        'auto'
+#   normalized                     Optional[bool]         None
+#   confidence_threshold           float                  0.25
+#
+#   refine                         bool                   True
+#   refine_radius                  int                    18
+#   refine_mode                    RefinementMode         'auto'
+#   refine_max_street_width        Optional[int]          None
+#   refine_corner_patch_ratio      float                  0.22
+#   refine_corner_reference_weight float                  0.7
+#   refine_noise_kernel            int                    5
+#   refine_min_confidence          float                  0.15
+#       YOLO 중심을 street 교차점으로 끌어당기는 보정. refine=False 면 전부 무시.
+#
+#   angle_mode                     AngleMode              'robust'
+#   angle_inlier_tolerance_deg     float                  2.5
+#       YOLO pair 기반 각도. die_render 를 쓰면 결과 각도로는 채택되지 않고
+#       dm.yolo_angle_deg 에 비교용으로만 남습니다.
+#
+#   pitch_size                     Optional[Tuple[float,float]]  None
+#       주면 그 pitch 를 강제 (pitch_source='given').
+#       None 이면 검출값 사용 (pitch_source='detected').
+#   pixel_per_unit                 float                  32.0
+#       real_coord 환산 계수. 1 unit = 32 px.
+#
+#   include_edge                   bool                   True
+#   edge_margin                    float                  1.0
+#   edge_mode                      str                    'circle'
+#   boundary_max_dimension         int                    2048
+#
+#   return_aligned_image           bool                   True
+#   alignment_interpolation        int                    2      (cv2.INTER_CUBIC)
+#   alignment_border_value         Tuple[int,int,int]     (0, 0, 0)
+#
+#
+# =============================================================================
+# OUTPUT  ->  WaferDieMap
+# =============================================================================
+#
+# -----------------------------------------------------------------------------
+# 4. WaferDieMap 선언 필드 33개
+# -----------------------------------------------------------------------------
+#
+#   # 웨이퍼 기하                              예시값
+#   wafer_cx                  int              627
+#   wafer_cy                  int              623
+#   wafer_r                   int              613
+#   image_shape               Tuple[int,int]   (1254, 1254)
+#   edge_mode                 str              'circle'
+#
+#   # 격자                                      예시값
+#   pitch_x                   float            38.021
+#   pitch_y                   float            29.030
+#   x0                        float            622.271   격자 원점 (px)
+#   y0                        float            624.637
+#   die_w                     int              38        pitch 를 정수화한 값
+#   die_h                     int              29
+#   pixel_per_unit            float            32.0
+#   detected_pitch_x          Optional[float]  38.021    실제 검출값
+#   detected_pitch_y          Optional[float]  29.030
+#   pitch_source              str              'detected' | 'given'
+#
+#   # 각도                                      예시값
+#   rotation_deg              float            0.0013
+#   grid_angle_deg            float            0.0013
+#   angle_confidence          float            1.0   (품질 아님. 이진 표시)
+#
+#   # die 목록
+#   dies                      List[Dict[str,Any]]                len 1137
+#   dies_by_index             Dict[Tuple[int,int], Dict]         len 1137
+#                             키 예: (-2, -22)
+#
+#   # 부속 객체
+#   wafer_boundary            Optional[WaferBoundary]
+#   grid_estimate             Optional[GridEstimate]
+#
+#   # 정렬 결과
+#   aligned_image             Optional[np.ndarray]   (H, W, 3) uint8
+#   original_to_aligned_matrix  Optional[np.ndarray] (2, 3) float64
+#   aligned_to_original_matrix  Optional[np.ndarray] (2, 3) float64
+#
+#   # 시각화용 좌표쌍 (wafer 좌표계)
+#   pitch_x_points_full       Optional[PointPair]
+#   pitch_y_points_full       Optional[PointPair]
+#   pitch_x_points_raw_full   Optional[PointPair]
+#   pitch_y_points_raw_full   Optional[PointPair]
+#   angle_pairs_full          Tuple[PointPair, ...]
+#   angle_pairs_raw_full      Tuple[PointPair, ...]
+#       die_render 를 쓰면 angle_pairs_full / angle_pairs_raw_full 은 빈 튜플
+#       입니다 (픽셀로 잰 각도라 대응되는 점쌍이 없음). YOLO 쪽 좌표는
+#       yolo_angle_pairs_full 에 보존됩니다.
+#
+# -----------------------------------------------------------------------------
+# 5. WaferDieMap 동적 속성 6개  (dataclass 필드가 아니라 setattr 로 붙습니다)
+# -----------------------------------------------------------------------------
+#
+#   angle_align_method         str    'die_render' | 'off' | 'die_render_no_signal'
+#   yolo_angle_deg             float  0.0262    YOLO pair 로 잰 비교용 각도
+#   yolo_angle_pairs_full      tuple  len 224   YOLO pair 좌표 (정제 후)
+#   yolo_angle_pairs_raw_full  tuple  len 224   YOLO pair 좌표 (정제 전)
+#   die_render_info            dict   {'angle': .., 'confidence': 1.0,
+#                                      'agree': False, 'source': 'die_render'}
+#   angle_agree                bool   False     (die_render 고정 채택이라 항상 False)
+#
+#   dataclasses.fields(WaferDieMap) 에는 안 나옵니다. getattr 로 접근하세요.
+#
+# -----------------------------------------------------------------------------
+# 6. dies[i] dict 키 16개
+# -----------------------------------------------------------------------------
+#
+#   index               tuple  (-2, -22)          격자 인덱스 (col, row)
+#   center_px           tuple  (565, 1249)        die 중심 (wafer 좌표)
+#   rect_px             tuple  (546, 1234, 585, 1264)   x1,y1,x2,y2
+#   crop_rect_px        tuple  (578, 1234, 585, 1235)   이미지 안쪽으로 자른 rect
+#   polygon_px          tuple  4개 점             회전 반영된 die 사각형
+#   wafer_polygon_px    tuple  웨이퍼 원 안쪽으로 잘린 다각형
+#   visible_polygon_px  tuple  이미지 프레임까지 잘린 다각형
+#   full_area_px        float  1103.77            온전한 die 면적
+#   wafer_area_px       float  1.23               웨이퍼 안에 남은 면적
+#   visible_area_px     float  1.23               화면에 보이는 면적
+#   real_coord          tuple  (-1.94, -19.56)    center_px / pixel_per_unit 환산
+#   is_edge_partial     bool   웨이퍼 가장자리에 잘림
+#   is_image_partial    bool   이미지 프레임에 잘림
+#   is_outside_image    bool   완전히 프레임 밖
+#   is_edge_ring        bool   가장자리 링에 속함
+#   is_edge             bool   위 조건들의 종합
+#
+#   dies 는 dataclass 가 아니라 그냥 dict 입니다 (DieCell 같은 클래스 없음).
+#
+# -----------------------------------------------------------------------------
+# 7. WaferBoundary 필드 6개
+# -----------------------------------------------------------------------------
+#
+#   center_px   Tuple[float,float]  (627.14, 623.15)
+#   radius_px   float               613.18
+#   contour_px  np.ndarray          윤곽점 (len 1740)
+#   area_px     float               1168964.0
+#   bbox_px     Tuple[int,...]      (18, 11, 1237, 1237)
+#   method      str                 'lab_border_distance'
+#
+# -----------------------------------------------------------------------------
+# 8. GridEstimate 필드 26개  (dm.grid_estimate, 좌표는 전부 clip 좌표계)
+# -----------------------------------------------------------------------------
+#
+#   points_clip, raw_points_clip
+#   center_corner_clip, side_corner_clip, below_corner_clip
+#   center_corner_raw_clip, side_corner_raw_clip, below_corner_raw_clip
+#   pitch_x, pitch_y
+#   angle_deg, angle_x_deg, angle_y_deg, angle_confidence
+#   refined, refinement_confidences, refinement_mode
+#   angle_mode, robust_angle_deg, local_angle_deg
+#   angle_pairs_clip, angle_pairs_raw_clip
+#   angle_pair_axes, angle_pair_angles_deg, angle_pair_residuals_deg
+#   angle_candidate_count
+#
+#   angle_pairs_clip / angle_pairs_raw_clip 는 같은 pair 인덱스를 각각
+#   정제 후 좌표 / 정제 전 좌표로 뽑은 것입니다. 둘을 겹쳐 그리면 refine 이
+#   점을 얼마나 옮겼는지 보입니다.
+#   angle_candidate_count 는 필터 전 전체 pair 수, 실제 반환된 pair 는
+#   inlier 만이라 오버레이 라벨이 N=inlier/candidate 로 찍힙니다.
+#
+#
+# =============================================================================
+# OUTPUT  ->  보조 함수들
+# =============================================================================
+#
+# -----------------------------------------------------------------------------
+# 9. locate_die(dm, point=...) / locate_die(dm, bbox=...)
+# -----------------------------------------------------------------------------
+#
+#   ★ 키워드 필수입니다. locate_die(dm, x, y) 처럼 위치 인자로 주면
+#     ValueError("Specify exactly one of point or bbox.") 가 납니다.
+#
+#     locate_die(dm, point=(x, y))
+#     locate_die(dm, bbox=(x1, y1, x2, y2))
+#
+#   반환은 dict, 키 24개:
+#
+#   input_type          'point' | 'bbox'
+#   query_px            입력 좌표
+#   die_index           (col, row)
+#   die_center_px       die 중심
+#   die_rect_px         die 사각형
+#   crop_rect_px        잘린 사각형
+#   die_polygon_px      회전 반영 다각형
+#   wafer_polygon_px    웨이퍼 원으로 자른 다각형
+#   visible_polygon_px  프레임으로 자른 다각형
+#   real_coord          질의 좌표의 실좌표
+#   real_distance       웨이퍼 중심으로부터 실거리
+#   die_real_coord      die 중심의 실좌표
+#   wafer_center_px     (wafer_cx, wafer_cy)
+#   corner_px           격자 원점
+#   pitch_x, pitch_y, angle_deg
+#   is_edge, is_edge_partial, is_image_partial, is_outside_image, is_edge_ring
+#   edge_mode
+#   in_wafer            질의 좌표가 웨이퍼 원 안인지
+#
+# -----------------------------------------------------------------------------
+# 10. 좌표 변환
+# -----------------------------------------------------------------------------
+#
+#   transform_point_to_aligned(dm, (100.0, 200.0))
+#       -> (99.99038534202396, 200.01197882439797)
+#   transform_point_to_original(dm, (100.0, 200.0))
+#       -> (100.00961493025237, 199.98802139414641)
+#
+#   둘 다 (x, y) float 튜플. 원본<->정렬 이미지 좌표를 오갑니다.
+#   dm.original_to_aligned_matrix 예시 (2, 3) float64:
+#
+#       [[ 1.00000000e+00  2.27300097e-05 -1.41606341e-02]
+#        [-2.27300097e-05  1.00000000e+00  1.42518770e-02]]
+#
+# -----------------------------------------------------------------------------
+# 11. 오버레이 / 단독 각도 측정
+# -----------------------------------------------------------------------------
+#
+#   make_clip_overlay(clip_image, dm.grid_estimate)  -> (512, 512, 3) uint8
+#   make_wafer_overlay(wafer_image, dm)              -> (1254, 1254, 3) uint8
+#       둘 다 BGR uint8 이미지. 그대로 cv2.imwrite 하면 됩니다.
+#
+#   measure_die_render_angle(wafer_image, cx, cy, radius) -> float | None
+#       build_die_map_from_yolo 없이 각도만 재고 싶을 때. 0.00129 같은 도(deg).
+#       ROI 를 못 만들면 None.
+#
+# -----------------------------------------------------------------------------
+# 12. __all__ (18개)
+# -----------------------------------------------------------------------------
+#
+#   GridEstimate, WaferBoundary, WaferDieMap,
+#   inspect_yolo_results, parse_yolo_points, refine_cross_point,
+#   estimate_grid_from_yolo, detect_wafer_boundary, generate_die_map,
+#   build_die_map_from_yolo, build_die_map, locate_die,
+#   align_wafer_image, transform_point_to_aligned, transform_point_to_original,
+#   make_clip_overlay, make_wafer_overlay, measure_die_render_angle
+#
+# =============================================================================

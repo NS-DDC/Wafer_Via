@@ -150,8 +150,9 @@ print(angle)   # float 또는 None
 ## 주의사항
 
 - Full wafer에서 실제 die/sawline 주기 패턴이 보여야 합니다.
-- **격자가 없어도 각도를 냅니다.** 탐색은 항상 최대값을 하나 돌려주므로, 민웨이퍼처럼 격자가 아예 없는 이미지에서는 노이즈의 최대값으로 회전할 수 있습니다. `None`이 되는 경우는 ROI 자체를 만들 수 없을 때(웨이퍼가 너무 작거나 프레임 밖)뿐입니다. 걸러야 한다면 상위 코드에서 pitch/die 검출 결과와 함께 판단하십시오.
+- **탐색은 항상 최대값을 하나 돌려줍니다.** "여기엔 주기 신호가 없다"를 스스로 알아채지 못합니다. 다만 `build_die_map_from_yolo` 안에서는 YOLO die map이 먼저 만들어진 뒤에 각도를 재므로, die 격자가 전혀 없는 입력은 여기까지 오지 않습니다. 이 한계가 실제로 문제가 되는 것은 `measure_die_render_angle`을 단독으로 임의 이미지에 쓸 때입니다. `None`이 되는 경우는 ROI 자체를 만들 수 없을 때(웨이퍼가 너무 작거나 프레임 밖)뿐입니다.
 - Particle, 회로 내부 패턴 또는 banding이 격자보다 강하면 다른 주기를 선택할 수 있습니다.
-- 기울기가 `±6.0°`를 넘으면 `die_render_search_deg`를 키워야 합니다. 범위 밖은 경계값에 붙습니다.
+- **기울기가 `±6.0°`를 넘으면 조용히 틀립니다.** 예외도 `None`도 없이 범위 안에서 점수가 가장 높은 각도를 그럴듯하게 돌려줍니다(실측: −10° 입력 → −3.8155° 반환). 기울기가 클 수 있으면 `die_render_search_deg`를 먼저 키우십시오.
 - 위치별 pitch/angle이 달라지는 렌즈 왜곡이나 원근 왜곡은 단일 회전으로 해결되지 않습니다.
-- `wafer_via_die_render.py` 하나에 기본 YOLO 파이프라인과 `die_render` 방식이 모두 들어 있습니다.
+- `wafer_via_die_render.py` 하나에 기본 YOLO 파이프라인과 `die_render` 방식이 모두 들어 있습니다. 외부 의존은 `cv2`와 `numpy`뿐이고 로컬 모듈 import가 없어, 파일 하나만 복사하면 그대로 돕니다.
+- 전체 input/output 형식(인자 목록, `WaferDieMap` 필드, `dies[i]` 키, `locate_die` 반환 키 등)은 `wafer_via_die_render.py` 맨 끝 `[SECTOR: 95_IO_CONTRACT]` 주석에 있습니다.
