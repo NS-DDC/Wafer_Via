@@ -17,7 +17,7 @@ configured reference direction (bottom/90 degrees by default).
 from __future__ import annotations
 
 import math
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from pathlib import Path
 from typing import Any, Literal, Optional, Tuple, Union
 
@@ -616,15 +616,64 @@ def align_wafer_by_notch(
     return aligned, matrix, inverse, result
 
 
+def _transform_result_for_visual(
+    result: NotchAngleResult,
+    *,
+    scale: float = 1.0,
+    offset: Point = (0.0, 0.0),
+) -> NotchAngleResult:
+    def transform_point(point: Point) -> Point:
+        return (
+            float(point[0]) * float(scale) + float(offset[0]),
+            float(point[1]) * float(scale) + float(offset[1]),
+        )
+
+    contour = result.wafer_contour_px.astype(np.float64) * float(scale)
+    contour[:, :, 0] += float(offset[0])
+    contour[:, :, 1] += float(offset[1])
+    return replace(
+        result,
+        wafer_center_px=transform_point(result.wafer_center_px),
+        wafer_radius_px=float(result.wafer_radius_px) * float(scale),
+        notch_point_px=transform_point(result.notch_point_px),
+        notch_deepest_point_px=transform_point(result.notch_deepest_point_px),
+        notch_depth_px=float(result.notch_depth_px) * float(scale),
+        notch_width_px=float(result.notch_width_px) * float(scale),
+        radial_noise_px=float(result.radial_noise_px) * float(scale),
+        candidate_arc_px=tuple(transform_point(point) for point in result.candidate_arc_px),
+        wafer_contour_px=np.rint(contour).astype(np.int32),
+        circle_fit_residual_px=float(result.circle_fit_residual_px) * float(scale),
+    )
+
+
 def make_notch_overlay(
     image: ImageInput,
     result: NotchAngleResult,
     *,
     thickness: int = 2,
+    max_dimension: Optional[int] = None,
 ) -> np.ndarray:
     """Visualise the user-confirmed outer reference and deepest diagnostic."""
 
-    overlay = _load_bgr(image).copy()
+    source = _load_bgr(image)
+    if max_dimension is not None and int(max_dimension) > 0:
+        visual_scale = min(
+            1.0,
+            float(max_dimension) / max(source.shape[0], source.shape[1]),
+        )
+    else:
+        visual_scale = 1.0
+    if visual_scale < 1.0:
+        source = cv2.resize(
+            source,
+            None,
+            fx=visual_scale,
+            fy=visual_scale,
+            interpolation=cv2.INTER_AREA,
+        )
+        result = _transform_result_for_visual(result, scale=visual_scale)
+        thickness = max(1, int(round(float(thickness) * visual_scale)))
+    overlay = source.copy()
     center = tuple(int(round(v)) for v in result.wafer_center_px)
     notch = tuple(int(round(v)) for v in result.notch_point_px)
     deepest = tuple(int(round(v)) for v in result.notch_deepest_point_px)
@@ -690,8 +739,8 @@ def make_notch_zoom(
 ) -> np.ndarray:
     """Return an enlarged annotated crop around the selected notch point."""
 
-    overlay = make_notch_overlay(image, result, thickness=2)
-    height, width = overlay.shape[:2]
+    source = _load_bgr(image)
+    height, width = source.shape[:2]
     crop_size = int(size_px or max(80, round(result.wafer_radius_px * 0.13)))
     # Centre the crop between the outer reference and inner apex so both remain
     # visible even when the outer reference is very close to the image border.
@@ -699,7 +748,12 @@ def make_notch_zoom(
     cy = int(round((result.notch_point_px[1] + result.notch_deepest_point_px[1]) / 2.0))
     x0, x1 = max(0, cx - crop_size), min(width, cx + crop_size)
     y0, y1 = max(0, cy - crop_size), min(height, cy + crop_size)
-    crop = overlay[y0:y1, x0:x1]
+    crop = source[y0:y1, x0:x1]
+    local_result = _transform_result_for_visual(
+        result,
+        offset=(-float(x0), -float(y0)),
+    )
+    crop = make_notch_overlay(crop, local_result, thickness=2)
     return cv2.resize(
         crop, None, fx=float(scale), fy=float(scale), interpolation=cv2.INTER_NEAREST
     )

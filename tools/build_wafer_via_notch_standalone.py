@@ -33,7 +33,7 @@ def main() -> None:
 
     notch_tail = notch[notch.index("@dataclass(frozen=True)\nclass NotchAngleResult"):]
     pipeline_tail = pipeline[
-        pipeline.index("def estimate_grid_from_yolo_notch(\n"):
+        pipeline.index("def _affine_point("):
     ].replace("_base.", "")
     exports = """
 

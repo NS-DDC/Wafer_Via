@@ -52,6 +52,17 @@ __all__ = list(_base.__all__) + [
 ]
 
 
+def _affine_point(matrix: np.ndarray, point: Point) -> Point:
+    transformed = np.asarray(matrix, dtype=np.float64) @ np.asarray(
+        (float(point[0]), float(point[1]), 1.0), dtype=np.float64
+    )
+    return float(transformed[0]), float(transformed[1])
+
+
+def _affine_pair(matrix: np.ndarray, pair) -> Tuple[Point, Point]:
+    return _affine_point(matrix, pair[0]), _affine_point(matrix, pair[1])
+
+
 def estimate_grid_from_yolo_notch(
     clip_image: ImageInput,
     detections: Union[str, Path, np.ndarray, Sequence[Any]],
@@ -225,6 +236,10 @@ def build_die_map_from_yolo(
     notch_wafer_radius_hint_px: Optional[float] = None,
     notch_failure_mode: Literal["error", "zero"] = "error",
     return_aligned_image: bool = True,
+    return_notch_visuals: bool = True,
+    notch_visual_max_dimension: int = 2048,
+    notch_zoom_size_px: Optional[int] = 256,
+    notch_zoom_scale: float = 2.0,
     alignment_interpolation: int = cv2.INTER_CUBIC,
     alignment_border_value: Tuple[int, int, int] = (0, 0, 0),
 ) -> _base.WaferDieMap:
@@ -239,8 +254,19 @@ def build_die_map_from_yolo(
     ``notch_wafer_center_hint_px=(x, y)`` and
     ``notch_wafer_radius_hint_px=radius``. Use ``notch_failure_mode="error"``
     to stop on a missing notch or ``"zero"`` to keep an unrotated result.
-    Detailed diagnostics remain available under ``dm.notch_result``.
+    The returned ``dm`` and ``dm.dies`` use the rotated ``aligned_image``
+    coordinate system and therefore have ``dm.grid_angle_deg == 0``. The
+    applied image rotation is ``dm.image_rotation_deg``; original coordinates
+    are preserved through the affine matrices and ``source_*`` fields.
+    Detailed diagnostics and images are returned as ``dm.notch_result``,
+    ``dm.notch_overlay_image``, and ``dm.notch_zoom_image``.
     """
+
+    if return_notch_visuals:
+        if float(notch_zoom_scale) <= 0.0:
+            raise ValueError("notch_zoom_scale must be positive.")
+        if notch_zoom_size_px is not None and int(notch_zoom_size_px) <= 0:
+            raise ValueError("notch_zoom_size_px must be positive or None.")
 
     wafer = _base._load_bgr(wafer_image)
     clip = _base._load_bgr(clip_image)
@@ -289,7 +315,7 @@ def build_die_map_from_yolo(
         refine_min_confidence=refine_min_confidence,
     )
     bx, by, bw, bh = cv2.boundingRect(notch.wafer_contour_px)
-    boundary = _base.WaferBoundary(
+    source_boundary = _base.WaferBoundary(
         center_px=notch.wafer_center_px,
         radius_px=notch.wafer_radius_px,
         contour_px=notch.wafer_contour_px,
@@ -317,13 +343,41 @@ def build_die_map_from_yolo(
         map_pitch_x, map_pitch_y = float(pitch_values[0]), float(pitch_values[1])
         pitch_source = "manual"
 
+    # The notch angle rotates the image into its canonical orientation. The
+    # returned DM is generated in that aligned-image coordinate system with a
+    # zero grid angle; the map itself must not be rotated a second time.
+    matrix = cv2.getRotationMatrix2D(
+        notch.wafer_center_px, notch.correction_angle_deg, 1.0
+    )
+    inverse = cv2.invertAffineTransform(matrix)
+    aligned_origin = _affine_point(matrix, origin_full)
+    aligned_contour = cv2.transform(
+        source_boundary.contour_px.astype(np.float32), matrix
+    )
+    aligned_contour = np.rint(aligned_contour).astype(np.int32)
+    aligned_center = _affine_point(matrix, source_boundary.center_px)
+    aligned_bx, aligned_by, aligned_bw, aligned_bh = cv2.boundingRect(aligned_contour)
+    aligned_boundary = _base.WaferBoundary(
+        center_px=aligned_center,
+        radius_px=source_boundary.radius_px,
+        contour_px=aligned_contour,
+        area_px=float(cv2.contourArea(aligned_contour)),
+        bbox_px=(
+            int(aligned_bx),
+            int(aligned_by),
+            int(aligned_bx + aligned_bw),
+            int(aligned_by + aligned_bh),
+        ),
+        method="notch_aligned_geometry_edge_circle",
+    )
+
     die_map = _base.generate_die_map(
-        boundary,
+        aligned_boundary,
         (full_height, full_width),
-        origin_full,
+        aligned_origin,
         map_pitch_x,
         map_pitch_y,
-        notch.correction_angle_deg,
+        0.0,
         pixel_per_unit=pixel_per_unit,
         include_edge=include_edge,
         edge_margin=edge_margin,
@@ -344,25 +398,31 @@ def build_die_map_from_yolo(
             ),
         )
 
-    die_map.pitch_x_points_full = pair_to_full(estimate.pitch_x_points_clip)
-    die_map.pitch_y_points_full = pair_to_full(estimate.pitch_y_points_clip)
-    die_map.pitch_x_points_raw_full = pair_to_full(
-        estimate.pitch_x_points_raw_clip
-    )
-    die_map.pitch_y_points_raw_full = pair_to_full(
-        estimate.pitch_y_points_raw_clip
-    )
+    source_pitch_x_points = pair_to_full(estimate.pitch_x_points_clip)
+    source_pitch_y_points = pair_to_full(estimate.pitch_y_points_clip)
+    source_pitch_x_points_raw = pair_to_full(estimate.pitch_x_points_raw_clip)
+    source_pitch_y_points_raw = pair_to_full(estimate.pitch_y_points_raw_clip)
+    die_map.pitch_x_points_full = _affine_pair(matrix, source_pitch_x_points)
+    die_map.pitch_y_points_full = _affine_pair(matrix, source_pitch_y_points)
+    die_map.pitch_x_points_raw_full = _affine_pair(matrix, source_pitch_x_points_raw)
+    die_map.pitch_y_points_raw_full = _affine_pair(matrix, source_pitch_y_points_raw)
+    die_map.source_pitch_x_points_full = source_pitch_x_points
+    die_map.source_pitch_y_points_full = source_pitch_y_points
+    die_map.source_pitch_x_points_raw_full = source_pitch_x_points_raw
+    die_map.source_pitch_y_points_raw_full = source_pitch_y_points_raw
     die_map.angle_pairs_full = ()
     die_map.angle_pairs_raw_full = ()
     die_map.detected_pitch_x = float(estimate.pitch_x)
     die_map.detected_pitch_y = float(estimate.pitch_y)
     die_map.pitch_source = pitch_source
-    matrix = cv2.getRotationMatrix2D(
-        notch.wafer_center_px, notch.correction_angle_deg, 1.0
-    )
-    inverse = cv2.invertAffineTransform(matrix)
     die_map.original_to_aligned_matrix = matrix
     die_map.aligned_to_original_matrix = inverse
+    die_map.coordinate_space = "aligned_image"
+    die_map.source_grid_angle_deg = float(notch.correction_angle_deg)
+    die_map.image_rotation_deg = float(notch.correction_angle_deg)
+    die_map.source_x0 = float(origin_full[0])
+    die_map.source_y0 = float(origin_full[1])
+    die_map.original_wafer_boundary = source_boundary
     if return_aligned_image:
         die_map.aligned_image = cv2.warpAffine(
             wafer,
@@ -385,6 +445,24 @@ def build_die_map_from_yolo(
     die_map.notch_circle_fit_residual_px = notch.circle_fit_residual_px
     die_map.notch_search_center_angle_deg = notch.search_center_angle_deg
     die_map.notch_search_half_width_deg = notch.search_half_width_deg
+    die_map.notch_correction_angle_deg = float(notch.correction_angle_deg)
+    die_map.notch_point_aligned_px = _affine_point(matrix, notch.notch_point_px)
+    die_map.notch_deepest_point_aligned_px = _affine_point(
+        matrix, notch.notch_deepest_point_px
+    )
+    die_map.notch_overlay_coordinate_space = "original_image"
+    if return_notch_visuals:
+        die_map.notch_overlay_image = make_notch_overlay(
+            wafer,
+            notch,
+            max_dimension=notch_visual_max_dimension,
+        )
+        die_map.notch_zoom_image = make_notch_zoom(
+            wafer,
+            notch,
+            size_px=notch_zoom_size_px,
+            scale=notch_zoom_scale,
+        )
     return die_map
 
 

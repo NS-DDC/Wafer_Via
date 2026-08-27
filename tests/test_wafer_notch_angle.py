@@ -10,6 +10,8 @@ import numpy as np
 from codex.wafer_notch_angle import (
     align_wafer_by_notch,
     detect_wafer_notch,
+    make_notch_overlay,
+    make_notch_zoom,
 )
 from codex.wafer_via_notch import build_die_map_from_yolo
 
@@ -118,6 +120,9 @@ class WaferNotchAngleTests(unittest.TestCase):
         )
         self.assertEqual(die_map.angle_align_method, "notch")
         self.assertLess(abs(die_map.grid_angle_deg), 0.3)
+        self.assertEqual(die_map.coordinate_space, "aligned_image")
+        self.assertIsNotNone(die_map.notch_overlay_image)
+        self.assertIsNotNone(die_map.notch_zoom_image)
 
     def test_bottom_notch_is_zero_correction(self):
         image, _ = synthetic_notched_wafer()
@@ -136,6 +141,10 @@ class WaferNotchAngleTests(unittest.TestCase):
         )
         self.assertAlmostEqual(outer_radius, result.wafer_radius_px, places=3)
         self.assertLess(deepest_radius, outer_radius)
+        overview = make_notch_overlay(image, result, max_dimension=300)
+        zoom = make_notch_zoom(image, result, size_px=120, scale=2.0)
+        self.assertEqual(max(overview.shape[:2]), 300)
+        self.assertLessEqual(max(zoom.shape[:2]), 480)
 
     def test_rotated_notch_recovers_opposite_correction(self):
         image, center = synthetic_notched_wafer()
@@ -213,6 +222,7 @@ class WaferNotchAngleTests(unittest.TestCase):
             refine=False,
             notch_failure_mode="zero",
             return_aligned_image=False,
+            return_notch_visuals=False,
         )
 
         self.assertEqual(die_map.grid_angle_deg, 0.0)
@@ -248,12 +258,34 @@ class WaferNotchAngleTests(unittest.TestCase):
         )
 
         self.assertEqual(die_map.angle_align_method, "notch")
-        self.assertLess(abs(die_map.grid_angle_deg + applied_rotation), 0.5)
+        self.assertEqual(die_map.coordinate_space, "aligned_image")
+        self.assertAlmostEqual(die_map.grid_angle_deg, 0.0, places=8)
+        self.assertLess(abs(die_map.image_rotation_deg + applied_rotation), 0.5)
+        self.assertLess(abs(die_map.source_grid_angle_deg + applied_rotation), 0.5)
         self.assertAlmostEqual(die_map.pitch_x, pitch_x, places=4)
         self.assertAlmostEqual(die_map.pitch_y, pitch_y, places=4)
         self.assertEqual(die_map.angle_pairs_full, ())
         self.assertEqual(die_map.grid_estimate.angle_candidate_count, 0)
         self.assertIsNotNone(die_map.aligned_image)
+        self.assertIsNotNone(die_map.notch_overlay_image)
+        self.assertIsNotNone(die_map.notch_zoom_image)
+        self.assertEqual(die_map.notch_overlay_coordinate_space, "original_image")
+        self.assertEqual(die_map.notch_overlay_image.shape, rotated.shape)
+        self.assertLessEqual(max(die_map.notch_zoom_image.shape[:2]), 1024)
+        aligned_origin = die_map.original_to_aligned_matrix @ np.asarray(
+            (die_map.source_x0, die_map.source_y0, 1.0)
+        )
+        self.assertTrue(np.allclose(aligned_origin, (die_map.x0, die_map.y0)))
+        aligned_x_vector = (
+            np.asarray(die_map.pitch_x_points_full[1])
+            - np.asarray(die_map.pitch_x_points_full[0])
+        )
+        aligned_y_vector = (
+            np.asarray(die_map.pitch_y_points_full[1])
+            - np.asarray(die_map.pitch_y_points_full[0])
+        )
+        self.assertLess(abs(aligned_x_vector[1]), 1e-5)
+        self.assertLess(abs(aligned_y_vector[0]), 1e-5)
         residual = detect_wafer_notch(die_map.aligned_image)
         self.assertLess(abs(residual.correction_angle_deg), 0.5)
 

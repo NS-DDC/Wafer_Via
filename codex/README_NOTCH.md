@@ -34,7 +34,13 @@ dm = build_die_map_from_yolo(
 )
 ```
 
-YOLO 좌표는 center corner와 `pitch_x`, `pitch_y`를 찾는 데만 사용합니다. 최종 `grid_angle_deg`는 notch에서만 나옵니다.
+YOLO 좌표는 center corner와 `pitch_x`, `pitch_y`를 찾는 데만 사용합니다. notch에서 구한 보정각은 **full wafer 이미지를 회전하는 데만 적용**합니다. 반환되는 DM은 회전된 `aligned_image` 좌표계에서 다시 생성되므로 `grid_angle_deg=0.0`이고 수평·수직입니다.
+
+```text
+원본 wafer_image -- notch 보정각으로 회전 --> dm.aligned_image
+원본 origin/points -- 같은 affine 변환 --> dm.x0/y0, dm.dies
+                                           dm.grid_angle_deg = 0
+```
 
 ## 빨간 기준점 정의
 
@@ -80,7 +86,10 @@ YOLO 좌표는 center corner와 `pitch_x`, `pitch_y`를 찾는 데만 사용합�
 
 ```python
 print(dm.angle_align_method)             # "notch"
-print(dm.grid_angle_deg)                 # DM/aligned image에 사용한 notch 보정각
+print(dm.coordinate_space)               # "aligned_image"
+print(dm.grid_angle_deg)                 # 0.0: DM 자체는 회전하지 않음
+print(dm.image_rotation_deg)             # 원본 이미지에 적용한 notch 보정각
+print(dm.source_grid_angle_deg)           # 원본 영상에서 측정한 격자 방향
 print(dm.angle_confidence)
 
 print(dm.notch_point_px)                 # 사용자 확인 빨간점: 외곽 원 위 기준 좌표
@@ -98,10 +107,29 @@ print(dm.notch_result.circle_fit_residual_px)  # 기준 원 fitting 잔차
 print(dm.notch_result.search_center_angle_deg)
 print(dm.notch_result.search_half_width_deg)
 
+print(dm.notch_overlay_image)            # 원본 영상 위 notch 전체 진단 overlay
+print(dm.notch_zoom_image)               # notch 주변 확대 진단 이미지
+print(dm.notch_point_aligned_px)         # aligned_image 좌표의 notch 기준점
+
 print(dm.pitch_x, dm.pitch_y)
-print(dm.x0, dm.y0)
-print(dm.dies)
+print(dm.x0, dm.y0)                      # aligned_image 좌표
+print(dm.dies)                           # aligned_image 좌표, angle=0
 print(dm.aligned_image)                  # 기본적으로 보정된 full wafer 반환
+```
+
+`dm.notch_result.notch_point_px`, `notch_deepest_point_px`와 `notch_overlay_image`는 검출 당시의 **원본 이미지 좌표계**입니다. `dm.notch_point_aligned_px`, `dm.x0/y0`, `dm.dies`, `locate_die(dm, ...)`는 **보정된 `aligned_image` 좌표계**입니다.
+
+원본 영상 좌표를 보정 좌표로 옮길 때는 다음 matrix를 사용합니다.
+
+```python
+point_original = np.asarray([x, y, 1.0])
+point_aligned = dm.original_to_aligned_matrix @ point_original
+
+# 반대 방향
+point_original_again = (
+    dm.aligned_to_original_matrix
+    @ np.asarray([point_aligned[0], point_aligned[1], 1.0])
+)
 ```
 
 기존 angle 좌표쌍은 생성하지 않습니다.
@@ -165,6 +193,11 @@ cv2.imwrite("notch_zoom.png", zoom)
 | `notch_wafer_center_hint_px` | `None` | 자동 원 검출이 틀릴 때 넣는 full wafer 이미지 중심 `(x, y)` |
 | `notch_wafer_radius_hint_px` | `None` | 자동 원 검출이 틀릴 때 넣는 full wafer 이미지 반지름 px |
 | `notch_failure_mode` | `"error"` | 미검출 시 `"error"`는 예외, `"zero"`는 보정각 0 반환 |
+| `return_aligned_image` | `True` | notch 보정된 full wafer 이미지를 `dm.aligned_image`로 반환 |
+| `return_notch_visuals` | `True` | notch 전체 overlay와 확대 이미지를 반환 |
+| `notch_visual_max_dimension` | `2048` | 전체 overlay의 최대 변 길이. 10000px 원본 메모리 절감용 |
+| `notch_zoom_size_px` | `256` | 원본 좌표에서 notch 확대 crop의 반쪽 크기 |
+| `notch_zoom_scale` | `2.0` | notch 확대 이미지 배율 |
 
 두 모드 모두 YOLO, FFT, projection 또는 die-render angle로 fallback하지 않습니다.
 
@@ -190,6 +223,7 @@ dm = build_die_map_from_yolo(
 
 if not dm.notch_result.found:
     assert dm.grid_angle_deg == 0.0
+    assert dm.image_rotation_deg == 0.0
     assert dm.angle_align_method == "notch_zero_fallback"
 ```
 
@@ -203,6 +237,12 @@ notch 검출 함수만 직접 호출할 때는 `failure_mode="zero"`로 같은 �
 2. 회색 추적 contour가 전체 외곽을 따라가는지 확인합니다.
 3. 노란 candidate arc가 아래쪽의 실제 파인 구간인지 확인합니다.
 4. 기준 원부터 틀렸다면 depth threshold를 바꾸기 전에 중심/반지름 hint를 넣습니다.
+
+```python
+cv2.imwrite("notch_overview.png", dm.notch_overlay_image)
+cv2.imwrite("notch_zoom.png", dm.notch_zoom_image)
+cv2.imwrite("wafer_aligned.png", dm.aligned_image)
+```
 
 ```python
 dm = build_die_map_from_yolo(

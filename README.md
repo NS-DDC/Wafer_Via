@@ -37,6 +37,10 @@ dm = build_die_map_from_yolo(
 `wafer_via_die_render.py`와 YOLO angle 방식은 비교·보관용 legacy입니다. 현재 권장
 notch pipeline의 angle fallback으로 호출되지 않습니다.
 
+notch 보정각은 이미지에 적용됩니다. 반환되는 `dm.dies`와 `locate_die()`는 회전된
+`dm.aligned_image` 좌표계에서 수평·수직이며 `dm.grid_angle_deg == 0.0`입니다.
+검출 결과 이미지는 `dm.notch_overlay_image`, `dm.notch_zoom_image`로 바로 확인합니다.
+
 ## via_claude — PAD 안의 VIA 검출·판정
 
 순수 OpenCV 만으로 PAD 안의 VIA 를 찾아 양·불량 코드(`1` / `42` / `-1`)를 돌려줍니다.

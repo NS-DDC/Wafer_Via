@@ -9,7 +9,7 @@ street colour is used.
 from __future__ import annotations
 
 import math
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from pathlib import Path
 from typing import Any, Dict, Iterable, List, Literal, Mapping, Optional, Sequence, Tuple, Union
 
@@ -209,6 +209,19 @@ class WaferDieMap:
     pitch_source: str = "direct"
     angle_pairs_full: Tuple[PointPair, ...] = ()
     angle_pairs_raw_full: Tuple[PointPair, ...] = ()
+    # Coordinate-space and notch diagnostics. The base builder keeps the
+    # historical ``original_image`` defaults. The notch builder returns an
+    # axis-aligned map in ``aligned_image`` coordinates and records the source
+    # angle/origin separately.
+    coordinate_space: str = "original_image"
+    source_grid_angle_deg: Optional[float] = None
+    image_rotation_deg: float = 0.0
+    source_x0: Optional[float] = None
+    source_y0: Optional[float] = None
+    original_wafer_boundary: Optional[WaferBoundary] = field(default=None, repr=False)
+    notch_result: Optional[Any] = field(default=None, repr=False)
+    notch_overlay_image: Optional[np.ndarray] = field(default=None, repr=False)
+    notch_zoom_image: Optional[np.ndarray] = field(default=None, repr=False)
 
     @property
     def num_dies(self) -> int:
