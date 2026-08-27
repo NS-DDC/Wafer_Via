@@ -17,7 +17,7 @@ configured reference direction (bottom/90 degrees by default).
 from __future__ import annotations
 
 import math
-from dataclasses import dataclass, replace
+from dataclasses import dataclass, field, replace
 from pathlib import Path
 from typing import Any, Literal, Optional, Tuple, Union
 
@@ -30,10 +30,12 @@ Point = Tuple[float, float]
 
 __all__ = [
     "NotchAngleResult",
+    "AlignedNotchGuideResult",
     "detect_wafer_notch",
     "align_wafer_by_notch",
     "make_notch_overlay",
     "make_notch_zoom",
+    "draw_aligned_wafer_notch_guide",
 ]
 
 
@@ -52,7 +54,7 @@ class NotchAngleResult:
     notch_width_px: float
     confidence: float
     radial_noise_px: float
-    candidate_arc_px: Tuple[Point, ...]
+    candidate_arc_px: Tuple[Point, ...] = field(repr=False)
     wafer_contour_px: np.ndarray
     segmentation_threshold: float
     scale: float
@@ -62,6 +64,36 @@ class NotchAngleResult:
     search_half_width_deg: float
     edge_support: float
     circle_fit_residual_px: float
+
+
+@dataclass(frozen=True)
+class AlignedNotchGuideResult:
+    """V5-style geometry and a writable overlay for one aligned wafer image.
+
+    Every point is expressed in the input ``aligned_image`` coordinate system.
+    ``overlay_image`` is a full-resolution BGR copy, so callers may draw their
+    own ground-truth marks on it with ordinary OpenCV functions.
+    """
+
+    overlay_image: np.ndarray = field(repr=False)
+    found: bool
+    wafer_center_px: Point
+    wafer_radius_px: float
+    notch_center_px: Optional[Point]
+    notch_point_px: Optional[Point]
+    notch_left_px: Optional[Point]
+    notch_right_px: Optional[Point]
+    notch_angle_deg: Optional[float]
+    reference_angle_deg: float
+    residual_angle_deg: float
+    notch_depth_px: float
+    notch_width_deg: float
+    effective_depth_threshold_px: float
+    candidate_arc_px: Tuple[Point, ...]
+    wafer_contour_px: np.ndarray = field(repr=False)
+    search_center_angle_deg: float
+    search_half_width_deg: float
+    detection_method: str
 
 
 def _load_bgr(image: ImageInput) -> np.ndarray:
@@ -756,4 +788,380 @@ def make_notch_zoom(
     crop = make_notch_overlay(crop, local_result, thickness=2)
     return cv2.resize(
         crop, None, fx=float(scale), fy=float(scale), interpolation=cv2.INTER_NEAREST
+    )
+
+
+def draw_aligned_wafer_notch_guide(
+    aligned_image: ImageInput,
+    *,
+    reference_angle_deg: float = 90.0,
+    search_half_width_deg: float = 70.0,
+    bg_threshold: int = 20,
+    wafer_morph_kernel: int = 25,
+    silhouette_open_kernel: int = 3,
+    angle_samples: int = 14400,
+    radial_samples: int = 200,
+    min_notch_depth_px: float = 4.0,
+    noise_margin_px: float = 3.0,
+    min_notch_span_deg: float = 0.06,
+    smooth_deg: float = 0.25,
+    failure_mode: Literal["error", "zero"] = "zero",
+    thickness: Optional[int] = None,
+    draw_text: bool = True,
+) -> AlignedNotchGuideResult:
+    """Detect and draw V5 wafer/notch geometry on an already aligned image.
+
+    This diagnostic deliberately mirrors the proven V5 approach: the largest
+    non-black component is closed/opened, its minimum enclosing circle supplies
+    the wafer ring, and a dense radial scan searches only the lower sector for
+    an inward notch. It does not rotate the image or build a die map.
+
+    The returned ``overlay_image`` has the same shape as the input and is a
+    writable BGR copy. All returned coordinates refer to that image. The green
+    line is the requested alignment reference, the red line is the measured
+    notch direction, and the small orange arc between them is the residual
+    angle after alignment.
+
+    ``failure_mode="zero"`` still returns the wafer ring/search lines when the
+    notch is absent. ``failure_mode="error"`` raises ``RuntimeError`` instead.
+    """
+
+    mode = str(failure_mode).strip().lower()
+    if mode not in ("error", "zero"):
+        raise ValueError("failure_mode must be 'error' or 'zero'.")
+    if not 1.0 <= float(search_half_width_deg) <= 170.0:
+        raise ValueError("search_half_width_deg must be between 1 and 170 degrees.")
+    if int(angle_samples) < 720:
+        raise ValueError("angle_samples must be at least 720.")
+    if int(radial_samples) < 32:
+        raise ValueError("radial_samples must be at least 32.")
+    if float(min_notch_depth_px) < 0.0 or float(noise_margin_px) < 0.0:
+        raise ValueError("notch depth thresholds must be non-negative.")
+
+    source = _load_bgr(aligned_image)
+    gray = cv2.cvtColor(source, cv2.COLOR_BGR2GRAY)
+    height, width = gray.shape
+
+    # V5 detect_wafer(): largest threshold component after a 25x25 close/open,
+    # followed by minEnclosingCircle. Kernel sizes remain configurable only so
+    # production images can be tuned without changing the implementation.
+    _, wafer_mask = cv2.threshold(
+        gray, int(bg_threshold), 255, cv2.THRESH_BINARY
+    )
+    morph_size = max(1, int(wafer_morph_kernel))
+    if morph_size > 1:
+        morph_size |= 1
+        morph_kernel = cv2.getStructuringElement(
+            cv2.MORPH_ELLIPSE, (morph_size, morph_size)
+        )
+        wafer_mask = cv2.morphologyEx(
+            wafer_mask, cv2.MORPH_CLOSE, morph_kernel
+        )
+        wafer_mask = cv2.morphologyEx(
+            wafer_mask, cv2.MORPH_OPEN, morph_kernel
+        )
+    contours, _ = cv2.findContours(
+        wafer_mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE
+    )
+    if not contours:
+        raise RuntimeError(
+            "V5 wafer ring was not found. Adjust bg_threshold for this image."
+        )
+    wafer_contour = max(contours, key=cv2.contourArea)
+    (wafer_cx, wafer_cy), wafer_radius = cv2.minEnclosingCircle(wafer_contour)
+    wafer_cx = float(round(wafer_cx))
+    wafer_cy = float(round(wafer_cy))
+    wafer_radius = float(round(wafer_radius))
+    if wafer_radius <= 0.0:
+        raise RuntimeError("V5 wafer ring radius is invalid.")
+
+    # V5 _wafer_silhouette(): optional light opening and largest connected
+    # contour. Unlike the closed mask above, this keeps the notch concavity.
+    _, silhouette_mask = cv2.threshold(
+        gray, int(bg_threshold), 255, cv2.THRESH_BINARY
+    )
+    open_size = max(1, int(silhouette_open_kernel))
+    if open_size >= 3:
+        open_size |= 1
+        open_kernel = cv2.getStructuringElement(
+            cv2.MORPH_ELLIPSE, (open_size, open_size)
+        )
+        silhouette_mask = cv2.morphologyEx(
+            silhouette_mask, cv2.MORPH_OPEN, open_kernel
+        )
+    silhouette_contours, _ = cv2.findContours(
+        silhouette_mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE
+    )
+    silhouette = np.zeros_like(gray, dtype=np.uint8)
+    if silhouette_contours:
+        silhouette_contour = max(silhouette_contours, key=cv2.contourArea)
+        cv2.drawContours(silhouette, [silhouette_contour], -1, 1, -1)
+
+    sample_count = int(angle_samples)
+    angles = np.linspace(0.0, 2.0 * math.pi, sample_count, endpoint=False)
+    radii_axis = np.linspace(
+        wafer_radius * 0.93,
+        wafer_radius * 1.015,
+        int(radial_samples),
+    )
+    xs = (
+        wafer_cx + radii_axis[None, :] * np.cos(angles)[:, None]
+    ).astype(np.int32)
+    ys = (
+        wafer_cy + radii_axis[None, :] * np.sin(angles)[:, None]
+    ).astype(np.int32)
+    np.clip(xs, 0, width - 1, out=xs)
+    np.clip(ys, 0, height - 1, out=ys)
+    on_wafer = silhouette[ys, xs] > 0
+    last_indices = np.where(
+        on_wafer.any(axis=1),
+        on_wafer.shape[1] - 1 - np.argmax(on_wafer[:, ::-1], axis=1),
+        0,
+    )
+    boundary_radii = radii_axis[last_indices]
+    depth = np.median(boundary_radii) - boundary_radii
+
+    smooth_window = max(
+        3, int(round(float(smooth_deg) / 360.0 * sample_count))
+    )
+    if smooth_window >= 3:
+        smooth_kernel = np.ones(smooth_window, dtype=np.float64) / smooth_window
+        padded = np.concatenate(
+            (depth[-smooth_window:], depth, depth[:smooth_window])
+        )
+        depth = np.convolve(padded, smooth_kernel, mode="same")[
+            smooth_window:smooth_window + sample_count
+        ]
+
+    angles_deg = np.degrees(angles)
+    distance_from_reference = np.abs(
+        (angles_deg - float(reference_angle_deg) + 180.0) % 360.0 - 180.0
+    )
+    in_sector = distance_from_reference <= float(search_half_width_deg)
+    active = (depth > float(min_notch_depth_px)) & in_sector
+    groups = _circular_candidate_groups(active)
+    degree_step = 360.0 / sample_count
+    groups = [
+        group for group in groups
+        if len(group) * degree_step >= float(min_notch_span_deg)
+    ]
+    candidate_indices = (
+        max(groups, key=lambda group: float(depth[group].sum()))
+        if groups else np.asarray((), dtype=np.int64)
+    )
+    outside_depth = depth[~in_sector]
+    noise_floor = (
+        float(np.percentile(outside_depth, 99.5))
+        if outside_depth.size else 0.0
+    )
+    effective_threshold = max(
+        float(min_notch_depth_px), noise_floor + float(noise_margin_px)
+    )
+    found = bool(
+        candidate_indices.size
+        and float(np.max(depth[candidate_indices])) >= effective_threshold
+    )
+
+    notch_center: Optional[Point] = None
+    notch_point: Optional[Point] = None
+    notch_left: Optional[Point] = None
+    notch_right: Optional[Point] = None
+    notch_angle: Optional[float] = None
+    residual_angle = 0.0
+    notch_depth = 0.0
+    notch_width = 0.0
+    candidate_arc: Tuple[Point, ...] = ()
+
+    if found:
+        candidate_depth = depth[candidate_indices]
+        candidate_angles = angles[candidate_indices]
+        weight_sum = float(candidate_depth.sum())
+        notch_angle = float(
+            math.degrees(
+                math.atan2(
+                    float((np.sin(candidate_angles) * candidate_depth).sum()),
+                    float((np.cos(candidate_angles) * candidate_depth).sum()),
+                )
+            ) % 360.0
+        )
+        residual_angle = _normalise_angle(
+            notch_angle - float(reference_angle_deg)
+        )
+        notch_radius_values = boundary_radii[candidate_indices]
+        boundary_x = wafer_cx + notch_radius_values * np.cos(candidate_angles)
+        boundary_y = wafer_cy + notch_radius_values * np.sin(candidate_angles)
+        notch_center = (
+            float((boundary_x * candidate_depth).sum() / weight_sum),
+            float((boundary_y * candidate_depth).sum() / weight_sum),
+        )
+        notch_angle_rad = math.radians(notch_angle)
+        notch_point = (
+            float(wafer_cx + wafer_radius * math.cos(notch_angle_rad)),
+            float(wafer_cy + wafer_radius * math.sin(notch_angle_rad)),
+        )
+        notch_left = (float(boundary_x[0]), float(boundary_y[0]))
+        notch_right = (float(boundary_x[-1]), float(boundary_y[-1]))
+        notch_depth = float(np.max(candidate_depth))
+        notch_width = float(len(candidate_indices) * degree_step)
+        arc_stride = max(1, len(candidate_indices) // 256)
+        candidate_arc = tuple(
+            (float(boundary_x[index]), float(boundary_y[index]))
+            for index in range(0, len(candidate_indices), arc_stride)
+        )
+    elif mode == "error":
+        raise RuntimeError(
+            "V5 notch was not found in the aligned image: "
+            f"effective_depth_threshold={effective_threshold:.2f}px, "
+            f"search={float(reference_angle_deg):.1f}+/-"
+            f"{float(search_half_width_deg):.1f}deg."
+        )
+
+    overlay = source.copy()
+    line_width = (
+        max(1, int(thickness))
+        if thickness is not None
+        else max(2, int(round(max(height, width) / 3000.0)))
+    )
+    center_int = (int(round(wafer_cx)), int(round(wafer_cy)))
+    radius_int = int(round(wafer_radius))
+
+    # Actual threshold contour (gray) and ideal V5 enclosing ring (cyan).
+    cv2.drawContours(
+        overlay, [wafer_contour], -1, (150, 150, 150),
+        max(1, line_width // 2), cv2.LINE_AA
+    )
+    cv2.circle(
+        overlay, center_int, radius_int, (255, 255, 0), line_width, cv2.LINE_AA
+    )
+    cv2.drawMarker(
+        overlay, center_int, (255, 0, 0), cv2.MARKER_CROSS,
+        max(12, line_width * 8), max(1, line_width), cv2.LINE_AA
+    )
+
+    def ring_point(angle_deg: float, ratio: float = 1.0) -> Tuple[int, int]:
+        angle_rad = math.radians(float(angle_deg))
+        return (
+            int(round(wafer_cx + wafer_radius * ratio * math.cos(angle_rad))),
+            int(round(wafer_cy + wafer_radius * ratio * math.sin(angle_rad))),
+        )
+
+    # Search-sector limits are magenta; aligned reference is green.
+    for search_angle in (
+        float(reference_angle_deg) - float(search_half_width_deg),
+        float(reference_angle_deg) + float(search_half_width_deg),
+    ):
+        cv2.line(
+            overlay, center_int, ring_point(search_angle),
+            (255, 0, 255), max(1, line_width // 2), cv2.LINE_AA
+        )
+    reference_endpoint = ring_point(reference_angle_deg)
+    cv2.arrowedLine(
+        overlay, center_int, reference_endpoint, (0, 220, 0),
+        line_width, cv2.LINE_AA, tipLength=0.018
+    )
+
+    if found and notch_angle is not None and notch_point is not None:
+        if candidate_arc:
+            arc_points = np.rint(np.asarray(candidate_arc)).astype(np.int32)
+            cv2.polylines(
+                overlay, [arc_points], False, (0, 255, 255),
+                max(2, line_width * 2), cv2.LINE_AA
+            )
+        for boundary_point in (notch_left, notch_right):
+            if boundary_point is not None:
+                point_int = tuple(int(round(value)) for value in boundary_point)
+                cv2.line(
+                    overlay, center_int, point_int, (0, 165, 255),
+                    max(1, line_width // 2), cv2.LINE_AA
+                )
+                cv2.circle(
+                    overlay, point_int, max(4, line_width * 2),
+                    (255, 255, 255), -1, cv2.LINE_AA
+                )
+        notch_endpoint = tuple(int(round(value)) for value in notch_point)
+        cv2.arrowedLine(
+            overlay, center_int, notch_endpoint, (0, 0, 255),
+            max(2, line_width * 2), cv2.LINE_AA, tipLength=0.018
+        )
+        if notch_center is not None:
+            cv2.circle(
+                overlay,
+                tuple(int(round(value)) for value in notch_center),
+                max(5, line_width * 3), (0, 128, 255), -1, cv2.LINE_AA
+            )
+        cv2.circle(
+            overlay, notch_endpoint, max(7, line_width * 4),
+            (0, 0, 255), -1, cv2.LINE_AA
+        )
+
+        # Draw the signed shortest arc from the green reference to the red
+        # detected direction. This is the residual angle in the aligned image.
+        arc_count = max(8, int(abs(residual_angle) * 2.0) + 2)
+        guide_angles = np.linspace(
+            float(reference_angle_deg),
+            float(reference_angle_deg) + residual_angle,
+            arc_count,
+        )
+        guide_radius = wafer_radius * 0.24
+        guide_arc = np.rint(np.column_stack((
+            wafer_cx + guide_radius * np.cos(np.radians(guide_angles)),
+            wafer_cy + guide_radius * np.sin(np.radians(guide_angles)),
+        ))).astype(np.int32)
+        cv2.polylines(
+            overlay, [guide_arc], False, (0, 128, 255),
+            max(2, line_width), cv2.LINE_AA
+        )
+
+    if draw_text:
+        if found and notch_angle is not None:
+            summary = (
+                f"V5 found=True  notch={notch_angle:.4f} deg  "
+                f"aligned residual={residual_angle:+.4f} deg"
+            )
+            detail = (
+                f"center=({wafer_cx:.1f},{wafer_cy:.1f})  "
+                f"radius={wafer_radius:.1f}px  depth={notch_depth:.2f}px  "
+                f"width={notch_width:.3f}deg"
+            )
+        else:
+            summary = "V5 found=False  residual=+0.0000 deg"
+            detail = (
+                f"center=({wafer_cx:.1f},{wafer_cy:.1f})  "
+                f"radius={wafer_radius:.1f}px  "
+                f"threshold={effective_threshold:.2f}px"
+            )
+        font_scale = max(0.55, min(1.2, max(height, width) / 9000.0))
+        text_x = max(12, line_width * 6)
+        text_y = max(34, line_width * 17)
+        for row, text_value in enumerate((summary, detail)):
+            y = text_y + row * int(round(34 * font_scale))
+            cv2.putText(
+                overlay, text_value, (text_x, y), cv2.FONT_HERSHEY_SIMPLEX,
+                font_scale, (0, 0, 0), max(3, line_width * 3), cv2.LINE_AA
+            )
+            cv2.putText(
+                overlay, text_value, (text_x, y), cv2.FONT_HERSHEY_SIMPLEX,
+                font_scale, (255, 255, 255), max(1, line_width), cv2.LINE_AA
+            )
+
+    return AlignedNotchGuideResult(
+        overlay_image=overlay,
+        found=found,
+        wafer_center_px=(wafer_cx, wafer_cy),
+        wafer_radius_px=wafer_radius,
+        notch_center_px=notch_center,
+        notch_point_px=notch_point,
+        notch_left_px=notch_left,
+        notch_right_px=notch_right,
+        notch_angle_deg=notch_angle,
+        reference_angle_deg=float(reference_angle_deg) % 360.0,
+        residual_angle_deg=float(residual_angle),
+        notch_depth_px=notch_depth,
+        notch_width_deg=notch_width,
+        effective_depth_threshold_px=float(effective_threshold),
+        candidate_arc_px=candidate_arc,
+        wafer_contour_px=wafer_contour.copy(),
+        search_center_angle_deg=float(reference_angle_deg) % 360.0,
+        search_half_width_deg=float(search_half_width_deg),
+        detection_method="v5_silhouette_radial_aligned",
     )

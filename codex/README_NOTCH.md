@@ -169,6 +169,75 @@ cv2.imwrite("notch_overlay.png", overlay)
 cv2.imwrite("notch_zoom.png", zoom)
 ```
 
+## aligned image에 V5 외곽 원·notch·각도선 그리기
+
+`dm.aligned_image`를 사람이 직접 확인하고 정답점을 추가할 때는
+`draw_aligned_wafer_notch_guide()`를 사용합니다. 이 함수는 입력 영상을
+다시 회전하거나 DM을 만들지 않습니다. V5에서 사용하던 검정 배경 임계값,
+최대 contour, `minEnclosingCircle`, 아래쪽 방사형 notch 탐색을 그대로 사용해
+진단선이 들어간 **동일 크기 BGR 복사본**을 반환합니다.
+
+```python
+import cv2
+from wafer_via_notch_standalone import draw_aligned_wafer_notch_guide
+
+guide = draw_aligned_wafer_notch_guide(
+    dm.aligned_image,             # np.ndarray 또는 이미지 경로
+    reference_angle_deg=90.0,     # 정렬 후 정상 notch 방향: 아래쪽/6시
+    failure_mode="zero",          # 못 찾아도 외곽 원과 탐색선은 반환
+)
+
+print(guide.found)
+print(guide.wafer_center_px)
+print(guide.wafer_radius_px)
+print(guide.notch_center_px)       # V5 파임 내부 중심, 미검출이면 None
+print(guide.notch_point_px)        # 외곽 원 위 notch 방향점, 미검출이면 None
+print(guide.notch_left_px)
+print(guide.notch_right_px)
+print(guide.notch_angle_deg)
+print(guide.residual_angle_deg)    # aligned image에 남은 각도 오차
+print(guide.notch_depth_px)
+print(guide.notch_width_deg)
+
+# 반환 배열은 writable입니다. 사용자가 판단한 정답을 바로 추가할 수 있습니다.
+manual = guide.overlay_image
+my_answer_xy = (5123, 9876)
+cv2.circle(manual, my_answer_xy, 18, (255, 0, 0), -1, cv2.LINE_AA)
+cv2.putText(
+    manual, "MY ANSWER", (my_answer_xy[0] + 24, my_answer_xy[1]),
+    cv2.FONT_HERSHEY_SIMPLEX, 0.8, (255, 0, 0), 2, cv2.LINE_AA,
+)
+cv2.imwrite("aligned_notch_manual_check.png", manual)
+```
+
+표시 색상은 OpenCV BGR 기준입니다.
+
+- 하늘색 원: V5 `minEnclosingCircle` Wafer 외곽 링
+- 회색선: V5 임계 마스크에서 얻은 실제 최대 contour
+- 초록선: 정렬 기준각, 기본 90° 아래쪽
+- 빨간선·빨간점: 검출된 notch 방향과 외곽 원 위 기준점
+- 주황색 짧은 arc: 초록 기준선부터 빨간 검출선까지의 잔여각
+- 노란선: 방사형 스캔에서 분리된 notch 후보 구간
+- 주황색 점: notch 파임 내부의 깊이 가중 중심
+- 흰점·주황선: notch 후보의 좌우 경계와 각도선
+- 자홍색선: notch 탐색 sector 양 끝
+- 파란 십자: V5 Wafer 중심
+
+aligned 결과가 정확하면 `residual_angle_deg`가 0° 근처여야 합니다. 노치를
+못 찾았을 때도 그림을 확인하려면 기본값인 `failure_mode="zero"`를 사용합니다.
+미검출을 즉시 예외로 처리하려면 `"error"`로 바꿉니다.
+
+V5 방식은 기본적으로 배경을 `gray <= 20`으로 간주합니다. 기존 장비 영상의
+배경 밝기가 다르면 `bg_threshold`만 조절하십시오. 외곽 검출 기본값은 V5와
+같은 `wafer_morph_kernel=25`, notch 실루엣은
+`silhouette_open_kernel=3`입니다.
+
+아래 그림은 표시 색과 선 구성을 확인하기 위한 합성 이미지 예시입니다. 실제
+장비 성능을 주장하는 결과가 아니라, 사용자가 어느 선 위에 정답을 그려야 하는지
+보여주는 용도입니다.
+
+![aligned V5 notch guide example](sample_img/aligned_v5_notch_guide_preview.png)
+
 오버레이 색상:
 
 - 빨간점: 최종 angle 기준인 외곽 원 위 좌표

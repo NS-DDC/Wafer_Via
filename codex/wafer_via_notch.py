@@ -19,9 +19,11 @@ try:
     from . import wafer_via as _base
     from .wafer_via import *  # noqa: F401,F403
     from .wafer_notch_angle import (
+        AlignedNotchGuideResult,
         NotchAngleResult,
         align_wafer_by_notch,
         detect_wafer_notch,
+        draw_aligned_wafer_notch_guide,
         make_notch_overlay,
         make_notch_zoom,
     )
@@ -29,9 +31,11 @@ except ImportError:
     import wafer_via as _base  # type: ignore[no-redef]
     from wafer_via import *  # type: ignore[no-redef]  # noqa: F401,F403
     from wafer_notch_angle import (  # type: ignore[no-redef]
+        AlignedNotchGuideResult,
         NotchAngleResult,
         align_wafer_by_notch,
         detect_wafer_notch,
+        draw_aligned_wafer_notch_guide,
         make_notch_overlay,
         make_notch_zoom,
     )
@@ -41,9 +45,11 @@ ImageInput = Union[str, Path, np.ndarray]
 Point = Tuple[float, float]
 
 __all__ = list(_base.__all__) + [
+    "AlignedNotchGuideResult",
     "NotchAngleResult",
     "detect_wafer_notch",
     "align_wafer_by_notch",
+    "draw_aligned_wafer_notch_guide",
     "make_notch_overlay",
     "make_notch_zoom",
     "estimate_grid_from_yolo_notch",

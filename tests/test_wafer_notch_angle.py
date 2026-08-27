@@ -10,6 +10,7 @@ import numpy as np
 from codex.wafer_notch_angle import (
     align_wafer_by_notch,
     detect_wafer_notch,
+    draw_aligned_wafer_notch_guide,
     make_notch_overlay,
     make_notch_zoom,
 )
@@ -100,7 +101,11 @@ class WaferNotchAngleTests(unittest.TestCase):
             namespace = runpy.run_path(str(isolated))
         self.assertTrue(callable(namespace["build_die_map_from_yolo"]))
         self.assertTrue(callable(namespace["detect_wafer_notch"]))
+        self.assertTrue(callable(namespace["draw_aligned_wafer_notch_guide"]))
         image, center = synthetic_notched_wafer()
+        standalone_guide = namespace["draw_aligned_wafer_notch_guide"](image)
+        self.assertTrue(standalone_guide.found)
+        self.assertEqual(standalone_guide.overlay_image.shape, image.shape)
         clip = image[194:706, 194:706]
         detections = np.asarray(
             [
@@ -123,6 +128,43 @@ class WaferNotchAngleTests(unittest.TestCase):
         self.assertEqual(die_map.coordinate_space, "aligned_image")
         self.assertIsNotNone(die_map.notch_overlay_image)
         self.assertIsNotNone(die_map.notch_zoom_image)
+
+    def test_aligned_v5_guide_returns_writable_full_resolution_overlay(self):
+        image, center = synthetic_notched_wafer()
+        guide = draw_aligned_wafer_notch_guide(image)
+
+        self.assertTrue(guide.found)
+        self.assertEqual(guide.detection_method, "v5_silhouette_radial_aligned")
+        self.assertEqual(guide.overlay_image.shape, image.shape)
+        self.assertTrue(guide.overlay_image.flags.writeable)
+        self.assertLess(
+            np.linalg.norm(np.asarray(guide.wafer_center_px) - center), 3.0
+        )
+        self.assertLess(abs(guide.residual_angle_deg), 0.5)
+        self.assertIsNotNone(guide.notch_center_px)
+        self.assertIsNotNone(guide.notch_point_px)
+        self.assertIsNotNone(guide.notch_left_px)
+        self.assertIsNotNone(guide.notch_right_px)
+        outer_radius = np.linalg.norm(
+            np.asarray(guide.notch_point_px) - np.asarray(guide.wafer_center_px)
+        )
+        self.assertAlmostEqual(outer_radius, guide.wafer_radius_px, places=4)
+        self.assertGreater(np.count_nonzero(guide.overlay_image != image), 0)
+
+        # The caller can draw ground truth directly on the returned image.
+        cv2.circle(guide.overlay_image, (123, 234), 8, (255, 0, 0), -1)
+        self.assertTrue(np.array_equal(guide.overlay_image[234, 123], (255, 0, 0)))
+
+    def test_aligned_v5_guide_zero_mode_keeps_ring_without_notch(self):
+        image, center = synthetic_notched_wafer()
+        cv2.circle(image, center, 390, (110, 130, 145), -1, cv2.LINE_AA)
+        guide = draw_aligned_wafer_notch_guide(image, failure_mode="zero")
+
+        self.assertFalse(guide.found)
+        self.assertIsNone(guide.notch_point_px)
+        self.assertIsNone(guide.notch_center_px)
+        self.assertEqual(guide.residual_angle_deg, 0.0)
+        self.assertEqual(guide.overlay_image.shape, image.shape)
 
     def test_bottom_notch_is_zero_correction(self):
         image, _ = synthetic_notched_wafer()

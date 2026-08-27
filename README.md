@@ -41,6 +41,8 @@ notch pipeline의 angle fallback으로 호출되지 않습니다.
 notch 보정각은 이미지에 적용됩니다. 반환되는 `dm.dies`와 `locate_die()`는 회전된
 `dm.aligned_image` 좌표계에서 수평·수직이며 `dm.grid_angle_deg == 0.0`입니다.
 검출 결과 이미지는 `dm.notch_overlay_image`, `dm.notch_zoom_image`로 바로 확인합니다.
+정렬된 이미지 위에서 V5 방식 외곽 원·notch·잔여각 선을 확인하고 직접 정답을
+덧그리려면 `draw_aligned_wafer_notch_guide(dm.aligned_image)`를 사용하십시오.
 
 ## via_claude — PAD 안의 VIA 검출·판정
 

@@ -41,9 +41,11 @@ def main() -> None:
 # The notch detector and notch-only DM builder are embedded below. The legacy
 # YOLO angle helpers above are never called by the exported builder.
 __all__.extend([
+    "AlignedNotchGuideResult",
     "NotchAngleResult",
     "detect_wafer_notch",
     "align_wafer_by_notch",
+    "draw_aligned_wafer_notch_guide",
     "make_notch_overlay",
     "make_notch_zoom",
     "estimate_grid_from_yolo_notch",
