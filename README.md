@@ -1,13 +1,41 @@
 # Wafer_Via
 
-## codex — wafer die-map
+## codex — 현재 권장 wafer die-map
 
-YOLO centre-clip cross-points를 이용하는 wafer die-map 모듈입니다.
+YOLO centre-clip cross-points로 중심 corner와 `pitch_x`, `pitch_y`를 구하고,
+full wafer의 **아래쪽 외곽 원에 파인 notch**로만 회전각을 계산하는 모듈입니다.
 
-- 구현/사용법: [`codex/README.md`](codex/README.md)
-- 코드: [`codex/wafer_via.py`](codex/wafer_via.py)
+현재 notch 검출은 wafer 또는 배경 색상을 분류하지 않습니다. 아래쪽 검색 구간을
+제외한 원주 colour-edge로 기준 원을 fitting하고, 아래쪽에서 기준 원보다 안쪽으로
+연속해서 들어온 외곽 edge를 notch로 선택합니다.
+
+- notch 사용법과 실제 데이터 진단 순서: [`codex/README_NOTCH.md`](codex/README_NOTCH.md)
+- 복붙용 단일 파일: [`codex/wafer_via_notch_standalone.py`](codex/wafer_via_notch_standalone.py)
+- 유지보수용 조립 파일: [`codex/wafer_via_notch.py`](codex/wafer_via_notch.py)
+- notch 검출/오버레이: [`codex/wafer_notch_angle.py`](codex/wafer_notch_angle.py)
+- 기본 YOLO/DM 상세 설명: [`codex/README.md`](codex/README.md)
 - 샘플: [`codex/sample_img/Clip_sample.png`](codex/sample_img/Clip_sample.png)
-- 테스트: [`tests/test_wafer_via.py`](tests/test_wafer_via.py)
+- 테스트: [`tests/test_wafer_notch_angle.py`](tests/test_wafer_notch_angle.py) · [`tests/test_wafer_via.py`](tests/test_wafer_via.py)
+
+권장 호출의 핵심 옵션은 아래와 같습니다.
+
+```python
+from codex.wafer_via_notch import build_die_map_from_yolo
+
+dm = build_die_map_from_yolo(
+    wafer_image=wafer_bgr,
+    clip_image=center_clip_bgr,
+    detections=results[0].boxes.xywh.cpu().numpy(),
+    detection_format="xywh",
+    notch_search_center_angle_deg=90.0,
+    notch_search_half_width_deg=45.0,
+    notch_max_dimension=4096,  # 10000x10000에서 매우 얕은 notch
+    notch_failure_mode="error",  # 또는 "zero"
+)
+```
+
+`wafer_via_die_render.py`와 YOLO angle 방식은 비교·보관용 legacy입니다. 현재 권장
+notch pipeline의 angle fallback으로 호출되지 않습니다.
 
 ## via_claude — PAD 안의 VIA 검출·판정
 

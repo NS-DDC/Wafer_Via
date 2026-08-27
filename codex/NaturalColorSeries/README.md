@@ -22,12 +22,17 @@ outside the wafer and no square-tile intersections. Its regression test is
 
 ## Notch angle samples
 
+> **현재 상태:** 이 폴더의 notch 이미지와 contact sheet는 과거 시각 실험 기록입니다.
+> 현재 `geometry_edge_bottom_sector` 검출기를 이 이미지에 맞춰 튜닝하거나 실제 장비
+> 성능 검증에 사용하지 않습니다. 실제 데이터 평가는 현재 코드에서 새로 생성한
+> overlay의 기준 원, 추적 contour, 검색 구간, fitting 잔차를 보고 수행해야 합니다.
+
 The four `*_notch.png` files preserve their corresponding source image and add
 one small wafer-orientation notch at 6 o'clock. The source files are unchanged.
 Only the local notch ROI comes from the image edit; pixels outside that ROI are
 restored from the exact source image.
 
-For each sample:
+Historical files for each sample:
 
 - `*_notch_overlay.png` marks the fitted wafer circle, centre-to-notch
   vector, candidate notch arc, and selected deepest point.
@@ -35,7 +40,8 @@ For each sample:
 - `*_notch_aligned.png` is the notch-angle-corrected wafer image.
 
 `notch_detection_contact_sheet.png` collects the four enlarged detections for
-quick visual confirmation.
+historical visual comparison. It is not production-data validation for the
+current geometry-edge detector.
 
 ![Four notch detections](./notch_detection_contact_sheet.png)
 
@@ -50,3 +56,9 @@ projected onto the fitted original wafer circle. This is the user-confirmed
 angle reference. The small green point is the deepest notch point and is kept
 only as a diagnostic. Image-space right is 0 degrees, bottom is 90 degrees, and
 the default correction aligns the red reference point to bottom.
+
+The current detector still preserves that red/green point meaning, but its
+detection signal has changed: it no longer compares wafer and corner background
+colours. It fits the circle from colour-gradient geometry outside the bottom
+search sector and measures an inward edge deviation inside the sector. See
+[`../README_NOTCH.md`](../README_NOTCH.md) for current options and diagnostics.

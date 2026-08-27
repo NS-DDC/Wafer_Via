@@ -1,5 +1,11 @@
 # Wafer_Via die_render variant
 
+> **Legacy 비교용:** 현재 권장 angle 방식은
+> [`wafer_via_notch_standalone.py`](./wafer_via_notch_standalone.py)와
+> [`README_NOTCH.md`](./README_NOTCH.md)의 geometry-edge notch pipeline입니다.
+> 이 문서의 projection/FFT/die-render 방식은 보관·비교용이며 현재 notch pipeline에서
+> fallback으로 호출되지 않습니다.
+
 `wafer_via_die_render.py`는 기존 `wafer_via.py`를 변경하지 않고 V5의 full-wafer `die_render` angle 측정을 추가한 단일 파일 독립 버전입니다. 기존 파이프라인도 파일 안에 모두 포함되어 있으므로 이 파일 하나만 통째로 복사하면 됩니다.
 
 ## 사용법
