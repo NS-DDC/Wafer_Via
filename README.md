@@ -10,6 +10,7 @@ full wafer의 **아래쪽 외곽 원에 파인 notch**로만 회전각을 계산
 연속해서 들어온 외곽 edge를 notch로 선택합니다.
 
 - notch 사용법과 실제 데이터 진단 순서: [`codex/README_NOTCH.md`](codex/README_NOTCH.md)
+- 단일 한국어 통합 설명서: [`codex/NOTCH_ALIGNED_DM_GUIDE_KO.md`](codex/NOTCH_ALIGNED_DM_GUIDE_KO.md)
 - 복붙용 단일 파일: [`codex/wafer_via_notch_standalone.py`](codex/wafer_via_notch_standalone.py)
 - 유지보수용 조립 파일: [`codex/wafer_via_notch.py`](codex/wafer_via_notch.py)
 - notch 검출/오버레이: [`codex/wafer_notch_angle.py`](codex/wafer_notch_angle.py)

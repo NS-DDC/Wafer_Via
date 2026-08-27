@@ -1,5 +1,7 @@
 # Wafer notch angle pipeline
 
+입력부터 좌표 변환, `locate_die()`, 반환 이미지 저장까지 한 문서로 보려면 [NOTCH_ALIGNED_DM_GUIDE_KO.md](./NOTCH_ALIGNED_DM_GUIDE_KO.md)를 사용하십시오.
+
 새 방향의 angle 기준은 YOLO 점, die line, projection 또는 FFT가 아니라 wafer notch 하나입니다.
 
 ## 복붙용 파일
