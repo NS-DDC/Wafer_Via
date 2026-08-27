@@ -13,7 +13,7 @@
 
 이전 projection+FFT 방식인 [wafer_via_die_render.py](./wafer_via_die_render.py)는 비교·보관용 legacy입니다. 새 pipeline에서는 사용하지 않습니다.
 
-새 notch 단독 angle 방식은 [wafer_via_notch_standalone.py](./wafer_via_notch_standalone.py)와 [README_NOTCH.md](./README_NOTCH.md)를 사용하십시오. 이 버전은 YOLO/die-render angle을 사용하거나 fallback하지 않습니다.
+새 notch 단독 angle 방식은 [wafer_via_notch_standalone.py](./wafer_via_notch_standalone.py)와 [README_NOTCH.md](./README_NOTCH.md)를 사용하십시오. 이 버전은 검은 외부 배경이 wafer 원 안쪽으로 들어오는 폭과 깊이로 뾰족하거나 길고 얕은 notch를 찾습니다. YOLO/die-render angle로 fallback하지 않으며, 미검출 시 `notch_failure_mode="error"`로 예외를 내거나 `"zero"`로 보정각 0을 반환할 수 있습니다.
 
 ## 1. 권장 사용법
 

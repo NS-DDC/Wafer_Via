@@ -1,5 +1,10 @@
 """Colour-independent wafer notch detection and angle alignment.
 
+The detector fits the wafer's original outer circle, then measures where the
+corner/background colour remains connected while penetrating inward through
+that circle. Candidate depth, angular width, and area are scored together, so
+the notch may be sharp, rounded, or a long shallow semicircle.
+
 The angle reference is the vector from the fitted wafer centre to the midpoint
 of the original outer circle across the notch opening. The deepest point stays
 available as a diagnostic only. Image-space angles are clockwise: right=0,
@@ -13,7 +18,7 @@ from __future__ import annotations
 import math
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any, Optional, Tuple, Union
+from typing import Any, Literal, Optional, Tuple, Union
 
 import cv2
 import numpy as np
@@ -50,6 +55,7 @@ class NotchAngleResult:
     wafer_contour_px: np.ndarray
     segmentation_threshold: float
     scale: float
+    failure_mode: str
 
 
 def _load_bgr(image: ImageInput) -> np.ndarray:
@@ -132,8 +138,16 @@ def _circular_gaussian(values: np.ndarray, kernel_size: int) -> np.ndarray:
     return blurred[half:half + len(values)]
 
 
-def _radial_profile(
-    filled_mask: np.ndarray,
+def _circular_median(values: np.ndarray, kernel_size: int) -> np.ndarray:
+    kernel_size = max(3, int(kernel_size) | 1)
+    half = kernel_size // 2
+    extended = np.concatenate((values[-half:], values, values[:half]))
+    windows = np.lib.stride_tricks.sliding_window_view(extended, kernel_size)
+    return np.median(windows, axis=1).astype(np.float32)
+
+
+def _radial_background_penetration(
+    wafer_mask: np.ndarray,
     center: Point,
     radius: float,
     *,
@@ -143,7 +157,7 @@ def _radial_profile(
     angles = np.arange(angle_samples, dtype=np.float64) * (
         2.0 * math.pi / angle_samples
     )
-    radial_samples = max(160, int(round(radius * 0.35)))
+    radial_samples = max(96, int(round(radius * (1.0 - radial_inner_ratio) * 2.5)))
     radii = np.linspace(
         radius * float(radial_inner_ratio), radius + 2.0, radial_samples
     )
@@ -153,23 +167,81 @@ def _radial_profile(
     map_y = (
         float(center[1]) + np.sin(angles)[:, None] * radii[None, :]
     ).astype(np.float32)
-    samples = cv2.remap(
-        filled_mask,
+    foreground = cv2.remap(
+        wafer_mask,
         map_x,
         map_y,
         cv2.INTER_NEAREST,
         borderMode=cv2.BORDER_CONSTANT,
         borderValue=0,
-    ) > 0
-    indices = np.where(
-        samples, np.arange(radial_samples, dtype=np.int32)[None, :], -1
-    ).max(axis=1)
-    profile = np.where(
-        indices >= 0,
-        radii[np.maximum(indices, 0)],
+    ).astype(np.float32) / 255.0
+
+    # A die street or a single dark rim pixel must not look like outside
+    # background. Majority voting across neighbouring angles keeps only a
+    # continuous black region entering through the wafer edge.
+    samples_per_degree = angle_samples / 360.0
+    angular_kernel = max(3, int(round(0.5 * samples_per_degree)) | 1)
+    foreground = cv2.blur(foreground, (1, angular_kernel)) >= 0.50
+    inside = radii <= radius
+    inside_radii = radii[inside][::-1]
+    outer_to_inner = foreground[:, inside][:, ::-1]
+    has_foreground = np.any(outer_to_inner, axis=1)
+    first_foreground = np.argmax(outer_to_inner, axis=1)
+    boundary_radius = np.where(
+        has_foreground,
+        inside_radii[first_foreground],
         radius * float(radial_inner_ratio),
-    ).astype(np.float32)
-    return angles, profile
+    )
+    penetration = (radius - boundary_radius).astype(np.float32)
+    penetration = _circular_median(
+        penetration, max(3, int(round(0.7 * samples_per_degree)) | 1)
+    )
+    return angles, penetration
+
+
+def _robust_periodic_baseline(values: np.ndarray, angles: np.ndarray) -> np.ndarray:
+    """Fit only slow circular/elliptical edge variation, rejecting notches."""
+
+    columns = [np.ones_like(angles)]
+    for order in range(1, 5):
+        columns.extend((np.cos(order * angles), np.sin(order * angles)))
+    design = np.column_stack(columns)
+    keep = np.ones(len(values), dtype=bool)
+    baseline = np.full_like(values, float(np.median(values)), dtype=np.float64)
+    for _ in range(6):
+        coefficients = np.linalg.lstsq(
+            design[keep], values[keep], rcond=None
+        )[0]
+        baseline = design @ coefficients
+        residual = values - baseline
+        kept_residual = residual[keep]
+        noise = 1.4826 * np.median(
+            np.abs(kept_residual - np.median(kept_residual))
+        )
+        # Positive residuals are outside-black intrusions. Exclude them while
+        # retaining broad low-frequency circle/ellipse fitting information.
+        keep = residual < max(0.75, 2.5 * float(noise))
+        if int(keep.sum()) < design.shape[1] * 3:
+            break
+    return baseline.astype(np.float32)
+
+
+def _circular_candidate_groups(active: np.ndarray):
+    if not np.any(active):
+        return []
+    if np.all(active):
+        return [np.arange(len(active), dtype=np.int64)]
+    starts = np.flatnonzero(active & ~np.roll(active, 1))
+    groups = []
+    for start_value in starts:
+        start = int(start_value)
+        values = [start]
+        index = (start + 1) % len(active)
+        while active[index] and index != start:
+            values.append(index)
+            index = (index + 1) % len(active)
+        groups.append(np.asarray(values, dtype=np.int64))
+    return groups
 
 
 def detect_wafer_notch(
@@ -181,14 +253,22 @@ def detect_wafer_notch(
     baseline_window_deg: float = 10.0,
     radial_inner_ratio: float = 0.85,
     min_notch_depth_px: Optional[float] = None,
-    min_notch_depth_ratio: float = 0.006,
-    require_notch: bool = True,
+    min_notch_depth_ratio: float = 0.002,
+    min_wide_notch_deg: float = 2.0,
+    failure_mode: Literal["error", "zero"] = "error",
+    require_notch: Optional[bool] = None,
 ) -> NotchAngleResult:
     """Find a local inward deviation of the otherwise circular wafer edge.
 
     ``notch_angle_deg`` uses image coordinates (right=0, down=90). The returned
     ``correction_angle_deg`` is suitable for ``cv2.getRotationMatrix2D`` and
-    moves the detected notch to ``reference_angle_deg``.
+    moves the detected notch to ``reference_angle_deg``. Detection measures
+    how far the corner-background colour penetrates inside the fitted circle;
+    it does not assume a V, U, or semicircle template.
+
+    ``failure_mode="error"`` raises when no notch is reliable.
+    ``failure_mode="zero"`` returns ``found=False`` and a zero correction.
+    ``require_notch`` remains as a backwards-compatible alias.
     """
 
     source = _load_bgr(image)
@@ -202,36 +282,27 @@ def detect_wafer_notch(
     mask, segmentation_threshold = _background_distance_mask(work)
     contour = _select_wafer_contour(mask)
     (cx, cy), radius = cv2.minEnclosingCircle(contour)
-    filled = np.zeros(mask.shape, np.uint8)
-    cv2.drawContours(filled, [contour], -1, 255, -1)
+
+    mode = str(failure_mode).strip().lower()
+    if require_notch is not None:
+        mode = "error" if bool(require_notch) else "zero"
+    if mode not in ("error", "zero"):
+        raise ValueError("failure_mode must be 'error' or 'zero'.")
 
     angle_samples = max(720, int(angle_samples))
-    angles, profile = _radial_profile(
-        filled,
+    angles, penetration = _radial_background_penetration(
+        mask,
         (cx, cy),
         float(radius),
         angle_samples=angle_samples,
         radial_inner_ratio=radial_inner_ratio,
     )
-    samples_per_degree = angle_samples / 360.0
-    baseline_kernel = max(
-        5, int(round(float(baseline_window_deg) * samples_per_degree)) | 1
-    )
-    extended = np.concatenate(
-        (profile[-baseline_kernel:], profile, profile[:baseline_kernel])
-    ).reshape(1, -1)
-    baseline = cv2.dilate(
-        extended, np.ones((1, baseline_kernel), np.uint8)
-    ).reshape(-1)[baseline_kernel:baseline_kernel + angle_samples]
-    smooth_kernel = max(5, int(round(4.0 * samples_per_degree)) | 1)
-    baseline = _circular_gaussian(baseline, smooth_kernel)
-    deficit = baseline - profile
-    deficit = _circular_gaussian(
-        deficit, max(3, int(round(0.8 * samples_per_degree)) | 1)
-    )
-
-    peak_index = int(np.argmax(deficit))
-    peak_depth = float(deficit[peak_index])
+    # ``baseline_window_deg`` is retained for API compatibility. A global
+    # robust periodic fit replaces the old local closing window, so a long
+    # semicircular notch is not absorbed into the baseline.
+    _ = baseline_window_deg
+    baseline = _robust_periodic_baseline(penetration, angles)
+    deficit = penetration - baseline
     median_deficit = float(np.median(deficit))
     radial_noise = float(
         1.4826 * np.median(np.abs(deficit - median_deficit))
@@ -239,35 +310,61 @@ def detect_wafer_notch(
     depth_limit = (
         float(min_notch_depth_px) * scale
         if min_notch_depth_px is not None
-        else max(4.0, float(radius) * float(min_notch_depth_ratio))
+        else max(1.25, float(radius) * float(min_notch_depth_ratio))
     )
-    found = bool(
-        peak_depth >= depth_limit
-        and peak_depth >= median_deficit + max(3.0, 5.0 * radial_noise)
+    candidate_threshold = max(
+        0.60, depth_limit * 0.45, 3.0 * radial_noise
     )
+    groups = _circular_candidate_groups(deficit >= candidate_threshold)
+    degree_step = 360.0 / angle_samples
+    candidates = []
+    for indices in groups:
+        width_deg = float(len(indices) * degree_step)
+        if width_deg > 90.0:
+            continue
+        values = np.maximum(deficit[indices], 0.0)
+        peak = float(values.max())
+        area = float(values.sum() * degree_step)
+        score = area * math.sqrt(max(peak, 0.0))
+        candidates.append((score, peak, area, width_deg, indices))
+    if candidates:
+        _, peak_depth, candidate_area, notch_width_deg, candidate_indices = max(
+            candidates, key=lambda item: item[0]
+        )
+        peak_index = int(candidate_indices[np.argmax(deficit[candidate_indices])])
+    else:
+        peak_index = int(np.argmax(deficit))
+        peak_depth = float(deficit[peak_index])
+        candidate_area = 0.0
+        notch_width_deg = degree_step
+        candidate_indices = np.asarray((peak_index,), dtype=np.int64)
 
-    width_threshold = max(depth_limit * 0.75, peak_depth * 0.30)
-    active = deficit >= width_threshold
-    left = peak_index
-    right = peak_index
-    while active[(left - 1) % angle_samples] and peak_index - left < angle_samples:
-        left -= 1
-    while active[(right + 1) % angle_samples] and right - peak_index < angle_samples:
-        right += 1
-    candidate_indices = np.arange(left, right + 1, dtype=np.int64) % angle_samples
+    strong_notch = peak_depth >= max(
+        depth_limit, 0.75, 6.0 * radial_noise
+    )
+    wide_shallow_notch = bool(
+        peak_depth >= max(depth_limit * 0.50, 0.75, 4.0 * radial_noise)
+        and notch_width_deg >= float(min_wide_notch_deg)
+        and candidate_area >= depth_limit * max(1.5, float(min_wide_notch_deg))
+    )
+    found = bool(strong_notch or wide_shallow_notch)
+
     # The requested reference is the angular midpoint of the separated notch
-    # region, not the depth-weighted apex. Keep the unwrapped left/right values
-    # so a notch crossing 0/360 degrees is handled correctly.
-    notch_center_index = (float(left) + float(right)) / 2.0
+    # region, not the depth-weighted apex. Unwrap group indices so a notch
+    # crossing 0/360 degrees is handled correctly.
+    unwrapped = np.unwrap(
+        candidate_indices.astype(np.float64) * 2.0 * math.pi / angle_samples
+    )
+    notch_center_index = float(np.mean(unwrapped) * angle_samples / (2.0 * math.pi))
     notch_angle_rad = float(
         (notch_center_index % angle_samples) * 2.0 * math.pi / angle_samples
     )
     notch_angle_deg = float(math.degrees(notch_angle_rad) % 360.0)
-    notch_index = int(round(notch_angle_deg / 360.0 * angle_samples)) % angle_samples
-    notch_radius = float(profile[notch_index])
+    deepest_angle = float(angles[peak_index])
+    notch_radius = float(radius - penetration[peak_index])
     notch_deepest_point = (
-        float(cx + math.cos(notch_angle_rad) * notch_radius),
-        float(cy + math.sin(notch_angle_rad) * notch_radius),
+        float(cx + math.cos(deepest_angle) * notch_radius),
+        float(cy + math.sin(deepest_angle) * notch_radius),
     )
     # This is the user-confirmed red point: the notch centre direction at the
     # fitted wafer outer circle, i.e. where the circle would be without a cut.
@@ -276,20 +373,35 @@ def detect_wafer_notch(
         float(cy + math.sin(notch_angle_rad) * radius),
     )
 
-    notch_width_deg = float(len(candidate_indices) / samples_per_degree)
     notch_width_px = float(
         2.0 * radius * math.sin(math.radians(notch_width_deg) / 2.0)
     )
-    snr = peak_depth / max(1.0, radial_noise)
+    snr = peak_depth / max(0.25, radial_noise)
     depth_score = (peak_depth - depth_limit) / max(depth_limit * 2.0, 1.0)
-    confidence = float(np.clip(0.55 * min(1.0, snr / 10.0) + 0.45 * np.clip(depth_score, 0.0, 1.0), 0.0, 1.0))
+    area_score = candidate_area / max(depth_limit * 6.0, 1.0)
+    confidence = float(np.clip(
+        0.50 * min(1.0, snr / 10.0)
+        + 0.30 * np.clip(depth_score, 0.0, 1.0)
+        + 0.20 * np.clip(area_score, 0.0, 1.0),
+        0.0,
+        1.0,
+    ))
     if not found:
-        confidence = min(confidence, 0.25)
-        if require_notch:
+        confidence = 0.0
+        if mode == "error":
             raise RuntimeError(
                 f"Wafer notch was not found: peak_depth={peak_depth / scale:.2f}px, "
-                f"required={depth_limit / scale:.2f}px."
+                f"width={notch_width_deg:.2f}deg, required_depth={depth_limit / scale:.2f}px. "
+                "Use failure_mode='zero' to return angle 0 instead."
             )
+        notch_angle_deg = float(reference_angle_deg) % 360.0
+        notch_angle_rad = math.radians(notch_angle_deg)
+        notch_point = (
+            float(cx + math.cos(notch_angle_rad) * radius),
+            float(cy + math.sin(notch_angle_rad) * radius),
+        )
+        notch_deepest_point = notch_point
+        candidate_indices = np.asarray((), dtype=np.int64)
 
     inv_scale = 1.0 / scale
     full_center = (float(cx * inv_scale), float(cy * inv_scale))
@@ -304,8 +416,8 @@ def detect_wafer_notch(
     )
     arc = tuple(
         (
-            float((cx + math.cos(angles[index]) * profile[index]) * inv_scale),
-            float((cy + math.sin(angles[index]) * profile[index]) * inv_scale),
+            float((cx + math.cos(angles[index]) * (radius - penetration[index])) * inv_scale),
+            float((cy + math.sin(angles[index]) * (radius - penetration[index])) * inv_scale),
         )
         for index in candidate_indices[::max(1, len(candidate_indices) // 48)]
     )
@@ -330,6 +442,7 @@ def detect_wafer_notch(
         wafer_contour_px=contour_full,
         segmentation_threshold=float(segmentation_threshold),
         scale=scale,
+        failure_mode=mode,
     )
 
 
@@ -338,6 +451,7 @@ def align_wafer_by_notch(
     result: Optional[NotchAngleResult] = None,
     *,
     reference_angle_deg: float = 90.0,
+    failure_mode: Literal["error", "zero"] = "error",
     interpolation: int = cv2.INTER_CUBIC,
     border_value: Tuple[int, int, int] = (0, 0, 0),
 ):
@@ -346,7 +460,9 @@ def align_wafer_by_notch(
     source = _load_bgr(image)
     if result is None:
         result = detect_wafer_notch(
-            source, reference_angle_deg=reference_angle_deg
+            source,
+            reference_angle_deg=reference_angle_deg,
+            failure_mode=failure_mode,
         )
     height, width = source.shape[:2]
     matrix = cv2.getRotationMatrix2D(

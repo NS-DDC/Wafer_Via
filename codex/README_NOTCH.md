@@ -24,6 +24,9 @@ dm = build_die_map_from_yolo(
 
     # notch가 정렬된 뒤 위치할 기준 방향: 아래쪽 6시
     notch_reference_angle_deg=90.0,
+
+    # 권장: notch 미검출 시 즉시 RuntimeError
+    notch_failure_mode="error",
 )
 ```
 
@@ -31,10 +34,14 @@ YOLO 좌표는 center corner와 `pitch_x`, `pitch_y`를 찾는 데만 사용합�
 
 ## 빨간 기준점 정의
 
-1. 색상을 고정하지 않고 이미지 네 corner의 배경과 다른 중앙 원형 contour를 찾습니다.
-2. 원 외곽의 반지름 profile에서 국소적으로 안쪽으로 들어간 notch 구간을 분리합니다.
-3. notch 구간 좌우 끝의 각도상 가운데를 구합니다.
-4. 그 방향을 원래 wafer 외곽 원까지 연장한 점이 `notch_point_px`입니다.
+1. 이미지 네 corner에서 wafer 밖 배경색을 추정합니다. 실제 이미지의 검은 배경뿐 아니라 조금 밝거나 색이 섞인 배경도 같은 방식으로 처리합니다.
+2. 배경과 다른 가장 큰 중앙 영역으로 원래 wafer 외곽 원을 맞춥니다.
+3. 원 외곽의 각 방향에서 **외부 배경이 원 안쪽으로 얼마나 침투했는지**를 측정합니다.
+4. 원·타원의 미세한 중심 오차와 완만한 외곽 변형은 강건한 주기 baseline으로 제거합니다.
+5. 남은 후보를 깊이뿐 아니라 각도 폭과 면적으로 함께 평가합니다. 따라서 뾰족한 V/U 홈뿐 아니라 **길고 얕은 반원형 notch**도 검출합니다.
+6. 선택된 notch 구간 좌우 끝의 각도상 가운데를 구하고, 그 방향을 원래 wafer 외곽 원까지 연장한 점을 `notch_point_px`로 반환합니다.
+
+notch 모양 자체를 V, U 또는 반원 template로 고정하지 않습니다. 핵심 신호는 wafer 밖 배경이 원 안쪽으로 이어져 들어오는 영역입니다. wafer 내부의 검은 die street나 작은 노이즈는 외부 배경과 연결되지 않으므로 각도 방향 다수결과 폭·면적 조건으로 억제합니다.
 
 이 점이 `natural_teal_bluegray_notch_zoom_red.png`에 사용자가 표시한 빨간점입니다. 홈의 가장 안쪽 점은 angle 기준으로 사용하지 않고 `notch_deepest_point_px`에 진단용으로만 보존합니다.
 
@@ -79,6 +86,8 @@ print(dm.notch_reference_angle_deg)      # 기본 90°
 print(dm.notch_depth_px)
 print(dm.notch_width_px)
 print(dm.notch_result)
+print(dm.notch_result.found)             # notch 검출 성공 여부
+print(dm.notch_result.failure_mode)      # "error" 또는 "zero"
 
 print(dm.pitch_x, dm.pitch_y)
 print(dm.x0, dm.y0)
@@ -103,7 +112,10 @@ from wafer_via_notch_standalone import (
     make_notch_zoom,
 )
 
-notch = detect_wafer_notch(wafer_bgr)
+notch = detect_wafer_notch(
+    wafer_bgr,
+    failure_mode="error",               # 미검출 시 RuntimeError
+)
 
 print(notch.notch_point_px)
 print(notch.notch_deepest_point_px)
@@ -133,15 +145,44 @@ cv2.imwrite("notch_zoom.png", zoom)
 | `notch_reference_angle_deg` | `90.0` | 보정 후 notch가 위치할 방향 |
 | `notch_max_dimension` | `2048` | 큰 이미지의 notch 검출용 축소 크기 |
 | `notch_angle_samples` | `3600` | 원주 반지름 sampling 수, 기본 0.1° 간격 |
-| `notch_baseline_window_deg` | `10.0` | 정상 원 외곽을 복원할 주변 각도 폭 |
+| `notch_baseline_window_deg` | `10.0` | 이전 호출과의 호환용 인자. 현재 강건한 전역 주기 baseline을 사용하므로 값은 사용하지 않음 |
 | `notch_min_depth_px` | `None` | 수동 최소 notch 깊이, 원본 이미지 px |
-| `notch_min_depth_ratio` | `0.006` | 자동 최소 깊이, wafer 반지름 비율 |
+| `notch_min_depth_ratio` | `0.002` | 자동 최소 깊이, wafer 반지름 비율. 얕은 실제 notch 대응 기본값 |
+| `notch_min_wide_deg` | `2.0` | 얕은 notch로 인정할 최소 각도 폭 |
+| `notch_failure_mode` | `"error"` | 미검출 시 `"error"`는 예외, `"zero"`는 보정각 0 반환 |
 
-notch가 검출되지 않으면 기존 angle로 fallback하지 않고 `RuntimeError`를 발생시킵니다. 이는 notch만 angle 기준으로 사용하기 위한 의도된 동작입니다.
+두 모드 모두 YOLO, FFT, projection 또는 die-render angle로 fallback하지 않습니다.
+
+### notch 미검출 처리 선택
+
+운영 중 잘못된 각도로 DM을 만드는 것을 막으려면 기본값인 `"error"`를 권장합니다.
+
+```python
+dm = build_die_map_from_yolo(
+    ...,
+    notch_failure_mode="error",
+)
+# 미검출: RuntimeError
+```
+
+notch가 없는 이미지도 그대로 처리해야 하면 `"zero"`를 사용합니다.
+
+```python
+dm = build_die_map_from_yolo(
+    ...,
+    notch_failure_mode="zero",
+)
+
+if not dm.notch_result.found:
+    assert dm.grid_angle_deg == 0.0
+    assert dm.angle_align_method == "notch_zero_fallback"
+```
+
+notch 검출 함수만 직접 호출할 때는 `failure_mode="zero"`로 같은 정책을 지정합니다. 이 경우 `correction_angle_deg=0.0`, `found=False`이고, `notch_point_px`는 진단과 오버레이 형식 유지를 위해 설정한 기준 방향의 외곽 원 좌표로 채워집니다.
 
 ## 검증 결과
 
-- 전체 회귀 테스트 25개 통과
+- 전체 회귀 테스트에는 뾰족한 notch, 길고 얕은 반원형 notch, 회전된 얕은 notch, notch 미검출의 `error`/`zero` 정책이 포함됩니다.
 - 실제 notch 샘플에 `-27°`, `13°`, `31°` 회전을 적용했을 때 angle 오차 최대 약 `0.15°`
 - 정렬 후 notch 잔여 보정각 최대 약 `0.05°`
 - `wafer_via_notch_standalone.py` 한 파일만 빈 폴더에 복사한 뒤 DM 생성 성공

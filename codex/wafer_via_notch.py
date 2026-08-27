@@ -2,13 +2,15 @@
 
 YOLO points are used for the centre corner and X/Y pitch only. No YOLO pair,
 projection, FFT, or die-render angle estimate is called by this pipeline.
+The notch detector follows outside/background penetration through the fitted
+wafer circle and therefore does not require one fixed notch shape.
 """
 
 from __future__ import annotations
 
 import math
 from pathlib import Path
-from typing import Any, Optional, Sequence, Tuple, Union
+from typing import Any, Literal, Optional, Sequence, Tuple, Union
 
 import cv2
 import numpy as np
@@ -215,7 +217,9 @@ def build_die_map_from_yolo(
     notch_angle_samples: int = 3600,
     notch_baseline_window_deg: float = 10.0,
     notch_min_depth_px: Optional[float] = None,
-    notch_min_depth_ratio: float = 0.006,
+    notch_min_depth_ratio: float = 0.002,
+    notch_min_wide_deg: float = 2.0,
+    notch_failure_mode: Literal["error", "zero"] = "error",
     return_aligned_image: bool = True,
     alignment_interpolation: int = cv2.INTER_CUBIC,
     alignment_border_value: Tuple[int, int, int] = (0, 0, 0),
@@ -234,6 +238,8 @@ def build_die_map_from_yolo(
         baseline_window_deg=notch_baseline_window_deg,
         min_notch_depth_px=notch_min_depth_px,
         min_notch_depth_ratio=notch_min_depth_ratio,
+        min_wide_notch_deg=notch_min_wide_deg,
+        failure_mode=notch_failure_mode,
     )
     if clip_origin is None:
         clip_origin = (
@@ -346,7 +352,7 @@ def build_die_map_from_yolo(
             borderMode=cv2.BORDER_CONSTANT,
             borderValue=alignment_border_value,
         )
-    die_map.angle_align_method = "notch"
+    die_map.angle_align_method = "notch" if notch.found else "notch_zero_fallback"
     die_map.notch_result = notch
     die_map.notch_point_px = notch.notch_point_px
     die_map.notch_deepest_point_px = notch.notch_deepest_point_px

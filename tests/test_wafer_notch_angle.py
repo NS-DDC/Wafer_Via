@@ -32,6 +32,27 @@ def synthetic_notched_wafer(size=900):
     return image, center
 
 
+def synthetic_wide_shallow_notch(size=900):
+    center = (450, 450)
+    radius = 390
+    image = np.zeros((size, size, 3), np.uint8)
+    cv2.circle(image, center, radius, (110, 130, 145), -1, cv2.LINE_AA)
+    cv2.circle(image, center, radius, (185, 195, 205), 5, cv2.LINE_AA)
+    # A long, shallow semicircular black intrusion rather than a sharp V.
+    cv2.ellipse(
+        image,
+        (center[0], center[1] + radius + 3),
+        (70, 3),
+        0,
+        0,
+        360,
+        (0, 0, 0),
+        -1,
+        cv2.LINE_AA,
+    )
+    return image, center
+
+
 class WaferNotchAngleTests(unittest.TestCase):
     def test_standalone_notch_pipeline_has_no_local_import(self):
         source = (
@@ -102,6 +123,20 @@ class WaferNotchAngleTests(unittest.TestCase):
         residual = detect_wafer_notch(aligned)
         self.assertLess(abs(residual.correction_angle_deg), 0.5)
 
+    def test_wide_shallow_semicircle_notch_is_detected(self):
+        image, center = synthetic_wide_shallow_notch()
+        result = detect_wafer_notch(image)
+
+        self.assertTrue(result.found)
+        self.assertLess(abs(result.notch_angle_deg - 90.0), 0.5)
+        self.assertGreater(result.notch_width_deg, 8.0)
+        self.assertGreater(result.notch_depth_px, 2.0)
+
+        matrix = cv2.getRotationMatrix2D(center, -23.0, 1.0)
+        rotated = cv2.warpAffine(image, matrix, image.shape[1::-1])
+        rotated_result = detect_wafer_notch(rotated)
+        self.assertLess(abs(rotated_result.correction_angle_deg - 23.0), 0.6)
+
     def test_circle_without_notch_is_rejected(self):
         image, center = synthetic_notched_wafer()
         cv2.circle(image, center, 390, (110, 130, 145), -1, cv2.LINE_AA)
@@ -109,8 +144,40 @@ class WaferNotchAngleTests(unittest.TestCase):
 
         with self.assertRaises(RuntimeError):
             detect_wafer_notch(image)
-        result = detect_wafer_notch(image, require_notch=False)
+        result = detect_wafer_notch(image, failure_mode="zero")
         self.assertFalse(result.found)
+        self.assertEqual(result.correction_angle_deg, 0.0)
+        self.assertEqual(result.failure_mode, "zero")
+        with self.assertRaises(ValueError):
+            detect_wafer_notch(image, failure_mode="invalid")
+
+    def test_die_map_zero_policy_returns_zero_angle_when_notch_is_missing(self):
+        image, center = synthetic_notched_wafer()
+        cv2.circle(image, center, 390, (110, 130, 145), -1, cv2.LINE_AA)
+        cv2.circle(image, center, 390, (185, 195, 205), 5, cv2.LINE_AA)
+        clip = image[194:706, 194:706]
+        detections = np.asarray(
+            [
+                (center[0] + ix * 70.0 - 194, center[1] + iy * 82.0 - 194)
+                for iy in range(-2, 3)
+                for ix in range(-2, 3)
+            ]
+        )
+
+        die_map = build_die_map_from_yolo(
+            image,
+            clip,
+            detections,
+            detection_format="point",
+            clip_origin=(194, 194),
+            refine=False,
+            notch_failure_mode="zero",
+            return_aligned_image=False,
+        )
+
+        self.assertEqual(die_map.grid_angle_deg, 0.0)
+        self.assertEqual(die_map.angle_align_method, "notch_zero_fallback")
+        self.assertFalse(die_map.notch_result.found)
 
     def test_die_map_uses_notch_as_only_angle_source(self):
         image, center = synthetic_notched_wafer()
