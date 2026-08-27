@@ -41,8 +41,8 @@ def synthetic_wide_shallow_notch(size=900):
     # A long, shallow semicircular black intrusion rather than a sharp V.
     cv2.ellipse(
         image,
-        (center[0], center[1] + radius + 3),
-        (70, 3),
+        (center[0], center[1] + radius + 5),
+        (70, 12),
         0,
         0,
         360,
@@ -51,6 +51,35 @@ def synthetic_wide_shallow_notch(size=900):
         cv2.LINE_AA,
     )
     return image, center
+
+
+def synthetic_nonblack_variable_background_notch(size=900):
+    center = (472, 432)
+    radius = 365
+    yy, xx = np.indices((size, size), dtype=np.float32)
+    background = np.dstack((
+        65.0 + 55.0 * xx / size,
+        82.0 + 45.0 * yy / size,
+        105.0 + 18.0 * np.sin(xx / 95.0),
+    )).clip(0, 255).astype(np.uint8)
+    image = background.copy()
+    cv2.circle(image, center, radius, (118, 137, 151), -1, cv2.LINE_AA)
+    cv2.circle(image, center, radius, (150, 161, 171), 4, cv2.LINE_AA)
+    notch_mask = np.zeros((size, size), np.uint8)
+    cv2.ellipse(
+        notch_mask,
+        (center[0], center[1] + radius + 4),
+        (58, 11),
+        0,
+        0,
+        360,
+        255,
+        -1,
+        cv2.LINE_AA,
+    )
+    alpha = notch_mask.astype(np.float32)[:, :, None] / 255.0
+    image = np.rint(image * (1.0 - alpha) + background * alpha).astype(np.uint8)
+    return image, center, radius
 
 
 class WaferNotchAngleTests(unittest.TestCase):
@@ -136,6 +165,17 @@ class WaferNotchAngleTests(unittest.TestCase):
         rotated = cv2.warpAffine(image, matrix, image.shape[1::-1])
         rotated_result = detect_wafer_notch(rotated)
         self.assertLess(abs(rotated_result.correction_angle_deg - 23.0), 0.6)
+
+    def test_nonblack_variable_background_and_offset_center(self):
+        image, center, radius = synthetic_nonblack_variable_background_notch()
+        result = detect_wafer_notch(image)
+
+        self.assertTrue(result.found)
+        self.assertEqual(result.detection_method, "geometry_edge_bottom_sector")
+        self.assertLess(abs(result.notch_angle_deg - 90.0), 0.8)
+        self.assertLess(np.linalg.norm(np.asarray(result.wafer_center_px) - center), 4.0)
+        self.assertLess(abs(result.wafer_radius_px - radius), 8.0)
+        self.assertGreater(result.notch_depth_px, 3.0)
 
     def test_circle_without_notch_is_rejected(self):
         image, center = synthetic_notched_wafer()

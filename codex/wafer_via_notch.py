@@ -2,8 +2,8 @@
 
 YOLO points are used for the centre corner and X/Y pitch only. No YOLO pair,
 projection, FFT, or die-render angle estimate is called by this pipeline.
-The notch detector follows outside/background penetration through the fitted
-wafer circle and therefore does not require one fixed notch shape.
+The detector follows colour-gradient geometry near the fitted wafer circle;
+neither the wafer colour nor the outside colour is classified.
 """
 
 from __future__ import annotations
@@ -213,18 +213,34 @@ def build_die_map_from_yolo(
     edge_margin: float = 1.0,
     edge_mode: str = "circle",
     notch_reference_angle_deg: float = 90.0,
-    notch_max_dimension: int = 2048,
+    notch_max_dimension: int = 3072,
     notch_angle_samples: int = 3600,
     notch_baseline_window_deg: float = 10.0,
     notch_min_depth_px: Optional[float] = None,
-    notch_min_depth_ratio: float = 0.002,
+    notch_min_depth_ratio: float = 0.001,
     notch_min_wide_deg: float = 2.0,
+    notch_search_center_angle_deg: float = 90.0,
+    notch_search_half_width_deg: float = 45.0,
+    notch_wafer_center_hint_px: Optional[Point] = None,
+    notch_wafer_radius_hint_px: Optional[float] = None,
     notch_failure_mode: Literal["error", "zero"] = "error",
     return_aligned_image: bool = True,
     alignment_interpolation: int = cv2.INTER_CUBIC,
     alignment_border_value: Tuple[int, int, int] = (0, 0, 0),
 ) -> _base.WaferDieMap:
-    """Build a die map with the wafer notch as the sole angle source."""
+    """Build a die map with the wafer notch as the sole angle source.
+
+    The notch detector does not require a black background. It fits the wafer
+    circle from colour-gradient geometry outside the expected notch sector,
+    then searches only ``notch_search_center_angle_deg +/-
+    notch_search_half_width_deg`` for a continuous inward depression.
+
+    If the automatic circle is wrong on production data, pass full-image
+    ``notch_wafer_center_hint_px=(x, y)`` and
+    ``notch_wafer_radius_hint_px=radius``. Use ``notch_failure_mode="error"``
+    to stop on a missing notch or ``"zero"`` to keep an unrotated result.
+    Detailed diagnostics remain available under ``dm.notch_result``.
+    """
 
     wafer = _base._load_bgr(wafer_image)
     clip = _base._load_bgr(clip_image)
@@ -239,6 +255,10 @@ def build_die_map_from_yolo(
         min_notch_depth_px=notch_min_depth_px,
         min_notch_depth_ratio=notch_min_depth_ratio,
         min_wide_notch_deg=notch_min_wide_deg,
+        search_center_angle_deg=notch_search_center_angle_deg,
+        search_half_width_deg=notch_search_half_width_deg,
+        wafer_center_hint_px=notch_wafer_center_hint_px,
+        wafer_radius_hint_px=notch_wafer_radius_hint_px,
         failure_mode=notch_failure_mode,
     )
     if clip_origin is None:
@@ -275,7 +295,7 @@ def build_die_map_from_yolo(
         contour_px=notch.wafer_contour_px,
         area_px=float(cv2.contourArea(notch.wafer_contour_px)),
         bbox_px=(int(bx), int(by), int(bx + bw), int(by + bh)),
-        method="notch_background_circle",
+        method="notch_geometry_edge_circle",
     )
     origin_full = (
         float(clip_origin[0]) + estimate.center_corner_clip[0],
@@ -360,6 +380,11 @@ def build_die_map_from_yolo(
     die_map.notch_reference_angle_deg = notch.reference_angle_deg
     die_map.notch_depth_px = notch.notch_depth_px
     die_map.notch_width_px = notch.notch_width_px
+    die_map.notch_detection_method = notch.detection_method
+    die_map.notch_edge_support = notch.edge_support
+    die_map.notch_circle_fit_residual_px = notch.circle_fit_residual_px
+    die_map.notch_search_center_angle_deg = notch.search_center_angle_deg
+    die_map.notch_search_half_width_deg = notch.search_half_width_deg
     return die_map
 
 
