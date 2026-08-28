@@ -99,6 +99,78 @@ class AdaptiveBackgroundNotchTests(unittest.TestCase):
         self.assertTrue(result.found)
         self.assertEqual(result.overlay_image.shape, image.shape)
 
+    def test_full_adaptive_standalone_changes_only_angle_source(self):
+        source = (
+            Path(__file__).parents[1]
+            / "codex"
+            / "wafer_via_notch_adaptive_standalone.py"
+        )
+        text = source.read_text(encoding="utf-8")
+        original_source = (
+            Path(__file__).parents[1]
+            / "codex"
+            / "wafer_via_notch_standalone.py"
+        ).read_text(encoding="utf-8")
+        original_builder = original_source[
+            original_source.index("def build_die_map_from_yolo("):
+        ].rstrip()
+        self.assertNotIn("import wafer_notch_angle", text)
+        self.assertNotIn("import wafer_via", text)
+        self.assertIn("86_ADAPTIVE_BACKGROUND_ANGLE_OVERRIDE", text)
+        self.assertIn(original_builder, text)
+        with tempfile.TemporaryDirectory() as directory:
+            isolated = Path(directory) / source.name
+            copy2(source, isolated)
+            namespace = runpy.run_path(str(isolated))
+
+        geometry = []
+        for background in ((0, 0, 0), (145, 62, 18), (150, 82, 220)):
+            image, center, _ = synthetic_wafer(background)
+            clip_origin = (94, 94)
+            clip = image[94:606, 94:606]
+            detections = np.asarray([
+                (
+                    center[0] + ix * 70.0 - clip_origin[0],
+                    center[1] + iy * 82.0 - clip_origin[1],
+                )
+                for iy in range(-2, 3)
+                for ix in range(-2, 3)
+            ])
+            die_map = namespace["build_die_map_from_yolo"](
+                image,
+                clip,
+                detections,
+                detection_format="point",
+                clip_origin=clip_origin,
+                refine=False,
+                return_aligned_image=True,
+                notch_angle_samples=14400,
+            )
+            self.assertEqual(
+                die_map.notch_detection_method,
+                "v5_border_adaptive_angle_only",
+            )
+            self.assertEqual(die_map.grid_angle_deg, 0.0)
+            self.assertAlmostEqual(die_map.pitch_x, 70.0, places=5)
+            self.assertAlmostEqual(die_map.pitch_y, 82.0, places=5)
+            self.assertEqual(die_map.aligned_image.shape, image.shape)
+            self.assertIsNotNone(die_map.notch_overlay_image)
+            self.assertIsNotNone(die_map.notch_zoom_image)
+            located = namespace["locate_die"](
+                die_map, point=(die_map.x0, die_map.y0)
+            )
+            self.assertIsNotNone(located)
+            geometry.append((
+                die_map.wafer_cx,
+                die_map.wafer_cy,
+                die_map.wafer_r,
+                die_map.notch_angle_deg,
+                die_map.image_rotation_deg,
+            ))
+
+        for values in geometry[1:]:
+            self.assertTrue(np.allclose(values, geometry[0], atol=1e-6))
+
 
 if __name__ == "__main__":
     unittest.main(verbosity=2)

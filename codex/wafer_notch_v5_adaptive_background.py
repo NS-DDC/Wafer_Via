@@ -39,6 +39,7 @@ class AdaptiveBackgroundNotchGuideResult:
     wafer_center_px: Point
     wafer_radius_px: float
     notch_center_px: Optional[Point]
+    notch_deepest_point_px: Optional[Point]
     notch_point_px: Optional[Point]
     notch_left_px: Optional[Point]
     notch_right_px: Optional[Point]
@@ -185,6 +186,7 @@ def draw_aligned_wafer_notch_guide(
     aligned_image: ImageInput,
     *,
     reference_angle_deg: float = 90.0,
+    search_center_angle_deg: Optional[float] = None,
     search_half_width_deg: float = 70.0,
     max_analysis_dimension: int = 3072,
     border_band_px: int = 16,
@@ -196,10 +198,13 @@ def draw_aligned_wafer_notch_guide(
     silhouette_open_kernel: int = 3,
     angle_samples: int = 14400,
     radial_samples: int = 200,
-    min_notch_depth_px: float = 4.0,
+    min_notch_depth_px: Optional[float] = 4.0,
+    min_notch_depth_ratio: float = 0.001,
     noise_margin_px: float = 3.0,
     min_notch_span_deg: float = 0.06,
     smooth_deg: float = 0.25,
+    wafer_center_hint_px: Optional[Point] = None,
+    wafer_radius_hint_px: Optional[float] = None,
     failure_mode: Literal["error", "zero"] = "zero",
     thickness: Optional[int] = None,
     draw_text: bool = True,
@@ -278,6 +283,11 @@ def draw_aligned_wafer_notch_guide(
         )
     wafer_contour = max(contours, key=cv2.contourArea)
     (wafer_cx, wafer_cy), wafer_radius = cv2.minEnclosingCircle(wafer_contour)
+    if wafer_center_hint_px is not None:
+        wafer_cx = float(wafer_center_hint_px[0]) * scale
+        wafer_cy = float(wafer_center_hint_px[1]) * scale
+    if wafer_radius_hint_px is not None:
+        wafer_radius = float(wafer_radius_hint_px) * scale
     if wafer_radius <= min(height, width) * 0.20:
         raise RuntimeError("Adaptive-background wafer radius is implausibly small.")
 
@@ -333,10 +343,19 @@ def draw_aligned_wafer_notch_guide(
     ]
 
     angles_deg = np.degrees(angles)
+    search_center = (
+        float(reference_angle_deg)
+        if search_center_angle_deg is None
+        else float(search_center_angle_deg)
+    )
     in_sector = np.abs(
-        (angles_deg - float(reference_angle_deg) + 180.0) % 360.0 - 180.0
+        (angles_deg - search_center + 180.0) % 360.0 - 180.0
     ) <= float(search_half_width_deg)
-    scaled_min_depth = float(min_notch_depth_px) * scale
+    scaled_min_depth = (
+        float(min_notch_depth_px) * scale
+        if min_notch_depth_px is not None
+        else max(1.25, float(wafer_radius) * float(min_notch_depth_ratio))
+    )
     scaled_noise_margin = float(noise_margin_px) * scale
     active = (depth > scaled_min_depth) & in_sector
     degree_step = 360.0 / sample_count
@@ -362,6 +381,7 @@ def draw_aligned_wafer_notch_guide(
     )
 
     notch_center_work: Optional[Point] = None
+    notch_deepest_work: Optional[Point] = None
     notch_point_work: Optional[Point] = None
     notch_left_work: Optional[Point] = None
     notch_right_work: Optional[Point] = None
@@ -389,6 +409,11 @@ def draw_aligned_wafer_notch_guide(
             float((boundary_x * candidate_depth).sum() / weight_sum),
             float((boundary_y * candidate_depth).sum() / weight_sum),
         )
+        peak_local_index = int(np.argmax(candidate_depth))
+        notch_deepest_work = (
+            float(boundary_x[peak_local_index]),
+            float(boundary_y[peak_local_index]),
+        )
         notch_angle_rad = math.radians(notch_angle)
         notch_point_work = (
             float(wafer_cx + wafer_radius * math.cos(notch_angle_rad)),
@@ -407,7 +432,7 @@ def draw_aligned_wafer_notch_guide(
         raise RuntimeError(
             "Adaptive-background V5 notch was not found: "
             f"effective_depth_threshold={effective_threshold / scale:.2f}px, "
-            f"search={float(reference_angle_deg):.1f}+/-"
+            f"search={search_center:.1f}+/-"
             f"{float(search_half_width_deg):.1f}deg."
         )
 
@@ -421,6 +446,7 @@ def draw_aligned_wafer_notch_guide(
     full_center = (float(wafer_cx * inv_scale), float(wafer_cy * inv_scale))
     full_radius = float(wafer_radius * inv_scale)
     notch_center = full_point(notch_center_work)
+    notch_deepest = full_point(notch_deepest_work)
     notch_point = full_point(notch_point_work)
     notch_left = full_point(notch_left_work)
     notch_right = full_point(notch_right_work)
@@ -460,8 +486,8 @@ def draw_aligned_wafer_notch_guide(
         )
 
     for search_angle in (
-        float(reference_angle_deg) - float(search_half_width_deg),
-        float(reference_angle_deg) + float(search_half_width_deg),
+        search_center - float(search_half_width_deg),
+        search_center + float(search_half_width_deg),
     ):
         cv2.line(
             overlay, center_int, ring_point(search_angle),
@@ -574,6 +600,7 @@ def draw_aligned_wafer_notch_guide(
         wafer_center_px=full_center,
         wafer_radius_px=full_radius,
         notch_center_px=notch_center,
+        notch_deepest_point_px=notch_deepest,
         notch_point_px=notch_point,
         notch_left_px=notch_left,
         notch_right_px=notch_right,
@@ -590,7 +617,7 @@ def draw_aligned_wafer_notch_guide(
         ),
         segmentation_threshold_lab=float(segmentation_threshold),
         analysis_scale=float(scale),
-        search_center_angle_deg=float(reference_angle_deg) % 360.0,
+        search_center_angle_deg=search_center % 360.0,
         search_half_width_deg=float(search_half_width_deg),
         detection_method="v5_border_adaptive_silhouette_radial_aligned",
     )

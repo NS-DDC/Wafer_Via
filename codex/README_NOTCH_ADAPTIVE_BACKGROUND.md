@@ -118,6 +118,7 @@ python wafer_notch_v5_adaptive_background.py `
 | `wafer_center_px` | aligned image 좌표의 Wafer 중심 |
 | `wafer_radius_px` | V5 `minEnclosingCircle` 반지름 |
 | `notch_center_px` | notch 안쪽 깊이 가중 중심 |
+| `notch_deepest_point_px` | 후보 중 반지름이 가장 작은 실제 최심점 |
 | `notch_point_px` | 중심 방향을 외곽 원까지 투영한 빨간 기준점 |
 | `notch_left_px`, `notch_right_px` | 검출된 notch 구간 양 끝 |
 | `notch_angle_deg` | 영상 좌표 각도, 오른쪽 0°, 아래쪽 90° |
