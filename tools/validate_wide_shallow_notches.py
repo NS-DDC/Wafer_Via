@@ -53,6 +53,7 @@ def main() -> None:
             notch_roi_center_px=(5000, 9650),
             notch_roi_half_size_px=(600, 600),
             notch_semicircle_radius_range_px=(30, 80),
+            notch_background_morph_px=8,
             failure_mode="error",
         )
         overlay = make_notch_overlay(image, result, max_dimension=5000)
@@ -106,6 +107,7 @@ def main() -> None:
                 notch_roi_center_px=(5000, 9650),
                 notch_roi_half_size_px=(600, 600),
                 notch_semicircle_radius_range_px=(30, 80),
+                background_morph_px=8,
             )
             cv2.imwrite(
                 str(IMAGE_DIR / f"debug_{name}_background_stages.png"), debug

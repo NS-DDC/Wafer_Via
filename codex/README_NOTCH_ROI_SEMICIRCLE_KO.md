@@ -63,13 +63,16 @@ dm = build_die_map_from_yolo(
     notch_roi_center_px=(5000, 9650),
     notch_roi_half_size_px=(600, 600),
     notch_semicircle_radius_range_px=(40, 70),
+    notch_background_morph_px=8,  # 원본 폭 105~110 px의 작은 notch
     notch_semicircle_min_score=0.55,
     notch_failure_mode="error",
 )
 ```
 
 가로 반폭 범위도 원본 이미지 픽셀 단위입니다. 실제 크기를 모르면 이 옵션은 생략하고
-자동 범위를 사용하십시오.
+자동 범위를 사용하십시오. 이 샘플처럼 원본 notch 폭이 약 105 px로 작으면
+`notch_background_morph_px=8`부터 시작하고, 더 큰 끊김이나 노이즈가 있을 때만
+조금씩 키우십시오.
 
 ## 개선된 angle 보정 원리
 
