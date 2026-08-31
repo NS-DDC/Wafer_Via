@@ -62,7 +62,7 @@ dm = build_die_map_from_yolo(
     ...,
     notch_roi_center_px=(5000, 9650),
     notch_roi_half_size_px=(600, 600),
-    notch_semicircle_radius_range_px=(40, 160),
+    notch_semicircle_radius_range_px=(40, 70),
     notch_semicircle_min_score=0.55,
     notch_failure_mode="error",
 )
@@ -163,7 +163,7 @@ debug_sheet = make_notch_background_debug_contact_sheet(
     wafer_bgr,
     notch_roi_center_px=(5000, 9650),
     notch_roi_half_size_px=(600, 600),
-    notch_semicircle_radius_range_px=(40, 160),  # 가로 반폭, 모르면 생략
+    notch_semicircle_radius_range_px=(40, 70),  # 가로 반폭, 모르면 생략
 )
 cv2.imwrite("notch_background_stages.png", debug_sheet)
 ```
@@ -246,16 +246,20 @@ notch arc를 못 찾으면 `RuntimeError`를 발생시켜 잘못된 wafer angle�
 
 ## 실제 장비 적용 전 점검
 
-`image5`에는 5000×5000 결과 기준으로 notch 크기가 서로 다른 다음 4개 검증 영상을
-추가했습니다.
+`image5`에는 **10000×10000 원본 이미지 기준**으로 notch 크기가 서로 다른 다음 4개
+검증 영상을 추가했습니다.
 
 - black: 105×36 px
 - gray: 106×37 px
 - pale green: 108×38 px
 - pale red: 110×40 px
 
-원본 테스트 파일은 10000×10000이므로 실제로 그리는 크기는 각각 2배이고,
-5000×5000 angle 결과에서 위 크기가 됩니다.
+위 숫자는 원본에 실제로 그린 크기입니다. 5000×5000 angle 결과는 0.5배 축소되므로
+화면상 크기는 각각 `52.5×18`, `53×18.5`, `54×19`, `55×20 px`입니다.
+기존 샘플의 중앙 하단 반원 장식은 직선 grid texture로 제거했습니다. 따라서 아래
+검증 영상에서 반원/반타원 형상은 wafer 최외곽 notch 하나뿐입니다. 로직도 영상
+테두리와 연결된 배경 경계만 사용하므로 wafer 내부의 고립된 반원 패턴은 후보에서
+제외됩니다.
 
 ![얕고 넓은 notch 4종 검출 결과](sample_img/wide_shallow_notch_results.png)
 

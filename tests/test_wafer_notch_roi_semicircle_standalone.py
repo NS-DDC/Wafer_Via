@@ -151,6 +151,36 @@ class RoiSemicircleStandaloneTests(unittest.TestCase):
         self.assertLess(abs(result.wafer_radius_px - 390.0), 8.0)
         self.assertLess(result.semicircle_fit_residual_px, 4.0)
 
+    def test_isolated_inner_semicircle_is_not_used_as_notch(self):
+        image, _, roi_center = synthetic_wide_shallow_notch(
+            108.0, 38.0, (185, 185, 185)
+        )
+        # Deliberately add a larger semicircular decoy inside the wafer.  It is
+        # not connected to the image-border background and must be ignored.
+        cv2.ellipse(
+            image,
+            (700, 1195),
+            (95, 45),
+            0.0,
+            180.0,
+            360.0,
+            (185, 185, 185),
+            12,
+            cv2.LINE_AA,
+        )
+        result = MODULE.detect_wafer_notch(
+            image,
+            notch_roi_center_px=roi_center,
+            notch_roi_half_size_px=(150, 150),
+            notch_semicircle_radius_range_px=(35, 80),
+            notch_background_morph_px=4,
+            failure_mode="error",
+        )
+        self.assertTrue(result.found)
+        self.assertLess(abs(result.notch_angle_deg - 90.0), 0.5)
+        self.assertLess(abs(result.notch_width_px - 108.0), 8.0)
+        self.assertLess(abs(result.notch_depth_px - 38.0), 6.0)
+
     def test_roi_mode_rejects_a_circle_without_notch(self):
         image, center, _ = synthetic_semicircle_notch()
         cv2.circle(image, tuple(center.astype(int)), 390, (120, 140, 160), -1, cv2.LINE_AA)
