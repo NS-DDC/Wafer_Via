@@ -2075,7 +2075,7 @@ build_die_map = _legacy_build_die_map_from_yolo
 #   5) robust/local angle 차이와 angle_pair_residuals_deg가 작은지
 #   6) clip overlay와 wafer overlay가 실제 street/grid에 맞는지
 #
-# [고정 좌표 ROI에서 반원 notch로 angle 보정]
+# [고정 좌표 ROI에서 반원/얕은 반타원 notch로 angle 보정]
 # 장비에서 notch 위치가 늘 비슷하면 아래 두 값만 실제 full wafer 좌표로
 # 지정하는 것이 권장됩니다. ROI 밖의 외곽 함몰은 angle 후보가 될 수 없습니다.
 #
@@ -2084,7 +2084,7 @@ build_die_map = _legacy_build_die_map_from_yolo
 #       clip_image=center_clip_bgr,
 #       detections=yolo_points,
 #       detection_format="point",
-#       notch_roi_center_px=(5000, 9650),       # 예상 반원 중심 (x, y)
+#       notch_roi_center_px=(5000, 9650),       # 예상 notch 중심 (x, y)
 #       notch_roi_half_size_px=(600, 600),      # 좌우/상하 반경, 실제값에 맞게 조절
 #       # 선택: 실제 notch 반지름 범위를 알 때 오검출을 더 줄임
 #       notch_semicircle_radius_range_px=(60, 300),
@@ -2093,7 +2093,7 @@ build_die_map = _legacy_build_die_map_from_yolo
 #
 # ``notch_roi_center_px``는 축소 영상 좌표가 아니라 원본 ``wafer_image`` 좌표입니다.
 # image5의 10000x10000 샘플은 대략 (5000, 9650)을 사용했지만 실제 장비 영상에서는
-# overlay의 자홍색 ROI/십자와 하늘색 반원 표시를 보고 좌표와 크기를 조정하십시오.
+# overlay의 자홍색 ROI/십자와 하늘색 arc 표시를 보고 좌표와 크기를 조정하십시오.
 # 검출 결과는 dm.notch_result.roi_bounds_px, semicircle_center_px,
 # semicircle_radius_px, semicircle_score, semicircle_fit_residual_px에서
 # 확인할 수 있습니다.
@@ -2142,6 +2142,9 @@ class NotchAngleResult:
     roi_bounds_px: Optional[Tuple[float, float, float, float]] = None
     semicircle_center_px: Optional[Point] = None
     semicircle_radius_px: Optional[float] = None
+    semicircle_radius_x_px: Optional[float] = None
+    semicircle_radius_y_px: Optional[float] = None
+    semicircle_shape: str = "none"
     semicircle_score: float = 0.0
     semicircle_fit_residual_px: float = 0.0
     background_segmentation_used: bool = False
@@ -2393,6 +2396,9 @@ class _LocalSemicircleCandidate:
     arc_points: Tuple[Point, ...]
     roi_bounds: Tuple[int, int, int, int]
     fit_residual: float = 0.0
+    radius_x: Optional[float] = None
+    radius_y: Optional[float] = None
+    shape: str = "semicircle"
 
 
 @dataclass(frozen=True)
@@ -2627,7 +2633,265 @@ def _learn_background_from_notch_roi(
     )
 
 
-def _fit_semicircle_from_background_boundary(
+def _sample_fitted_arc_support(
+    edge: np.ndarray,
+    arc_points: np.ndarray,
+) -> Tuple[float, float, float]:
+    """Measure local edge support and left/right balance along a fitted arc."""
+
+    height, width = edge.shape
+    values = []
+    for point in np.asarray(arc_points, dtype=np.float64).reshape(-1, 2):
+        x = int(round(float(point[0])))
+        y = int(round(float(point[1])))
+        x0, x1 = max(0, x - 2), min(width, x + 3)
+        y0, y1 = max(0, y - 2), min(height, y + 3)
+        values.append(
+            0.0 if x0 >= x1 or y0 >= y1 else float(np.max(edge[y0:y1, x0:x1]))
+        )
+    support = np.asarray(values, dtype=np.float64)
+    if not len(support):
+        return 0.0, 0.0, 0.0
+    edge_support = float(np.mean(support))
+    support_floor = max(0.08, float(np.percentile(support, 35.0)) * 0.70)
+    coverage = float(np.mean(support >= support_floor))
+    midpoint = len(support) // 2
+    left = float(np.mean(support[:midpoint])) if midpoint else edge_support
+    right = (
+        float(np.mean(support[midpoint + 1 :]))
+        if midpoint + 1 < len(support) else edge_support
+    )
+    symmetry = min(left, right) / max(1e-6, max(left, right))
+    return edge_support, coverage, float(symmetry)
+
+
+def _fit_semiellipse_from_background_boundary(
+    geometry: _RoiBackgroundGeometry,
+    roi_center: Point,
+    roi_half_size: Point,
+    radius_range: Optional[Tuple[float, float]],
+) -> Optional[_LocalSemicircleCandidate]:
+    """Fit a shallow/wide semi-ellipse to the exterior intrusion boundary."""
+
+    contours, _ = cv2.findContours(
+        geometry.exterior_background_mask,
+        cv2.RETR_LIST,
+        cv2.CHAIN_APPROX_NONE,
+    )
+    if not contours:
+        return None
+    points = np.concatenate([contour.reshape(-1, 2) for contour in contours], axis=0)
+    x0, y0, x1, y1 = geometry.roi_bounds
+    in_roi = (
+        (points[:, 0] >= x0)
+        & (points[:, 0] < x1)
+        & (points[:, 1] >= y0)
+        & (points[:, 1] < y1)
+    )
+    points = points[in_roi].astype(np.float64)
+    if len(points) < 24:
+        return None
+
+    wafer_center = np.asarray(geometry.wafer_center, dtype=np.float64)
+    outward = np.asarray(geometry.outward_unit, dtype=np.float64)
+    outward /= max(1e-9, float(np.linalg.norm(outward)))
+    tangent = np.asarray((-outward[1], outward[0]), dtype=np.float64)
+    vectors = points - wafer_center
+    radial_distance = np.linalg.norm(vectors, axis=1)
+    depth = float(geometry.wafer_radius) - radial_distance
+    tangential = vectors @ tangent
+    outward_projection = vectors @ outward
+    minimum_half_size = min(float(roi_half_size[0]), float(roi_half_size[1]))
+    if radius_range is None:
+        min_half_width = max(3.0, minimum_half_size * 0.035)
+        max_half_width = max(min_half_width + 2.0, minimum_half_size * 0.55)
+    else:
+        min_half_width, max_half_width = (
+            float(radius_range[0]), float(radius_range[1])
+        )
+        if min_half_width <= 0.0 or max_half_width <= min_half_width:
+            raise ValueError(
+                "notch_semicircle_radius_range_px must be (positive_min, larger_max)."
+            )
+
+    noise_floor = max(0.75, float(geometry.wafer_circle_residual) * 1.35)
+    usable = (
+        (depth >= noise_floor)
+        & (depth <= max(4.0, minimum_half_size * 0.75))
+        & (outward_projection >= float(geometry.wafer_radius) - 2.2 * minimum_half_size)
+        & (np.abs(tangential - float(np.dot(np.asarray(roi_center) - wafer_center, tangent)))
+           <= float(roi_half_size[0]) * 1.10)
+    )
+    tangential = tangential[usable]
+    depth = depth[usable]
+    if len(depth) < 24:
+        return None
+
+    # Keep the deepest exterior-boundary sample in each tangential pixel bin.
+    bins = np.rint(tangential).astype(np.int32)
+    unique_bins = np.unique(bins)
+    fitted_t = []
+    fitted_d = []
+    for value in unique_bins:
+        selected_depth = depth[bins == value]
+        fitted_t.append(float(value))
+        fitted_d.append(float(np.max(selected_depth)))
+    fitted_t = np.asarray(fitted_t, dtype=np.float64)
+    fitted_d = np.asarray(fitted_d, dtype=np.float64)
+    if len(fitted_t) < 18:
+        return None
+
+    order = np.argsort(fitted_t)
+    fitted_t, fitted_d = fitted_t[order], fitted_d[order]
+    expected_t = float(np.dot(np.asarray(roi_center) - wafer_center, tangent))
+    central = np.abs(fitted_t - expected_t) <= float(roi_half_size[0]) * 0.75
+    if not np.any(central):
+        return None
+    local_peak = float(np.max(fitted_d[central]))
+    strong_threshold = max(noise_floor * 1.55, local_peak * 0.12)
+    strong_indices = np.flatnonzero(central & (fitted_d >= strong_threshold))
+    if len(strong_indices) < 8:
+        return None
+    split_at = np.flatnonzero(np.diff(fitted_t[strong_indices]) > 3.5) + 1
+    groups = np.split(strong_indices, split_at)
+    groups = [group for group in groups if len(group) >= 8]
+    if not groups:
+        return None
+    group = max(
+        groups,
+        key=lambda values: float(np.sum(fitted_d[values]))
+        * math.exp(
+            -0.5
+            * (
+                (float(np.mean(fitted_t[values])) - expected_t)
+                / max(3.0, float(roi_half_size[0]) * 0.30)
+            )
+            ** 2
+        ),
+    )
+    lower = float(fitted_t[group[0]] - 4.0)
+    upper = float(fitted_t[group[-1]] + 4.0)
+    selected_group = (fitted_t >= lower) & (fitted_t <= upper)
+    fitted_t, fitted_d = fitted_t[selected_group], fitted_d[selected_group]
+    if len(fitted_t) < 18:
+        return None
+
+    # Semi-ellipse linearisation: d^2 = A*t^2 + B*t + C.  Robust iterations
+    # reject texture/noise points while retaining the broad, shallow arc.
+    origin_t = float(np.median(fitted_t))
+    x = fitted_t - origin_t
+    keep = np.ones(len(x), dtype=bool)
+    half_width = depth_axis = center_offset = fit_residual = 0.0
+    for _ in range(10):
+        if int(keep.sum()) < 18:
+            return None
+        design = np.column_stack((x[keep] * x[keep], x[keep], np.ones(int(keep.sum()))))
+        coefficients = np.linalg.lstsq(
+            design, fitted_d[keep] * fitted_d[keep], rcond=None
+        )[0]
+        quadratic, linear, constant = (float(value) for value in coefficients)
+        if quadratic >= -1e-8:
+            return None
+        center_local = -linear / (2.0 * quadratic)
+        depth_squared = constant - quadratic * center_local * center_local
+        if depth_squared <= 0.0:
+            return None
+        depth_axis = math.sqrt(depth_squared)
+        half_width_squared = -depth_squared / quadratic
+        if half_width_squared <= 0.0:
+            return None
+        half_width = math.sqrt(half_width_squared)
+        center_offset = origin_t + center_local
+        normalized = (fitted_t - center_offset) / max(half_width, 1e-6)
+        predicted = depth_axis * np.sqrt(
+            np.maximum(0.0, 1.0 - normalized * normalized)
+        )
+        residual = fitted_d - predicted
+        valid_span = np.abs(normalized) <= 1.08
+        current = keep & valid_span
+        if int(current.sum()) < 18:
+            return None
+        median = float(np.median(residual[current]))
+        noise = float(
+            1.4826 * np.median(np.abs(residual[current] - median))
+        )
+        new_keep = valid_span & (
+            np.abs(residual - median) <= max(1.15, 2.8 * noise)
+        )
+        if int(new_keep.sum()) < 18:
+            return None
+        fit_residual = float(np.median(np.abs(residual[new_keep])))
+        if np.array_equal(new_keep, keep):
+            keep = new_keep
+            break
+        keep = new_keep
+
+    if not (min_half_width * 0.70 <= half_width <= max_half_width * 1.25):
+        return None
+    aspect = depth_axis / max(half_width, 1e-6)
+    if not 0.12 <= aspect <= 1.60:
+        return None
+
+    direction_vector = outward * float(geometry.wafer_radius) + tangent * center_offset
+    direction_length = float(np.linalg.norm(direction_vector))
+    if direction_length <= 1e-6:
+        return None
+    direction = direction_vector / direction_length
+    arc_tangent = np.asarray((-direction[1], direction[0]), dtype=np.float64)
+    inward = -direction
+    baseline_center = wafer_center + direction * float(geometry.wafer_radius)
+    unit = np.linspace(-1.0, 1.0, 97, dtype=np.float64)
+    arc_values = (
+        baseline_center[None, :]
+        + arc_tangent[None, :] * (unit * half_width)[:, None]
+        + inward[None, :] * (
+            depth_axis * np.sqrt(np.maximum(0.0, 1.0 - unit * unit))
+        )[:, None]
+    )
+    boundary_edge = cv2.morphologyEx(
+        geometry.exterior_background_mask,
+        cv2.MORPH_GRADIENT,
+        np.ones((3, 3), np.uint8),
+    ).astype(np.float32) / 255.0
+    edge_support, arc_coverage, symmetry = _sample_fitted_arc_support(
+        boundary_edge, arc_values
+    )
+    apex = baseline_center + inward * depth_axis
+    center_distance = float(np.linalg.norm(apex - np.asarray(roi_center)))
+    center_prior = math.exp(
+        -0.5 * (center_distance / max(4.0, minimum_half_size * 0.28)) ** 2
+    )
+    fit_quality = math.exp(
+        -fit_residual / max(1.0, depth_axis * 0.10)
+    )
+    score = float(np.clip(
+        0.26 * edge_support
+        + 0.18 * arc_coverage
+        + 0.10 * symmetry
+        + 0.18 * center_prior
+        + 0.28 * fit_quality,
+        0.0,
+        1.0,
+    ))
+    stride = max(1, len(arc_values) // 48)
+    return _LocalSemicircleCandidate(
+        center=(float(baseline_center[0]), float(baseline_center[1])),
+        radius=float(half_width),
+        score=score,
+        edge_support=float(edge_support),
+        arc_coverage=float(arc_coverage),
+        arc_points=tuple(
+            (float(point[0]), float(point[1])) for point in arc_values[::stride]
+        ),
+        roi_bounds=geometry.roi_bounds,
+        fit_residual=float(fit_residual),
+        radius_x=float(half_width),
+        radius_y=float(depth_axis),
+        shape="semiellipse",
+    )
+
+
+def _fit_circle_from_background_boundary(
     geometry: _RoiBackgroundGeometry,
     roi_center: Point,
     roi_half_size: Point,
@@ -2743,6 +3007,24 @@ def _fit_semicircle_from_background_boundary(
         if best is None or candidate.score > best.score:
             best = candidate
     return best
+
+
+def _fit_semicircle_from_background_boundary(
+    geometry: _RoiBackgroundGeometry,
+    roi_center: Point,
+    roi_half_size: Point,
+    radius_range: Optional[Tuple[float, float]],
+) -> Optional[_LocalSemicircleCandidate]:
+    """Fit a semi-ellipse first, then retain the historical circle fallback."""
+
+    candidate = _fit_semiellipse_from_background_boundary(
+        geometry, roi_center, roi_half_size, radius_range
+    )
+    if candidate is not None:
+        return candidate
+    return _fit_circle_from_background_boundary(
+        geometry, roi_center, roi_half_size, radius_range
+    )
 
 
 def _normalise_roi_half_size(
@@ -3059,7 +3341,8 @@ def detect_wafer_notch(
     ``notch_roi_center_px=(x, y)`` the default ROI mode learns the wafer-exterior
     background palette from the outward part of that crop. Only the
     border-connected background is retained; its boundary supplies both a
-    noise-resistant wafer silhouette and the local inward semicircle.
+    noise-resistant wafer silhouette and the local inward semicircle or
+    wide/shallow semi-ellipse.
     ``notch_roi_half_size_px`` is a scalar or ``(half_width, half_height)`` in
     full-resolution pixels. ``notch_semicircle_radius_range_px`` and
     ``notch_background_morph_px`` are also full-resolution pixel values.
@@ -3355,7 +3638,7 @@ def detect_wafer_notch(
                 roi_half_size,
                 semicircle_radius_range,
             )
-            detection_method = "roi_background_connected_semicircle"
+            detection_method = "roi_background_connected_notch_arc"
         else:
             semicircle_candidate = _detect_semicircle_in_roi(
                 edge,
@@ -3388,8 +3671,18 @@ def detect_wafer_notch(
             else:
                 outward_unit = outward_vector / outward_length
             inward_unit = -outward_unit
+            notch_half_width = float(
+                semicircle_candidate.radius_x
+                if semicircle_candidate.radius_x is not None
+                else semicircle_candidate.radius
+            )
+            notch_height = float(
+                semicircle_candidate.radius_y
+                if semicircle_candidate.radius_y is not None
+                else semicircle_candidate.radius
+            )
             deepest = semicircle_center + inward_unit * float(
-                semicircle_candidate.radius
+                notch_height
             )
             notch_angle_rad = float(
                 math.atan2(float(outward_unit[1]), float(outward_unit[0]))
@@ -3406,10 +3699,10 @@ def detect_wafer_notch(
                 float(radius)
                 - float(np.linalg.norm(deepest - wafer_center_array)),
             )
-            notch_width_px = float(2.0 * semicircle_candidate.radius)
+            notch_width_px = float(2.0 * notch_half_width)
             notch_width_deg = float(math.degrees(
                 2.0 * math.asin(
-                    min(1.0, float(semicircle_candidate.radius) / max(radius, 1e-6))
+                    min(1.0, notch_half_width / max(radius, 1e-6))
                 )
             ))
             candidate_support = float(semicircle_candidate.edge_support)
@@ -3545,6 +3838,33 @@ def detect_wafer_notch(
             if semicircle_candidate is None
             else float(semicircle_candidate.radius * inv_scale)
         ),
+        semicircle_radius_x_px=(
+            None
+            if semicircle_candidate is None
+            else float(
+                (
+                    semicircle_candidate.radius_x
+                    if semicircle_candidate.radius_x is not None
+                    else semicircle_candidate.radius
+                )
+                * inv_scale
+            )
+        ),
+        semicircle_radius_y_px=(
+            None
+            if semicircle_candidate is None
+            else float(
+                (
+                    semicircle_candidate.radius_y
+                    if semicircle_candidate.radius_y is not None
+                    else semicircle_candidate.radius
+                )
+                * inv_scale
+            )
+        ),
+        semicircle_shape=(
+            "none" if semicircle_candidate is None else semicircle_candidate.shape
+        ),
         semicircle_score=(
             0.0 if semicircle_candidate is None else float(semicircle_candidate.score)
         ),
@@ -3639,6 +3959,16 @@ def _transform_result_for_visual(
             None
             if result.semicircle_radius_px is None
             else float(result.semicircle_radius_px) * float(scale)
+        ),
+        semicircle_radius_x_px=(
+            None
+            if result.semicircle_radius_x_px is None
+            else float(result.semicircle_radius_x_px) * float(scale)
+        ),
+        semicircle_radius_y_px=(
+            None
+            if result.semicircle_radius_y_px is None
+            else float(result.semicircle_radius_y_px) * float(scale)
         ),
         semicircle_fit_residual_px=(
             float(result.semicircle_fit_residual_px) * float(scale)
@@ -3746,7 +4076,7 @@ def make_notch_overlay(
     diagnostic_text = (
         f"method={result.detection_method}  edge={result.edge_support:.3f}  "
         f"circle_residual={result.circle_fit_residual_px:.2f}px  "
-        f"semicircle={result.semicircle_score:.3f}  "
+        f"arc={result.semicircle_shape}:{result.semicircle_score:.3f}  "
         f"arc_fit={result.semicircle_fit_residual_px:.2f}px"
     )
     cv2.putText(
@@ -3973,7 +4303,7 @@ def make_notch_background_debug_contact_sheet(
         panel(background_like, "3  Background-like mask"),
         panel(exterior, "4  Border-connected background"),
         panel(silhouette, "5  Wafer mask + robust circle"),
-        panel(final_roi, "6  Semicircle + final angle"),
+        panel(final_roi, "6  Notch arc + final angle"),
     ]
     return np.vstack((np.hstack(panels[:3]), np.hstack(panels[3:])))
 
@@ -4561,8 +4891,10 @@ def build_die_map_from_yolo(
     circle from colour-gradient geometry outside the expected notch sector.
     Set ``notch_roi_center_px=(x, y)`` to force the final notch calculation
     into a stable full-image coordinate area. In ROI mode an inward-facing
-    local semicircle, rather than any depression in the wide sector, supplies
-    the correction angle. ``notch_roi_half_size_px`` controls that area.
+    local semicircle or semi-ellipse, rather than any depression in the wide
+    sector, supplies the correction angle. ``notch_roi_half_size_px`` controls
+    that area. ``notch_semicircle_radius_range_px`` retains its historical
+    name and constrains the horizontal half-width for a semi-ellipse.
 
     If the automatic circle is wrong on production data, pass full-image
     ``notch_wafer_center_hint_px=(x, y)`` and
@@ -4775,6 +5107,9 @@ def build_die_map_from_yolo(
     die_map.notch_roi_bounds_px = notch.roi_bounds_px
     die_map.notch_semicircle_center_px = notch.semicircle_center_px
     die_map.notch_semicircle_radius_px = notch.semicircle_radius_px
+    die_map.notch_semicircle_radius_x_px = notch.semicircle_radius_x_px
+    die_map.notch_semicircle_radius_y_px = notch.semicircle_radius_y_px
+    die_map.notch_semicircle_shape = notch.semicircle_shape
     die_map.notch_semicircle_score = notch.semicircle_score
     die_map.notch_semicircle_fit_residual_px = notch.semicircle_fit_residual_px
     die_map.notch_background_segmentation_used = notch.background_segmentation_used

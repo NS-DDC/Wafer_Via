@@ -1,10 +1,11 @@
-# 고정 ROI 반원 notch angle 보정 사용법
+# 고정 ROI 얕은 타원형 notch angle 보정 사용법
 
 ## 목적
 
 장비에서 wafer notch가 항상 비슷한 좌표에 나타날 때, 사용자가 지정한 원본
 이미지 ROI의 **wafer 바깥쪽 색**을 먼저 학습합니다. 영상 테두리와 연결된 배경만
-남겨 wafer 실루엣과 외곽원을 다시 만들고, 같은 배경 경계에서 U자 반원을 찾아
+남겨 wafer 실루엣과 외곽원을 다시 만들고, 같은 배경 경계에서 U자 반원 또는
+옆으로 길고 얕은 반타원(semi-ellipse)을 찾아
 full wafer 이미지와 die-map을 회전 보정합니다. ROI 밖의 외곽선, die street,
 장식성 원형 edge는 notch angle 후보가 될 수 없습니다.
 
@@ -52,20 +53,22 @@ dm = build_die_map_from_yolo(
 
 ## notch 크기를 알고 있을 때
 
-장비에서 notch 크기도 일정하면 반지름 범위를 추가해 오검출을 더 줄일 수 있습니다.
+장비에서 notch 크기도 일정하면 가로 반폭 범위를 추가해 오검출을 더 줄일 수 있습니다.
+인자 이름은 기존 호환 때문에 `radius_range`지만, 얕은 반타원에서는 가로 전체 폭의
+절반으로 해석합니다.
 
 ```python
 dm = build_die_map_from_yolo(
     ...,
     notch_roi_center_px=(5000, 9650),
     notch_roi_half_size_px=(600, 600),
-    notch_semicircle_radius_range_px=(50, 150),
+    notch_semicircle_radius_range_px=(40, 160),
     notch_semicircle_min_score=0.55,
     notch_failure_mode="error",
 )
 ```
 
-반지름 범위도 원본 이미지 픽셀 단위입니다. 실제 크기를 모르면 이 옵션은 생략하고
+가로 반폭 범위도 원본 이미지 픽셀 단위입니다. 실제 크기를 모르면 이 옵션은 생략하고
 자동 범위를 사용하십시오.
 
 ## 개선된 angle 보정 원리
@@ -76,11 +79,12 @@ dm = build_die_map_from_yolo(
    유지합니다. 바깥 패턴의 고립된 노이즈는 이 단계에서 제거됩니다.
 4. 연결 배경을 반전해 wafer 실루엣을 만들고 contour 점을 robust circle-fit하여
    wafer 중심과 외곽 반지름을 다시 계산합니다.
-5. ROI 안의 연결 배경 경계만 모아 반지름 histogram과 robust fit으로 U자 반원을
-   선택합니다. 기존 Hough 검출은 기본 경로에서 사용하지 않습니다.
-6. `wafer 중심 → 반원 중심` 방향을 `notch_angle_deg`로 사용합니다.
-7. notch가 `notch_reference_angle_deg`에 오도록 full wafer 이미지를 회전합니다.
-8. 같은 affine matrix로 YOLO 기준점과 die-map 좌표를 변환합니다.
+5. ROI 안의 연결 배경 경계에서 wafer 외곽원보다 안으로 들어온 부분만 분리합니다.
+6. `depth² = A·x² + B·x + C` robust fitting으로 반타원의 가로 반폭과 깊이를 각각
+   계산합니다. 가로와 세로가 같을 필요가 없어 얕고 넓은 notch도 검출합니다.
+7. `wafer 중심 → 반타원 기준점` 방향을 `notch_angle_deg`로 사용합니다.
+8. notch가 `notch_reference_angle_deg`에 오도록 full wafer 이미지를 회전합니다.
+9. 같은 affine matrix로 YOLO 기준점과 die-map 좌표를 변환합니다.
 
 기존 LAB edge/Hough 방식으로 비교해야 할 때만
 `notch_use_roi_background=False`로 설정할 수 있습니다.
@@ -106,6 +110,9 @@ print(dm.notch_roi_center_px)
 print(dm.notch_roi_bounds_px)
 print(dm.notch_semicircle_center_px)
 print(dm.notch_semicircle_radius_px)
+print(dm.notch_semicircle_radius_x_px)  # 가로 반폭
+print(dm.notch_semicircle_radius_y_px)  # 깊이
+print(dm.notch_semicircle_shape)        # "semiellipse" 또는 "semicircle"
 print(dm.notch_semicircle_score)
 print(dm.notch_semicircle_fit_residual_px)
 print(dm.notch_background_segmentation_used)
@@ -135,17 +142,17 @@ cv2.imwrite("wafer_aligned.png", dm.aligned_image)
 유지합니다. 5000보다 작은 입력은 화질 저하를 막기 위해 확대하지 않습니다.
 
 - 자홍색 사각형: 실제 연산을 허용한 ROI
-- 자홍색 십자: 사용자가 입력한 예상 반원 중심
-- 하늘색 반원 arc와 점: robust fitting된 반원과 중심
+- 자홍색 십자: 사용자가 입력한 예상 notch 위치
+- 하늘색 arc와 점: robust fitting된 반원/반타원과 기준점
 - 노란 arc: angle 계산에 사용한 inward edge 구간
 - 빨간점: wafer 외곽 원 위의 최종 notch 방향점
 - 초록선: wafer 중심에서 notch 방향으로 향하는 angle 벡터
 - 하늘색 큰 원: 연결 배경으로 만든 wafer 실루엣에 robust fitting한 외곽 원
 
-하늘색 notch 표시는 전체 원을 크게 그리지 않고, 실제 계산에 사용한 inward 반원
-arc만 표시합니다.
+하늘색 notch 표시는 전체 원을 크게 그리지 않고, 실제 계산에 사용한 inward arc만
+표시합니다.
 
-![ROI 반원 notch 검출 예시](sample_img/notch_roi_semicircle_preview.png)
+![ROI 반원 또는 반타원 notch 검출 예시](sample_img/notch_roi_semicircle_preview.png)
 
 ## 단계별 배경 분할 확인
 
@@ -156,7 +163,7 @@ debug_sheet = make_notch_background_debug_contact_sheet(
     wafer_bgr,
     notch_roi_center_px=(5000, 9650),
     notch_roi_half_size_px=(600, 600),
-    notch_semicircle_radius_range_px=(50, 150),  # 모르면 생략
+    notch_semicircle_radius_range_px=(40, 160),  # 가로 반폭, 모르면 생략
 )
 cv2.imwrite("notch_background_stages.png", debug_sheet)
 ```
@@ -170,10 +177,10 @@ cv2.imwrite("notch_background_stages.png", debug_sheet)
 3. 색만으로 분류한 background-like mask
 4. 영상 테두리와 연결된 외부 배경만 남긴 mask
 5. 반전한 wafer mask와 robust 외곽원
-6. 최종 U자 반원과 angle
+6. 최종 U자 반원/반타원과 angle
 
 3번에는 바깥 패턴 노이즈가 보일 수 있지만 4번에서 고립 성분이 사라지는지 확인하면
-됩니다. 4번부터 잘못되면 반원 파라미터보다 먼저 배경 palette/threshold를 조정해야
+됩니다. 4번부터 잘못되면 arc 파라미터보다 먼저 배경 palette/threshold를 조정해야
 합니다.
 
 ## 현장에서 조정할 값
@@ -215,6 +222,9 @@ result = detect_wafer_notch(
 print(result.notch_angle_deg)
 print(result.correction_angle_deg)
 print(result.semicircle_fit_residual_px)
+print(result.semicircle_radius_x_px)
+print(result.semicircle_radius_y_px)
+print(result.semicircle_shape)
 print(result.background_palette_bgr)
 print(result.background_distance_threshold_lab)
 
@@ -230,11 +240,24 @@ cv2.imwrite("notch_roi_check.png", overlay)
 notch_failure_mode="error"
 ```
 
-반원을 못 찾으면 `RuntimeError`를 발생시켜 잘못된 wafer angle로 다음 검사를 진행하지
+notch arc를 못 찾으면 `RuntimeError`를 발생시켜 잘못된 wafer angle로 다음 검사를 진행하지
 않습니다. `"zero"`는 테스트나 notch 없는 이미지용이며 미검출 시 회전각을 `0°`로
 두고 계속 진행합니다.
 
 ## 실제 장비 적용 전 점검
+
+`image5`에는 5000×5000 결과 기준으로 notch 크기가 서로 다른 다음 4개 검증 영상을
+추가했습니다.
+
+- black: 105×36 px
+- gray: 106×37 px
+- pale green: 108×38 px
+- pale red: 110×40 px
+
+원본 테스트 파일은 10000×10000이므로 실제로 그리는 크기는 각각 2배이고,
+5000×5000 angle 결과에서 위 크기가 됩니다.
+
+![얕고 넓은 notch 4종 검출 결과](sample_img/wide_shallow_notch_results.png)
 
 `image5` 결과는 제공된 테스트 이미지에 대한 기하 검증입니다. 실제 카메라의 반사,
 blur, 잘림, 배경 변화까지 보장하는 생산 검증은 아닙니다.
@@ -243,6 +266,6 @@ blur, 잘림, 배경 변화까지 보장하는 생산 검증은 아닙니다.
 2. 단계별 이미지 1번의 자홍색 band에 wafer 색이 과하게 섞이지 않았는지 확인합니다.
 3. 4번의 흰색 외부 배경이 영상 테두리에서 notch까지 끊기지 않는지 확인합니다.
 4. 5번의 하늘색 외곽원이 실제 wafer 테두리를 따르는지 확인합니다.
-5. 6번의 하늘색 반원 arc와 빨간점이 실제 notch 방향에 놓이는지 확인합니다.
-6. 여러 정상 wafer에서 angle, 외곽원 잔차, 반원 잔차의 분포를 기록합니다.
+5. 6번의 하늘색 반원/반타원 arc와 빨간점이 실제 notch 방향에 놓이는지 확인합니다.
+6. 여러 정상 wafer에서 angle, 외곽원 잔차, arc 잔차의 분포를 기록합니다.
 7. 생산 합격 기준은 그 정상 데이터 분포로 정합니다.

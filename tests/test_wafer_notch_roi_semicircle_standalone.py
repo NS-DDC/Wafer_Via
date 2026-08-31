@@ -57,6 +57,39 @@ def synthetic_noisy_exterior_semicircle_notch():
     return image, center, notch_center
 
 
+def synthetic_wide_shallow_notch(width_px, height_px, background_bgr):
+    size = 1400
+    center = np.asarray((700.0, 700.0))
+    radius = 620.0
+    image = np.full((size, size, 3), background_bgr, np.uint8)
+    cv2.circle(
+        image, tuple(center.astype(int)), int(radius),
+        (120, 140, 160), -1, cv2.LINE_AA
+    )
+    cv2.circle(
+        image, tuple(center.astype(int)), int(radius),
+        (190, 200, 210), 7, cv2.LINE_AA
+    )
+    half_width = float(width_px) * 0.5
+    x_values = np.linspace(-half_width, half_width, int(round(width_px)) + 1)
+    normal_y = center[1] + np.sqrt(
+        np.maximum(0.0, radius * radius - x_values * x_values)
+    )
+    boundary_y = normal_y - float(height_px) * np.sqrt(
+        np.maximum(0.0, 1.0 - (x_values / half_width) ** 2)
+    )
+    polygon = np.column_stack((center[0] + x_values, boundary_y))
+    polygon = np.vstack((
+        polygon,
+        (center[0] + half_width, size - 1),
+        (center[0] - half_width, size - 1),
+    ))
+    cv2.fillPoly(
+        image, [np.rint(polygon).astype(np.int32)], background_bgr, cv2.LINE_AA
+    )
+    return image, center, (center[0], center[1] + radius)
+
+
 class RoiSemicircleStandaloneTests(unittest.TestCase):
     def test_roi_semicircle_supplies_opposite_rotation_correction(self):
         image, _, roi_center = synthetic_semicircle_notch(rotation_deg=13.0)
@@ -67,10 +100,39 @@ class RoiSemicircleStandaloneTests(unittest.TestCase):
             notch_semicircle_radius_range_px=(15, 45),
         )
         self.assertTrue(result.found)
-        self.assertEqual(result.detection_method, "roi_background_connected_semicircle")
+        self.assertEqual(result.detection_method, "roi_background_connected_notch_arc")
         self.assertLess(abs(result.correction_angle_deg + 13.0), 0.6)
         self.assertLess(result.semicircle_fit_residual_px, 3.0)
         self.assertTrue(result.background_segmentation_used)
+
+    def test_wide_shallow_semiellipse_sizes_and_backgrounds(self):
+        cases = (
+            (105.0, 36.0, (0, 0, 0)),
+            (106.0, 37.0, (185, 185, 185)),
+            (108.0, 38.0, (220, 239, 219)),
+            (110.0, 40.0, (211, 210, 244)),
+        )
+        for width, height, background in cases:
+            with self.subTest(width=width, height=height, background=background):
+                image, center, roi_center = synthetic_wide_shallow_notch(
+                    width, height, background
+                )
+                result = MODULE.detect_wafer_notch(
+                    image,
+                    notch_roi_center_px=roi_center,
+                    notch_roi_half_size_px=(140, 90),
+                    notch_semicircle_radius_range_px=(35, 80),
+                    notch_background_morph_px=4,
+                    failure_mode="error",
+                )
+                self.assertTrue(result.found)
+                self.assertEqual(result.semicircle_shape, "semiellipse")
+                self.assertLess(abs(result.notch_angle_deg - 90.0), 0.5)
+                self.assertLess(abs(result.notch_width_px - width), 8.0)
+                self.assertLess(abs(result.notch_depth_px - height), 6.0)
+                self.assertLess(
+                    np.linalg.norm(np.asarray(result.wafer_center_px) - center), 4.0
+                )
 
     def test_roi_background_rejects_noisy_patterns_outside_wafer(self):
         image, center, roi_center = synthetic_noisy_exterior_semicircle_notch()
