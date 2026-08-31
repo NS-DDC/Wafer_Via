@@ -36,6 +36,7 @@ def main() -> None:
     SAMPLE_DIR.mkdir(parents=True, exist_ok=True)
     results: list[dict[str, object]] = []
     thumbnails = []
+    source_tiles = []
     preview = None
 
     for name in VARIANTS:
@@ -48,6 +49,23 @@ def main() -> None:
             source_crop, None, fx=2.0, fy=2.0, interpolation=cv2.INTER_NEAREST
         )
         cv2.imwrite(str(IMAGE_DIR / f"debug_{name}_source_notch.png"), source_crop)
+        target_width, target_height = TARGETS[name]
+        source_center_x = 4996 if name == "black" else (4995 if name == "gray" else 4994)
+        raw_crop = image[9500:9800, source_center_x - 250 : source_center_x + 250]
+        tile = cv2.copyMakeBorder(
+            raw_crop, 50, 0, 0, 0, cv2.BORDER_CONSTANT, value=(24, 24, 24)
+        )
+        source_label = f"{name}: raster={target_width}x{target_height}px (source 1:1)"
+        cv2.putText(
+            tile, source_label, (12, 32), cv2.FONT_HERSHEY_SIMPLEX,
+            0.52, (255, 255, 255), 1, cv2.LINE_AA
+        )
+        cv2.line(tile, (382, 40), (482, 40), (0, 220, 255), 2, cv2.LINE_8)
+        cv2.putText(
+            tile, "100 px", (400, 28), cv2.FONT_HERSHEY_SIMPLEX,
+            0.42, (0, 220, 255), 1, cv2.LINE_AA
+        )
+        source_tiles.append(tile)
         result = detect_wafer_notch(
             image,
             notch_roi_center_px=(5000, 9650),
@@ -72,7 +90,6 @@ def main() -> None:
             max(0, cx - half) : min(overlay.shape[1], cx + half),
         ]
         thumb = cv2.resize(zoom, (1100, 1100), interpolation=cv2.INTER_AREA)
-        target_width, target_height = TARGETS[name]
         detected_width = 2.0 * result.semicircle_radius_x_px
         detected_height = result.semicircle_radius_y_px
         cv2.rectangle(thumb, (0, 0), (1100, 92), (20, 20, 20), -1)
@@ -144,6 +161,15 @@ def main() -> None:
     sheet = cv2.vconcat((top, bottom))
     cv2.imwrite(str(SAMPLE_DIR / "wide_shallow_notch_results.png"), sheet)
     cv2.imwrite(str(IMAGE_DIR / "wide_shallow_notch_contact_sheet.png"), sheet)
+    source_sheet = cv2.vconcat(
+        (cv2.hconcat(source_tiles[:2]), cv2.hconcat(source_tiles[2:]))
+    )
+    cv2.imwrite(
+        str(SAMPLE_DIR / "wide_shallow_notch_source_1to1.png"), source_sheet
+    )
+    cv2.imwrite(
+        str(IMAGE_DIR / "wide_shallow_notch_source_1to1.png"), source_sheet
+    )
     if preview is not None:
         cv2.imwrite(str(SAMPLE_DIR / "notch_roi_semicircle_preview.png"), preview)
     print(json.dumps(results, indent=2, ensure_ascii=False))

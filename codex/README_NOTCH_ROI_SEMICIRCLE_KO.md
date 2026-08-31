@@ -266,6 +266,12 @@ notch arc를 못 찾으면 `RuntimeError`를 발생시켜 잘못된 wafer angle�
 
 ![얕고 넓은 notch 4종 검출 결과](sample_img/wide_shallow_notch_results.png)
 
+위 검출 결과 이미지는 판독을 위해 확대된 화면입니다. 실제 원본 픽셀 크기는 아래
+1:1 crop과 100 px 기준선을 확인하십시오. 생성기는 solid raster 크기가 목표값과
+1 px라도 다르면 오류를 발생시킵니다.
+
+![원본 픽셀 1대1 notch 크기](sample_img/wide_shallow_notch_source_1to1.png)
+
 `image5` 결과는 제공된 테스트 이미지에 대한 기하 검증입니다. 실제 카메라의 반사,
 blur, 잘림, 배경 변화까지 보장하는 생산 검증은 아닙니다.
 

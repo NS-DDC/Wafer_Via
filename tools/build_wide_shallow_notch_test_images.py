@@ -117,7 +117,12 @@ def build_variant(source_path: Path) -> tuple[Path, dict[str, float]]:
     target_width, target_depth = TARGET_SIZE_IN_SOURCE[variant_name]
     source_to_result_scale = 5000.0 / float(max(height, width))
     target_half_width = target_width * 0.5
-    notch_center_x = (old_left + old_right) * 0.5
+    measured_center_x = (old_left + old_right) * 0.5
+    target_integer_width = int(round(target_width))
+    if target_integer_width % 2:
+        notch_center_x = float(round(measured_center_x))
+    else:
+        notch_center_x = float(math.floor(measured_center_x) + 0.5)
 
     output = image.copy()
     # The source samples contain a decorative/deep semicircular structure
@@ -143,6 +148,22 @@ def build_variant(source_path: Path) -> tuple[Path, dict[str, float]]:
     desired_boundary_y = np.where(
         inside_notch_width, target_boundary_y, normal_y
     )
+    solid_depth_by_x = np.maximum(
+        0, np.ceil(normal_y) - np.ceil(target_boundary_y)
+    ).astype(np.int32)
+    solid_active = inside_notch_width & (solid_depth_by_x > 0)
+    if not np.any(solid_active):
+        raise RuntimeError(f"The generated notch is empty for {source_path.name}.")
+    active_x = x_values[solid_active]
+    raster_width = int(round(active_x[-1] - active_x[0] + 1.0))
+    raster_height = int(np.max(solid_depth_by_x[solid_active]))
+    expected_height = int(round(target_depth))
+    if raster_width != target_integer_width or raster_height != expected_height:
+        raise RuntimeError(
+            f"Raster notch size mismatch for {source_path.name}: "
+            f"expected {target_integer_width}x{expected_height}, "
+            f"got {raster_width}x{raster_height}."
+        )
 
     # Extend a normal grid strip vertically to the wafer edge.  A feathered
     # rectangle removes the old inner arch without introducing another curved
@@ -193,6 +214,8 @@ def build_variant(source_path: Path) -> tuple[Path, dict[str, float]]:
         "old_depth_px": maximum_depth,
         "source_width_px": target_width,
         "source_height_px": target_depth,
+        "raster_width_px": raster_width,
+        "raster_height_px": raster_height,
         "result_width_px": target_width * source_to_result_scale,
         "result_height_px": target_depth * source_to_result_scale,
         "center_x_px": notch_center_x,
