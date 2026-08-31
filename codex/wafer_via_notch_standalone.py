@@ -2110,6 +2110,7 @@ __all__.extend([
     "draw_aligned_wafer_notch_guide",
     "make_notch_overlay",
     "make_notch_zoom",
+    "make_notch_background_debug_contact_sheet",
     "estimate_grid_from_yolo_notch",
 ])
 
@@ -2144,6 +2145,9 @@ class NotchAngleResult:
     semicircle_radius_px: Optional[float] = None
     semicircle_score: float = 0.0
     semicircle_fit_residual_px: float = 0.0
+    background_segmentation_used: bool = False
+    background_palette_bgr: Tuple[Tuple[int, int, int], ...] = ()
+    background_distance_threshold_lab: float = 0.0
 
 
 @dataclass(frozen=True)
@@ -2390,6 +2394,356 @@ class _LocalSemicircleCandidate:
     arc_points: Tuple[Point, ...]
     roi_bounds: Tuple[int, int, int, int]
     fit_residual: float = 0.0
+
+
+@dataclass(frozen=True)
+class _RoiBackgroundGeometry:
+    palette_lab: np.ndarray = field(repr=False)
+    distance_threshold_lab: float
+    sample_mask: np.ndarray = field(repr=False)
+    background_like_mask: np.ndarray = field(repr=False)
+    exterior_background_mask: np.ndarray = field(repr=False)
+    wafer_mask: np.ndarray = field(repr=False)
+    wafer_contour: np.ndarray = field(repr=False)
+    wafer_center: Point
+    wafer_radius: float
+    wafer_circle_residual: float
+    roi_bounds: Tuple[int, int, int, int]
+    outward_unit: Point
+
+
+def _robust_circle_from_points(
+    points: np.ndarray,
+    *,
+    minimum_points: int = 30,
+) -> Tuple[Point, float, float, np.ndarray]:
+    values = np.asarray(points, dtype=np.float64).reshape(-1, 2)
+    if len(values) < int(minimum_points):
+        raise RuntimeError("Circle fit has insufficient boundary points.")
+    center = np.median(values, axis=0)
+    radius = float(np.median(np.linalg.norm(values - center, axis=1)))
+    keep = np.ones(len(values), dtype=bool)
+    residual = np.zeros(len(values), dtype=np.float64)
+    noise = float("inf")
+    for _ in range(10):
+        selected = values[keep]
+        design = np.column_stack((
+            2.0 * selected[:, 0],
+            2.0 * selected[:, 1],
+            np.ones(len(selected)),
+        ))
+        targets = np.sum(selected * selected, axis=1)
+        coefficients = np.linalg.lstsq(design, targets, rcond=None)[0]
+        center = coefficients[:2]
+        radius_squared = float(coefficients[2] + center @ center)
+        if radius_squared <= 0.0:
+            raise RuntimeError("Circle fit produced a non-positive radius.")
+        radius = math.sqrt(radius_squared)
+        residual = np.linalg.norm(values - center, axis=1) - radius
+        median = float(np.median(residual[keep]))
+        noise = float(1.4826 * np.median(np.abs(residual[keep] - median)))
+        new_keep = np.abs(residual - median) <= max(1.25, 3.0 * noise)
+        if int(new_keep.sum()) < int(minimum_points) or np.array_equal(new_keep, keep):
+            break
+        keep = new_keep
+    fit_residual = float(np.median(np.abs(residual[keep])))
+    return (float(center[0]), float(center[1])), float(radius), fit_residual, keep
+
+
+def _learn_background_from_notch_roi(
+    image_bgr: np.ndarray,
+    roi_center: Point,
+    roi_half_size: Point,
+    center_hint: Point,
+    *,
+    palette_size: int = 3,
+    outer_band_fraction: float = 0.28,
+    distance_threshold_lab: Optional[float] = None,
+    noise_margin_lab: float = 4.0,
+    morph_size_px: float = 24.0,
+) -> _RoiBackgroundGeometry:
+    """Learn exterior colour in the outward ROI band and segment the wafer."""
+
+    height, width = image_bgr.shape[:2]
+    x0 = max(0, int(math.floor(roi_center[0] - roi_half_size[0])))
+    y0 = max(0, int(math.floor(roi_center[1] - roi_half_size[1])))
+    x1 = min(width, int(math.ceil(roi_center[0] + roi_half_size[0])) + 1)
+    y1 = min(height, int(math.ceil(roi_center[1] + roi_half_size[1])) + 1)
+    if x1 - x0 < 24 or y1 - y0 < 24:
+        raise ValueError("notch ROI is too small or lies outside the image.")
+    if not 1 <= int(palette_size) <= 8:
+        raise ValueError("notch_background_palette_size must be between 1 and 8.")
+    if not 0.10 <= float(outer_band_fraction) <= 0.60:
+        raise ValueError("notch_background_outer_band_fraction must be in [0.10, 0.60].")
+
+    outward = np.asarray(roi_center, dtype=np.float64) - np.asarray(
+        center_hint, dtype=np.float64
+    )
+    outward_length = float(np.linalg.norm(outward))
+    if outward_length <= 1e-6:
+        outward = np.asarray((0.0, 1.0), dtype=np.float64)
+    else:
+        outward /= outward_length
+
+    roi_height, roi_width = y1 - y0, x1 - x0
+    local_y, local_x = np.indices((roi_height, roi_width), dtype=np.float32)
+    global_x = local_x + float(x0)
+    global_y = local_y + float(y0)
+    projection = (
+        (global_x - float(roi_center[0])) * float(outward[0])
+        + (global_y - float(roi_center[1])) * float(outward[1])
+    )
+    quantile = 1.0 - float(outer_band_fraction)
+    projection_threshold = float(np.quantile(projection, quantile))
+    sample_local = projection >= projection_threshold
+    sample_mask = np.zeros((height, width), dtype=np.uint8)
+    sample_mask[y0:y1, x0:x1] = sample_local.astype(np.uint8) * 255
+
+    lab = cv2.cvtColor(image_bgr, cv2.COLOR_BGR2LAB).astype(np.float32)
+    samples = lab[y0:y1, x0:x1][sample_local].reshape(-1, 3)
+    if len(samples) < 64:
+        raise RuntimeError("The outward notch ROI band has too few background pixels.")
+    stride = max(1, len(samples) // 30000)
+    samples_for_fit = samples[::stride].astype(np.float32)
+    distinct = np.unique(samples_for_fit.astype(np.uint8), axis=0)
+    cluster_count = min(int(palette_size), len(distinct), len(samples_for_fit))
+    if cluster_count <= 1:
+        palette = np.median(samples_for_fit, axis=0, keepdims=True).astype(np.float32)
+        labels = np.zeros((len(samples_for_fit), 1), dtype=np.int32)
+    else:
+        cv2.setRNGSeed(1907)
+        criteria = (
+            cv2.TERM_CRITERIA_EPS + cv2.TERM_CRITERIA_MAX_ITER,
+            60,
+            0.20,
+        )
+        _, labels, palette = cv2.kmeans(
+            samples_for_fit,
+            cluster_count,
+            None,
+            criteria,
+            5,
+            cv2.KMEANS_PP_CENTERS,
+        )
+    assigned = palette[labels.reshape(-1)]
+    sample_residual = np.linalg.norm(samples_for_fit - assigned, axis=1)
+    automatic_threshold = max(
+        8.0,
+        float(np.percentile(sample_residual, 98.0)) + float(noise_margin_lab),
+    )
+    threshold = (
+        automatic_threshold
+        if distance_threshold_lab is None
+        else float(distance_threshold_lab)
+    )
+    if threshold <= 0.0:
+        raise ValueError("notch_background_distance_threshold_lab must be positive.")
+
+    nearest_distance = np.full((height, width), np.inf, dtype=np.float32)
+    for colour in palette:
+        delta = lab - colour.reshape(1, 1, 3)
+        distance = np.sqrt(np.sum(delta * delta, axis=2)).astype(np.float32)
+        np.minimum(nearest_distance, distance, out=nearest_distance)
+    background_like = (nearest_distance <= threshold).astype(np.uint8) * 255
+    morph_size = max(3, int(round(float(morph_size_px))) | 1)
+    morph_size = min(morph_size, max(3, (min(height, width) // 12) | 1))
+    kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (morph_size, morph_size))
+    background_like = cv2.morphologyEx(
+        background_like, cv2.MORPH_CLOSE, kernel
+    )
+
+    component_count, components, stats, _ = cv2.connectedComponentsWithStats(
+        (background_like > 0).astype(np.uint8), 8
+    )
+    border_labels = np.unique(np.concatenate((
+        components[0, :],
+        components[-1, :],
+        components[:, 0],
+        components[:, -1],
+    )))
+    border_labels = border_labels[border_labels > 0]
+    if not len(border_labels):
+        raise RuntimeError("ROI background colour did not connect to the image border.")
+    exterior_label = int(max(
+        border_labels, key=lambda label: int(stats[int(label), cv2.CC_STAT_AREA])
+    ))
+    exterior_background = (components == exterior_label).astype(np.uint8) * 255
+
+    foreground = (exterior_background == 0).astype(np.uint8)
+    open_size = max(3, int(round(float(morph_size_px) * 0.45)) | 1)
+    open_kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (open_size, open_size))
+    foreground = cv2.morphologyEx(foreground, cv2.MORPH_OPEN, open_kernel)
+    fg_count, fg_components, fg_stats, fg_centroids = cv2.connectedComponentsWithStats(
+        foreground, 8
+    )
+    center_x = int(np.clip(round(center_hint[0]), 0, width - 1))
+    center_y = int(np.clip(round(center_hint[1]), 0, height - 1))
+    wafer_label = int(fg_components[center_y, center_x])
+    if wafer_label <= 0:
+        candidates = []
+        for label in range(1, fg_count):
+            area = int(fg_stats[label, cv2.CC_STAT_AREA])
+            centroid = fg_centroids[label]
+            distance_to_hint = float(np.linalg.norm(centroid - np.asarray(center_hint)))
+            candidates.append((area / max(1.0, 1.0 + distance_to_hint), label))
+        if not candidates:
+            raise RuntimeError("Wafer component was not found after ROI background segmentation.")
+        wafer_label = int(max(candidates)[1])
+    wafer_mask = (fg_components == wafer_label).astype(np.uint8) * 255
+    contours, _ = cv2.findContours(
+        wafer_mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_NONE
+    )
+    if not contours:
+        raise RuntimeError("Wafer contour was not found after ROI background segmentation.")
+    wafer_contour = max(contours, key=cv2.contourArea)
+    contour_values = wafer_contour.reshape(-1, 2)
+    border_clear = (
+        (contour_values[:, 0] > 1)
+        & (contour_values[:, 0] < width - 2)
+        & (contour_values[:, 1] > 1)
+        & (contour_values[:, 1] < height - 2)
+    )
+    fit_points = contour_values[border_clear]
+    if len(fit_points) > 6000:
+        fit_points = fit_points[::max(1, len(fit_points) // 6000)]
+    wafer_center, wafer_radius, circle_residual, _ = _robust_circle_from_points(
+        fit_points, minimum_points=100
+    )
+    if wafer_radius <= min(height, width) * 0.20:
+        raise RuntimeError("Background-segmented wafer radius is implausibly small.")
+
+    return _RoiBackgroundGeometry(
+        palette_lab=palette.astype(np.float32),
+        distance_threshold_lab=float(threshold),
+        sample_mask=sample_mask,
+        background_like_mask=background_like,
+        exterior_background_mask=exterior_background,
+        wafer_mask=wafer_mask,
+        wafer_contour=wafer_contour,
+        wafer_center=wafer_center,
+        wafer_radius=float(wafer_radius),
+        wafer_circle_residual=float(circle_residual),
+        roi_bounds=(x0, y0, x1, y1),
+        outward_unit=(float(outward[0]), float(outward[1])),
+    )
+
+
+def _fit_semicircle_from_background_boundary(
+    geometry: _RoiBackgroundGeometry,
+    roi_center: Point,
+    roi_half_size: Point,
+    radius_range: Optional[Tuple[float, float]],
+) -> Optional[_LocalSemicircleCandidate]:
+    """Fit the exterior-background intrusion contour around the expected notch."""
+
+    contours, _ = cv2.findContours(
+        geometry.exterior_background_mask,
+        cv2.RETR_LIST,
+        cv2.CHAIN_APPROX_NONE,
+    )
+    if not contours:
+        return None
+    points = np.concatenate([contour.reshape(-1, 2) for contour in contours], axis=0)
+    x0, y0, x1, y1 = geometry.roi_bounds
+    in_roi = (
+        (points[:, 0] >= x0)
+        & (points[:, 0] < x1)
+        & (points[:, 1] >= y0)
+        & (points[:, 1] < y1)
+    )
+    points = points[in_roi]
+    if len(points) < 20:
+        return None
+
+    minimum_half_size = min(float(roi_half_size[0]), float(roi_half_size[1]))
+    if radius_range is None:
+        min_radius = max(3.0, minimum_half_size * 0.035)
+        max_radius = max(min_radius + 2.0, minimum_half_size * 0.55)
+    else:
+        min_radius, max_radius = float(radius_range[0]), float(radius_range[1])
+    relative = points.astype(np.float64) - np.asarray(roi_center, dtype=np.float64)
+    distances = np.linalg.norm(relative, axis=1)
+    inward = -np.asarray(geometry.outward_unit, dtype=np.float64)
+    inward_projection = relative @ inward
+    usable = (
+        (distances >= min_radius)
+        & (distances <= max_radius)
+        & (inward_projection >= -max(2.0, min_radius * 0.25))
+    )
+    points = points[usable]
+    distances = distances[usable]
+    if len(points) < 20:
+        return None
+
+    bin_width = max(1.0, minimum_half_size / 240.0)
+    bins = np.arange(min_radius, max_radius + 2.0 * bin_width, bin_width)
+    histogram, edges = np.histogram(distances, bins=bins)
+    if not np.any(histogram):
+        return None
+    smooth_histogram = cv2.GaussianBlur(
+        histogram.astype(np.float32).reshape(1, -1), (5, 1), 0
+    ).reshape(-1)
+    peak_indices = np.argsort(smooth_histogram)[::-1][:12]
+    boundary_edge = cv2.morphologyEx(
+        geometry.exterior_background_mask,
+        cv2.MORPH_GRADIENT,
+        np.ones((3, 3), np.uint8),
+    ).astype(np.float32) / 255.0
+    best: Optional[_LocalSemicircleCandidate] = None
+    for peak_index in peak_indices:
+        peak_radius = float((edges[peak_index] + edges[peak_index + 1]) * 0.5)
+        band = max(2.0, peak_radius * 0.08)
+        selected = points[np.abs(distances - peak_radius) <= band]
+        if len(selected) < 20:
+            continue
+        try:
+            center, radius, fit_residual, _ = _robust_circle_from_points(
+                selected, minimum_points=18
+            )
+        except RuntimeError:
+            continue
+        center_distance = float(np.linalg.norm(
+            np.asarray(center) - np.asarray(roi_center)
+        ))
+        if center_distance > minimum_half_size * 0.45:
+            continue
+        if not min_radius * 0.70 <= radius <= max_radius * 1.20:
+            continue
+        inward_angle = math.atan2(
+            geometry.wafer_center[1] - center[1],
+            geometry.wafer_center[0] - center[0],
+        )
+        edge_support, arc_coverage, symmetry, arc_points = _sample_semicircle_support(
+            boundary_edge, center, radius, inward_angle
+        )
+        center_prior = math.exp(
+            -0.5 * (center_distance / max(4.0, minimum_half_size * 0.20)) ** 2
+        )
+        fit_quality = math.exp(
+            -fit_residual / max(1.25, radius * 0.055)
+        )
+        score = float(np.clip(
+            0.24 * edge_support
+            + 0.16 * arc_coverage
+            + 0.10 * symmetry
+            + 0.25 * center_prior
+            + 0.25 * fit_quality,
+            0.0,
+            1.0,
+        ))
+        candidate = _LocalSemicircleCandidate(
+            center=center,
+            radius=radius,
+            score=score,
+            edge_support=edge_support,
+            arc_coverage=arc_coverage,
+            arc_points=arc_points,
+            roi_bounds=geometry.roi_bounds,
+            fit_residual=fit_residual,
+        )
+        if best is None or candidate.score > best.score:
+            best = candidate
+    return best
 
 
 def _normalise_roi_half_size(
@@ -2686,6 +3040,12 @@ def detect_wafer_notch(
     notch_roi_half_size_px: Union[float, Tuple[float, float]] = 600.0,
     notch_semicircle_radius_range_px: Optional[Tuple[float, float]] = None,
     notch_semicircle_min_score: float = 0.55,
+    notch_use_roi_background: bool = True,
+    notch_background_palette_size: int = 3,
+    notch_background_outer_band_fraction: float = 0.28,
+    notch_background_distance_threshold_lab: Optional[float] = None,
+    notch_background_noise_margin_lab: float = 4.0,
+    notch_background_morph_px: float = 24.0,
     failure_mode: Literal["error", "zero"] = "error",
     require_notch: Optional[bool] = None,
 ) -> NotchAngleResult:
@@ -2695,14 +3055,15 @@ def detect_wafer_notch(
     ``correction_angle_deg`` is suitable for ``cv2.getRotationMatrix2D`` and
     moves the detected notch to ``reference_angle_deg``.
 
-    No foreground/background colour is assumed. LAB colour-gradient magnitude
-    supplies edge evidence only. The circle is fitted outside the configured
-    search sector. When ``notch_roi_center_px=(x, y)`` is supplied, the notch
-    calculation is forced into that full-resolution ROI and an inward-facing
-    local semicircle is used as the angle source. ``notch_roi_half_size_px``
-    is a scalar or ``(half_width, half_height)`` in full-resolution pixels.
-    ``notch_semicircle_radius_range_px`` is also expressed in full-resolution
-    pixels. Wafer centre/radius hints remain full-resolution coordinates.
+    Without an ROI, LAB colour-gradient magnitude supplies edge evidence and
+    no foreground/background colour is assumed. With
+    ``notch_roi_center_px=(x, y)`` the default ROI mode learns the wafer-exterior
+    background palette from the outward part of that crop. Only the
+    border-connected background is retained; its boundary supplies both a
+    noise-resistant wafer silhouette and the local inward semicircle.
+    ``notch_roi_half_size_px`` is a scalar or ``(half_width, half_height)`` in
+    full-resolution pixels. ``notch_semicircle_radius_range_px`` and
+    ``notch_background_morph_px`` are also full-resolution pixel values.
 
     ``failure_mode="error"`` raises when no notch is reliable.
     ``failure_mode="zero"`` returns ``found=False`` and a zero correction.
@@ -2720,6 +3081,10 @@ def detect_wafer_notch(
         raise ValueError("radial_inner_ratio must be in [0.50, 1.0).")
     if not 0.0 <= float(notch_semicircle_min_score) <= 1.0:
         raise ValueError("notch_semicircle_min_score must be between 0 and 1.")
+    if float(notch_background_noise_margin_lab) < 0.0:
+        raise ValueError("notch_background_noise_margin_lab must be non-negative.")
+    if float(notch_background_morph_px) <= 0.0:
+        raise ValueError("notch_background_morph_px must be positive.")
 
     source = _load_bgr(image)
     full_height, full_width = source.shape[:2]
@@ -2747,6 +3112,7 @@ def detect_wafer_notch(
     roi_center: Optional[Point] = None
     roi_half_size: Optional[Point] = None
     semicircle_radius_range: Optional[Tuple[float, float]] = None
+    background_geometry: Optional[_RoiBackgroundGeometry] = None
     effective_search_center_angle_deg = float(search_center_angle_deg) % 360.0
     if notch_roi_center_px is not None:
         roi_center = (
@@ -2772,6 +3138,20 @@ def detect_wafer_notch(
                 float(notch_semicircle_radius_range_px[0]) * scale,
                 float(notch_semicircle_radius_range_px[1]) * scale,
             )
+        if bool(notch_use_roi_background):
+            background_geometry = _learn_background_from_notch_roi(
+                work,
+                roi_center,
+                roi_half_size,
+                center,
+                palette_size=notch_background_palette_size,
+                outer_band_fraction=notch_background_outer_band_fraction,
+                distance_threshold_lab=notch_background_distance_threshold_lab,
+                noise_margin_lab=notch_background_noise_margin_lab,
+                morph_size_px=float(notch_background_morph_px) * scale,
+            )
+            if wafer_center_hint_px is None:
+                center = background_geometry.wafer_center
     search_distance = _angle_distance_deg(
         angles_deg, effective_search_center_angle_deg
     )
@@ -2779,16 +3159,22 @@ def detect_wafer_notch(
     fit_mask = search_distance >= float(search_half_width_deg) + 5.0
 
     if wafer_radius_hint_px is None:
-        radius, _ = _initial_outer_radius(edge, center, angles)
+        if background_geometry is not None:
+            radius = float(background_geometry.wafer_radius)
+        else:
+            radius, _ = _initial_outer_radius(edge, center, angles)
     else:
         radius = float(wafer_radius_hint_px) * scale
     if radius <= min(work_height, work_width) * 0.20:
         raise RuntimeError("Estimated wafer radius is implausibly small.")
 
-    circle_fit_noise = float("inf")
+    circle_fit_noise = (
+        float(background_geometry.wafer_circle_residual)
+        if background_geometry is not None else float("inf")
+    )
     # Re-centre using the first harmonic of the tracked radius. The notch
     # sector is excluded, so a wide or deep notch cannot pull the fitted circle.
-    for _ in range(4):
+    for _ in range(0 if background_geometry is not None else 4):
         fit_window = max(12.0, radius * 0.08)
         boundary, support = _track_outer_edge(
             edge,
@@ -2963,15 +3349,24 @@ def detect_wafer_notch(
     local_arc: Optional[Tuple[Point, ...]] = None
     semicircle_candidate: Optional[_LocalSemicircleCandidate] = None
     if roi_center is not None and roi_half_size is not None:
-        semicircle_candidate = _detect_semicircle_in_roi(
-            edge,
-            center,
-            radius,
-            roi_center,
-            roi_half_size,
-            semicircle_radius_range,
-        )
-        detection_method = "geometry_edge_manual_roi_semicircle"
+        if background_geometry is not None:
+            semicircle_candidate = _fit_semicircle_from_background_boundary(
+                background_geometry,
+                roi_center,
+                roi_half_size,
+                semicircle_radius_range,
+            )
+            detection_method = "roi_background_connected_semicircle"
+        else:
+            semicircle_candidate = _detect_semicircle_in_roi(
+                edge,
+                center,
+                radius,
+                roi_center,
+                roi_half_size,
+                semicircle_radius_range,
+            )
+            detection_method = "geometry_edge_manual_roi_semicircle"
         if semicircle_candidate is None:
             found = False
             confidence = 0.0
@@ -3078,13 +3473,30 @@ def detect_wafer_notch(
             )
             for index in candidate_indices[::max(1, len(candidate_indices) // 48)]
         )
-    contour_stride = max(1, angle_samples // 1440)
-    contour_indices = np.arange(0, angle_samples, contour_stride, dtype=np.int64)
-    contour_points = np.column_stack((
-        cx + np.cos(angles[contour_indices]) * boundary[contour_indices],
-        cy + np.sin(angles[contour_indices]) * boundary[contour_indices],
-    ))
-    contour_full = np.rint(contour_points * inv_scale).astype(np.int32).reshape(-1, 1, 2)
+    if background_geometry is not None:
+        contour_full = np.rint(
+            background_geometry.wafer_contour.astype(np.float64) * inv_scale
+        ).astype(np.int32)
+    else:
+        contour_stride = max(1, angle_samples // 1440)
+        contour_indices = np.arange(0, angle_samples, contour_stride, dtype=np.int64)
+        contour_points = np.column_stack((
+            cx + np.cos(angles[contour_indices]) * boundary[contour_indices],
+            cy + np.sin(angles[contour_indices]) * boundary[contour_indices],
+        ))
+        contour_full = np.rint(contour_points * inv_scale).astype(np.int32).reshape(-1, 1, 2)
+    if background_geometry is None:
+        palette_bgr: Tuple[Tuple[int, int, int], ...] = ()
+        background_threshold = 0.0
+    else:
+        palette_lab_u8 = np.clip(
+            np.rint(background_geometry.palette_lab), 0, 255
+        ).astype(np.uint8).reshape(1, -1, 3)
+        converted_palette = cv2.cvtColor(palette_lab_u8, cv2.COLOR_LAB2BGR).reshape(-1, 3)
+        palette_bgr = tuple(
+            tuple(int(value) for value in colour) for colour in converted_palette
+        )
+        background_threshold = float(background_geometry.distance_threshold_lab)
     return NotchAngleResult(
         found=found,
         wafer_center_px=full_center,
@@ -3142,6 +3554,9 @@ def detect_wafer_notch(
             if semicircle_candidate is None
             else float(semicircle_candidate.fit_residual * inv_scale)
         ),
+        background_segmentation_used=background_geometry is not None,
+        background_palette_bgr=palette_bgr,
+        background_distance_threshold_lab=background_threshold,
     )
 
 
@@ -3343,6 +3758,23 @@ def make_notch_overlay(
         overlay, diagnostic_text, (24, 74), cv2.FONT_HERSHEY_SIMPLEX, 0.62,
         (255, 255, 255), 1, cv2.LINE_AA
     )
+    if result.background_segmentation_used:
+        palette_text = "/".join(
+            f"{colour[0]},{colour[1]},{colour[2]}"
+            for colour in result.background_palette_bgr
+        )
+        background_text = (
+            f"ROI exterior BGR={palette_text}  "
+            f"LAB distance<={result.background_distance_threshold_lab:.1f}"
+        )
+        cv2.putText(
+            overlay, background_text, (24, 106), cv2.FONT_HERSHEY_SIMPLEX, 0.62,
+            (0, 0, 0), 4, cv2.LINE_AA
+        )
+        cv2.putText(
+            overlay, background_text, (24, 106), cv2.FONT_HERSHEY_SIMPLEX, 0.62,
+            (255, 255, 255), 1, cv2.LINE_AA
+        )
     return overlay
 
 
@@ -3373,6 +3805,178 @@ def make_notch_zoom(
     return cv2.resize(
         crop, None, fx=float(scale), fy=float(scale), interpolation=cv2.INTER_NEAREST
     )
+
+
+def make_notch_background_debug_contact_sheet(
+    image: ImageInput,
+    *,
+    notch_roi_center_px: Point,
+    notch_roi_half_size_px: Union[float, Tuple[float, float]] = 600.0,
+    notch_semicircle_radius_range_px: Optional[Tuple[float, float]] = None,
+    wafer_center_hint_px: Optional[Point] = None,
+    wafer_radius_hint_px: Optional[float] = None,
+    max_dimension: int = 1536,
+    background_palette_size: int = 3,
+    background_outer_band_fraction: float = 0.28,
+    background_distance_threshold_lab: Optional[float] = None,
+    background_noise_margin_lab: float = 4.0,
+    background_morph_px: float = 24.0,
+) -> np.ndarray:
+    """Return six labelled stages of the ROI-background notch pipeline."""
+
+    source = _load_bgr(image)
+    full_height, full_width = source.shape[:2]
+    analysis_scale = min(1.0, float(max_dimension) / max(full_height, full_width))
+    if analysis_scale < 1.0:
+        work = cv2.resize(
+            source, None, fx=analysis_scale, fy=analysis_scale,
+            interpolation=cv2.INTER_AREA
+        )
+    else:
+        work = source
+    work_height, work_width = work.shape[:2]
+    roi_center = (
+        float(notch_roi_center_px[0]) * analysis_scale,
+        float(notch_roi_center_px[1]) * analysis_scale,
+    )
+    roi_half_size = _normalise_roi_half_size(
+        notch_roi_half_size_px, scale=analysis_scale
+    )
+    if wafer_center_hint_px is None:
+        center_hint = (work_width / 2.0, work_height / 2.0)
+    else:
+        center_hint = (
+            float(wafer_center_hint_px[0]) * analysis_scale,
+            float(wafer_center_hint_px[1]) * analysis_scale,
+        )
+    radius_range = (
+        None
+        if notch_semicircle_radius_range_px is None
+        else (
+            float(notch_semicircle_radius_range_px[0]) * analysis_scale,
+            float(notch_semicircle_radius_range_px[1]) * analysis_scale,
+        )
+    )
+    geometry = _learn_background_from_notch_roi(
+        work,
+        roi_center,
+        roi_half_size,
+        center_hint,
+        palette_size=background_palette_size,
+        outer_band_fraction=background_outer_band_fraction,
+        distance_threshold_lab=background_distance_threshold_lab,
+        noise_margin_lab=background_noise_margin_lab,
+        morph_size_px=float(background_morph_px) * analysis_scale,
+    )
+    candidate = _fit_semicircle_from_background_boundary(
+        geometry, roi_center, roi_half_size, radius_range
+    )
+    result = detect_wafer_notch(
+        work,
+        max_dimension=max_dimension,
+        wafer_center_hint_px=(
+            None if wafer_center_hint_px is None else center_hint
+        ),
+        wafer_radius_hint_px=(
+            None
+            if wafer_radius_hint_px is None
+            else float(wafer_radius_hint_px) * analysis_scale
+        ),
+        notch_roi_center_px=roi_center,
+        notch_roi_half_size_px=roi_half_size,
+        notch_semicircle_radius_range_px=radius_range,
+        notch_background_palette_size=background_palette_size,
+        notch_background_outer_band_fraction=background_outer_band_fraction,
+        notch_background_distance_threshold_lab=background_distance_threshold_lab,
+        notch_background_noise_margin_lab=background_noise_margin_lab,
+        notch_background_morph_px=float(background_morph_px) * analysis_scale,
+        failure_mode="zero",
+    )
+    final_overlay = make_notch_overlay(work, result)
+
+    x0, y0, x1, y1 = geometry.roi_bounds
+    roi_source = work[y0:y1, x0:x1].copy()
+    sample_local = geometry.sample_mask[y0:y1, x0:x1] > 0
+    tint = np.full_like(roi_source, (255, 0, 255))
+    roi_source[sample_local] = cv2.addWeighted(
+        roi_source[sample_local], 0.45, tint[sample_local], 0.55, 0.0
+    )
+
+    lab = cv2.cvtColor(work, cv2.COLOR_BGR2LAB).astype(np.float32)
+    nearest_distance = np.full((work_height, work_width), np.inf, dtype=np.float32)
+    for colour in geometry.palette_lab:
+        delta = lab - colour.reshape(1, 1, 3)
+        np.minimum(
+            nearest_distance,
+            np.sqrt(np.sum(delta * delta, axis=2)).astype(np.float32),
+            out=nearest_distance,
+        )
+    distance_roi = nearest_distance[y0:y1, x0:x1]
+    distance_u8 = np.clip(
+        distance_roi / max(1.0, geometry.distance_threshold_lab * 2.0) * 255.0,
+        0.0,
+        255.0,
+    ).astype(np.uint8)
+    distance_colour = cv2.applyColorMap(distance_u8, cv2.COLORMAP_TURBO)
+    background_like = cv2.cvtColor(
+        geometry.background_like_mask[y0:y1, x0:x1], cv2.COLOR_GRAY2BGR
+    )
+    exterior = cv2.cvtColor(
+        geometry.exterior_background_mask[y0:y1, x0:x1], cv2.COLOR_GRAY2BGR
+    )
+
+    silhouette = cv2.cvtColor(geometry.wafer_mask, cv2.COLOR_GRAY2BGR)
+    circle_center = tuple(int(round(value)) for value in geometry.wafer_center)
+    cv2.circle(
+        silhouette, circle_center, int(round(geometry.wafer_radius)),
+        (255, 255, 0), 3, cv2.LINE_AA
+    )
+    cv2.rectangle(silhouette, (x0, y0), (x1, y1), (255, 0, 255), 3, cv2.LINE_AA)
+    final_roi = final_overlay[y0:y1, x0:x1]
+    if candidate is not None:
+        local_center = (
+            int(round(candidate.center[0] - x0)),
+            int(round(candidate.center[1] - y0)),
+        )
+        cv2.drawMarker(
+            final_roi, local_center, (255, 180, 0), cv2.MARKER_CROSS,
+            18, 2, cv2.LINE_AA
+        )
+
+    panel_width, panel_height = 440, 320
+
+    def panel(image_value: np.ndarray, label: str) -> np.ndarray:
+        canvas = np.full((panel_height, panel_width, 3), 24, dtype=np.uint8)
+        available_height = panel_height - 40
+        resize_scale = min(
+            panel_width / max(1, image_value.shape[1]),
+            available_height / max(1, image_value.shape[0]),
+        )
+        resized = cv2.resize(
+            image_value,
+            None,
+            fx=resize_scale,
+            fy=resize_scale,
+            interpolation=cv2.INTER_AREA if resize_scale < 1.0 else cv2.INTER_NEAREST,
+        )
+        left = (panel_width - resized.shape[1]) // 2
+        top = 34 + (available_height - resized.shape[0]) // 2
+        canvas[top:top + resized.shape[0], left:left + resized.shape[1]] = resized
+        cv2.putText(
+            canvas, label, (12, 24), cv2.FONT_HERSHEY_SIMPLEX, 0.62,
+            (245, 245, 245), 1, cv2.LINE_AA
+        )
+        return canvas
+
+    panels = [
+        panel(roi_source, "1  ROI: outward background sample"),
+        panel(distance_colour, "2  LAB distance to background"),
+        panel(background_like, "3  Background-like mask"),
+        panel(exterior, "4  Border-connected background"),
+        panel(silhouette, "5  Wafer mask + robust circle"),
+        panel(final_roi, "6  Semicircle + final angle"),
+    ]
+    return np.vstack((np.hstack(panels[:3]), np.hstack(panels[3:])))
 
 
 def draw_aligned_wafer_notch_guide(
@@ -3937,6 +4541,12 @@ def build_die_map_from_yolo(
     notch_roi_half_size_px: Union[float, Tuple[float, float]] = 600.0,
     notch_semicircle_radius_range_px: Optional[Tuple[float, float]] = None,
     notch_semicircle_min_score: float = 0.55,
+    notch_use_roi_background: bool = True,
+    notch_background_palette_size: int = 3,
+    notch_background_outer_band_fraction: float = 0.28,
+    notch_background_distance_threshold_lab: Optional[float] = None,
+    notch_background_noise_margin_lab: float = 4.0,
+    notch_background_morph_px: float = 24.0,
     notch_failure_mode: Literal["error", "zero"] = "error",
     return_aligned_image: bool = True,
     return_notch_visuals: bool = True,
@@ -3994,6 +4604,12 @@ def build_die_map_from_yolo(
         notch_roi_half_size_px=notch_roi_half_size_px,
         notch_semicircle_radius_range_px=notch_semicircle_radius_range_px,
         notch_semicircle_min_score=notch_semicircle_min_score,
+        notch_use_roi_background=notch_use_roi_background,
+        notch_background_palette_size=notch_background_palette_size,
+        notch_background_outer_band_fraction=notch_background_outer_band_fraction,
+        notch_background_distance_threshold_lab=notch_background_distance_threshold_lab,
+        notch_background_noise_margin_lab=notch_background_noise_margin_lab,
+        notch_background_morph_px=notch_background_morph_px,
         failure_mode=notch_failure_mode,
     )
     if clip_origin is None:
@@ -4160,6 +4776,11 @@ def build_die_map_from_yolo(
     die_map.notch_semicircle_radius_px = notch.semicircle_radius_px
     die_map.notch_semicircle_score = notch.semicircle_score
     die_map.notch_semicircle_fit_residual_px = notch.semicircle_fit_residual_px
+    die_map.notch_background_segmentation_used = notch.background_segmentation_used
+    die_map.notch_background_palette_bgr = notch.background_palette_bgr
+    die_map.notch_background_distance_threshold_lab = (
+        notch.background_distance_threshold_lab
+    )
     die_map.notch_correction_angle_deg = float(notch.correction_angle_deg)
     die_map.notch_point_aligned_px = _affine_point(matrix, notch.notch_point_px)
     die_map.notch_deepest_point_aligned_px = _affine_point(

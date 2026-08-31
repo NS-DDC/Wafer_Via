@@ -34,6 +34,28 @@ def synthetic_semicircle_notch(rotation_deg=0.0):
     return rotated, center, rotated_notch
 
 
+def synthetic_noisy_exterior_semicircle_notch():
+    size = 900
+    center = np.asarray((450.0, 450.0))
+    radius = 390
+    notch_center = np.asarray((450.0, 840.0))
+    rng = np.random.default_rng(1907)
+    background = np.full((size, size, 3), (72, 86, 105), np.uint8)
+    for _ in range(260):
+        x = int(rng.integers(0, size))
+        y = int(rng.integers(0, size))
+        colour = tuple(int(value) for value in rng.integers(45, 145, size=3))
+        cv2.circle(background, (x, y), int(rng.integers(2, 10)), colour, -1)
+    image = background.copy()
+    cv2.circle(image, tuple(center.astype(int)), radius, (120, 140, 160), -1, cv2.LINE_AA)
+    cv2.circle(image, tuple(center.astype(int)), radius, (190, 200, 210), 5, cv2.LINE_AA)
+    notch_mask = np.zeros((size, size), np.uint8)
+    cv2.circle(notch_mask, tuple(notch_center.astype(int)), 30, 255, -1, cv2.LINE_AA)
+    cv2.rectangle(notch_mask, (410, 840), (490, size - 1), 255, -1)
+    image[notch_mask > 0] = background[notch_mask > 0]
+    return image, center, notch_center
+
+
 class RoiSemicircleStandaloneTests(unittest.TestCase):
     def test_roi_semicircle_supplies_opposite_rotation_correction(self):
         image, _, roi_center = synthetic_semicircle_notch(rotation_deg=13.0)
@@ -44,9 +66,27 @@ class RoiSemicircleStandaloneTests(unittest.TestCase):
             notch_semicircle_radius_range_px=(15, 45),
         )
         self.assertTrue(result.found)
-        self.assertEqual(result.detection_method, "geometry_edge_manual_roi_semicircle")
+        self.assertEqual(result.detection_method, "roi_background_connected_semicircle")
         self.assertLess(abs(result.correction_angle_deg + 13.0), 0.6)
         self.assertLess(result.semicircle_fit_residual_px, 3.0)
+        self.assertTrue(result.background_segmentation_used)
+
+    def test_roi_background_rejects_noisy_patterns_outside_wafer(self):
+        image, center, roi_center = synthetic_noisy_exterior_semicircle_notch()
+        result = MODULE.detect_wafer_notch(
+            image,
+            notch_roi_center_px=tuple(roi_center),
+            notch_roi_half_size_px=(110, 90),
+            notch_semicircle_radius_range_px=(15, 45),
+            failure_mode="error",
+        )
+        self.assertTrue(result.found)
+        self.assertLess(abs(result.notch_angle_deg - 90.0), 0.8)
+        self.assertLess(
+            np.linalg.norm(np.asarray(result.wafer_center_px) - center), 5.0
+        )
+        self.assertLess(abs(result.wafer_radius_px - 390.0), 8.0)
+        self.assertLess(result.semicircle_fit_residual_px, 4.0)
 
     def test_roi_mode_rejects_a_circle_without_notch(self):
         image, center, _ = synthetic_semicircle_notch()
