@@ -1,4 +1,5 @@
 import importlib.util
+import inspect
 import sys
 import unittest
 from pathlib import Path
@@ -130,8 +131,16 @@ class RoiSemicircleStandaloneTests(unittest.TestCase):
         self.assertEqual(dm.coordinate_space, "aligned_image")
         self.assertEqual(dm.grid_angle_deg, 0.0)
         self.assertIsNotNone(dm.aligned_image)
+        self.assertIsNotNone(dm.notch_overlay_image)
+        self.assertEqual(dm.notch_overlay_image.shape, image.shape)
         self.assertIsNotNone(dm.notch_semicircle_center_px)
         self.assertGreater(dm.notch_semicircle_score, 0.55)
+
+    def test_builder_defaults_angle_result_image_to_5000_limit(self):
+        parameter = inspect.signature(
+            MODULE.build_die_map_from_yolo
+        ).parameters["notch_visual_max_dimension"]
+        self.assertEqual(parameter.default, 5000)
 
 
 if __name__ == "__main__":

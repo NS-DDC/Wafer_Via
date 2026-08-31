@@ -4550,7 +4550,7 @@ def build_die_map_from_yolo(
     notch_failure_mode: Literal["error", "zero"] = "error",
     return_aligned_image: bool = True,
     return_notch_visuals: bool = True,
-    notch_visual_max_dimension: int = 2048,
+    notch_visual_max_dimension: int = 5000,
     notch_zoom_size_px: Optional[int] = 256,
     notch_zoom_scale: float = 2.0,
     alignment_interpolation: int = cv2.INTER_CUBIC,
@@ -4574,7 +4574,9 @@ def build_die_map_from_yolo(
     applied image rotation is ``dm.image_rotation_deg``; original coordinates
     are preserved through the affine matrices and ``source_*`` fields.
     Detailed diagnostics and images are returned as ``dm.notch_result``,
-    ``dm.notch_overlay_image``, and ``dm.notch_zoom_image``.
+    ``dm.notch_overlay_image``, and ``dm.notch_zoom_image``. The angle-result
+    overlay is capped at ``notch_visual_max_dimension=5000`` by default, so a
+    10000x10000 square source returns a 5000x5000 ``notch_overlay_image``.
     """
 
     if return_notch_visuals:

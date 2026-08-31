@@ -38,6 +38,9 @@ dm = build_die_map_from_yolo(
     # 검출된 notch를 정렬 후 6시 방향에 둡니다.
     notch_reference_angle_deg=90.0,
 
+    # angle 결과 오버레이를 5000×5000으로 반환합니다.
+    notch_visual_max_dimension=5000,
+
     # 잘못된 angle로 계속 진행하지 않도록 운영에서는 error를 권장합니다.
     notch_failure_mode="error",
 )
@@ -122,10 +125,14 @@ print(dm.grid_angle_deg)     # 0.0
 ```python
 import cv2
 
-cv2.imwrite("notch_roi_overview.png", dm.notch_overlay_image)
+cv2.imwrite("notch_roi_overview_5000.png", dm.notch_overlay_image)
 cv2.imwrite("notch_roi_zoom.png", dm.notch_zoom_image)
 cv2.imwrite("wafer_aligned.png", dm.aligned_image)
 ```
+
+10000×10000 정사각형 입력에서 `dm.notch_overlay_image.shape`은
+`(5000, 5000, 3)`입니다. `dm.aligned_image`는 die-map 좌표 기준이므로 원본 크기를
+유지합니다. 5000보다 작은 입력은 화질 저하를 막기 위해 확대하지 않습니다.
 
 - 자홍색 사각형: 실제 연산을 허용한 ROI
 - 자홍색 십자: 사용자가 입력한 예상 반원 중심
@@ -211,7 +218,7 @@ print(result.semicircle_fit_residual_px)
 print(result.background_palette_bgr)
 print(result.background_distance_threshold_lab)
 
-overlay = make_notch_overlay(wafer_bgr, result, max_dimension=2048)
+overlay = make_notch_overlay(wafer_bgr, result, max_dimension=5000)
 cv2.imwrite("notch_roi_check.png", overlay)
 ```
 
