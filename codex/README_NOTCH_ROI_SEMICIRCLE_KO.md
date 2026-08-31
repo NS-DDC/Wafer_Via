@@ -272,6 +272,38 @@ notch arc를 못 찾으면 `RuntimeError`를 발생시켜 잘못된 wafer angle�
 
 ![원본 픽셀 1대1 notch 크기](sample_img/wide_shallow_notch_source_1to1.png)
 
+## 여러 배경색과 배경 노이즈 검증
+
+다음 8종을 추가로 검증했습니다. notch 크기는 원본 기준 105~110 × 36~40 px를
+유지하고, wafer 바깥 배경과 notch 내부에 동일한 노이즈 field를 사용했습니다.
+
+- charcoal + Gaussian noise
+- cool gray + 밝기 gradient
+- warm beige + 세로 banding
+- pale blue + Gaussian/gradient 혼합
+- sage green + 저주파 cloud 얼룩
+- lavender + 강한 speckle
+- dark blue + 강한 vertical banding
+- bright gray + heavy mixed noise
+
+8종 모두 `found=True`, 검출 angle은 `89.999~90.042°`, arc fit 잔차는
+`0.21~0.29 px`였습니다. 가장 까다로운 sage green cloud 배경은 palette 3개에서
+wafer와 배경색이 섞였지만 palette를 5개로 늘리면 정상 분리됐습니다.
+
+```python
+result = detect_wafer_notch(
+    wafer_bgr,
+    notch_roi_center_px=(5000, 9650),
+    notch_roi_half_size_px=(600, 600),
+    notch_semicircle_radius_range_px=(40, 70),
+    notch_background_palette_size=5,  # 다색 gradient/cloud 배경
+    notch_background_morph_px=8,
+    failure_mode="error",
+)
+```
+
+![여러 배경색과 노이즈 notch 검출 결과](sample_img/noisy_background_notch_results.png)
+
 `image5` 결과는 제공된 테스트 이미지에 대한 기하 검증입니다. 실제 카메라의 반사,
 blur, 잘림, 배경 변화까지 보장하는 생산 검증은 아닙니다.
 
