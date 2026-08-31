@@ -2075,6 +2075,29 @@ build_die_map = _legacy_build_die_map_from_yolo
 #   4) pitch_x/pitch_y가 실제 die 간격과 일치하는지
 #   5) robust/local angle 차이와 angle_pair_residuals_deg가 작은지
 #   6) clip overlay와 wafer overlay가 실제 street/grid에 맞는지
+#
+# [고정 좌표 ROI에서 반원 notch로 angle 보정]
+# 장비에서 notch 위치가 늘 비슷하면 아래 두 값만 실제 full wafer 좌표로
+# 지정하는 것이 권장됩니다. ROI 밖의 외곽 함몰은 angle 후보가 될 수 없습니다.
+#
+#   dm = build_die_map_from_yolo(
+#       wafer_image=wafer_bgr,
+#       clip_image=center_clip_bgr,
+#       detections=yolo_points,
+#       detection_format="point",
+#       notch_roi_center_px=(5000, 9650),       # 예상 반원 중심 (x, y)
+#       notch_roi_half_size_px=(600, 600),      # 좌우/상하 반경, 실제값에 맞게 조절
+#       # 선택: 실제 notch 반지름 범위를 알 때 오검출을 더 줄임
+#       notch_semicircle_radius_range_px=(60, 300),
+#       notch_failure_mode="error",
+#   )
+#
+# ``notch_roi_center_px``는 축소 영상 좌표가 아니라 원본 ``wafer_image`` 좌표입니다.
+# image5의 10000x10000 샘플은 대략 (5000, 9650)을 사용했지만 실제 장비 영상에서는
+# overlay의 자홍색 ROI/십자와 하늘색 반원 표시를 보고 좌표와 크기를 조정하십시오.
+# 검출 결과는 dm.notch_result.roi_bounds_px, semicircle_center_px,
+# semicircle_radius_px, semicircle_score, semicircle_fit_residual_px에서
+# 확인할 수 있습니다.
 
 # [SECTOR: 85_NOTCH_ANGLE] ---------------------------------------------------
 # The notch detector and notch-only DM builder are embedded below. The legacy
@@ -2115,6 +2138,12 @@ class NotchAngleResult:
     search_half_width_deg: float
     edge_support: float
     circle_fit_residual_px: float
+    roi_center_px: Optional[Point] = None
+    roi_bounds_px: Optional[Tuple[float, float, float, float]] = None
+    semicircle_center_px: Optional[Point] = None
+    semicircle_radius_px: Optional[float] = None
+    semicircle_score: float = 0.0
+    semicircle_fit_residual_px: float = 0.0
 
 
 @dataclass(frozen=True)
@@ -2351,6 +2380,293 @@ def _circular_candidate_groups(active: np.ndarray):
     return groups
 
 
+@dataclass(frozen=True)
+class _LocalSemicircleCandidate:
+    center: Point
+    radius: float
+    score: float
+    edge_support: float
+    arc_coverage: float
+    arc_points: Tuple[Point, ...]
+    roi_bounds: Tuple[int, int, int, int]
+    fit_residual: float = 0.0
+
+
+def _normalise_roi_half_size(
+    value: Union[float, Tuple[float, float]],
+    *,
+    scale: float,
+) -> Point:
+    if isinstance(value, (int, float, np.integer, np.floating)):
+        half_width = half_height = float(value)
+    else:
+        if len(value) != 2:
+            raise ValueError("notch_roi_half_size_px must be a number or (half_width, half_height).")
+        half_width, half_height = float(value[0]), float(value[1])
+    if half_width <= 0.0 or half_height <= 0.0:
+        raise ValueError("notch_roi_half_size_px values must be positive.")
+    return half_width * float(scale), half_height * float(scale)
+
+
+def _sample_semicircle_support(
+    edge: np.ndarray,
+    center: Point,
+    radius: float,
+    inward_angle_rad: float,
+) -> Tuple[float, float, float, Tuple[Point, ...]]:
+    """Measure the inward-facing half of a local U-shaped notch circle."""
+
+    arc_angles = np.linspace(
+        float(inward_angle_rad) - math.radians(100.0),
+        float(inward_angle_rad) + math.radians(100.0),
+        161,
+        dtype=np.float64,
+    )
+    band = max(1.0, min(5.0, float(radius) * 0.10))
+    radial_offsets = np.linspace(-band, band, 7, dtype=np.float64)
+    radii = np.maximum(1.0, float(radius) + radial_offsets)
+    sampled = _polar_sample(edge, center, radii, arc_angles)
+    supported = sampled.max(axis=1)
+    edge_support = float(np.mean(supported))
+    support_floor = max(0.08, float(np.percentile(supported, 35.0)) * 0.70)
+    arc_coverage = float(np.mean(supported >= support_floor))
+    midpoint = len(supported) // 2
+    left_support = float(np.mean(supported[:midpoint]))
+    right_support = float(np.mean(supported[midpoint + 1:]))
+    symmetry = min(left_support, right_support) / max(
+        1e-6, max(left_support, right_support)
+    )
+    stride = max(1, len(arc_angles) // 48)
+    arc_points = tuple(
+        (
+            float(center[0] + math.cos(float(angle)) * float(radius)),
+            float(center[1] + math.sin(float(angle)) * float(radius)),
+        )
+        for angle in arc_angles[::stride]
+    )
+    return edge_support, arc_coverage, float(symmetry), arc_points
+
+
+def _refine_semicircle_candidate(
+    edge: np.ndarray,
+    wafer_center: Point,
+    candidate: _LocalSemicircleCandidate,
+) -> _LocalSemicircleCandidate:
+    """Robustly re-fit the actual inward arc after coarse Hough detection."""
+
+    initial_center = np.asarray(candidate.center, dtype=np.float64)
+    initial_radius = float(candidate.radius)
+    inward_angle = math.atan2(
+        float(wafer_center[1]) - float(initial_center[1]),
+        float(wafer_center[0]) - float(initial_center[0]),
+    )
+    arc_angles = np.linspace(
+        inward_angle - math.radians(100.0),
+        inward_angle + math.radians(100.0),
+        241,
+        dtype=np.float64,
+    )
+    radii = np.linspace(
+        max(2.0, initial_radius * 0.65), initial_radius * 1.35, 101
+    )
+    polar = _polar_sample(edge, candidate.center, radii, arc_angles)
+    indices = np.argmax(polar, axis=1)
+    support = polar[np.arange(len(arc_angles)), indices]
+    selected_radii = radii[indices]
+    support_floor = max(0.08, float(np.percentile(support, 35.0)))
+    keep = (
+        (support >= support_floor)
+        & (np.abs(selected_radii - initial_radius) <= initial_radius * 0.30)
+    )
+    points = np.column_stack((
+        initial_center[0] + np.cos(arc_angles) * selected_radii,
+        initial_center[1] + np.sin(arc_angles) * selected_radii,
+    ))
+    if int(keep.sum()) < 30:
+        return candidate
+
+    fitted_center = initial_center.copy()
+    fitted_radius = initial_radius
+    residual = np.zeros(len(points), dtype=np.float64)
+    for _ in range(8):
+        selected = points[keep]
+        weights = np.clip(support[keep], 0.03, 1.0)
+        design = np.column_stack((
+            2.0 * selected[:, 0],
+            2.0 * selected[:, 1],
+            np.ones(len(selected)),
+        ))
+        values = np.sum(selected * selected, axis=1)
+        root_weights = np.sqrt(weights)
+        coefficients = np.linalg.lstsq(
+            design * root_weights[:, None], values * root_weights, rcond=None
+        )[0]
+        fitted_center = coefficients[:2]
+        radius_squared = float(coefficients[2] + fitted_center @ fitted_center)
+        if radius_squared <= 0.0:
+            return candidate
+        fitted_radius = math.sqrt(radius_squared)
+        residual = np.linalg.norm(points - fitted_center, axis=1) - fitted_radius
+        median = float(np.median(residual[keep]))
+        noise = float(1.4826 * np.median(np.abs(residual[keep] - median)))
+        refined_keep = keep & (np.abs(residual - median) <= max(1.25, 2.5 * noise))
+        if int(refined_keep.sum()) < 30 or np.array_equal(refined_keep, keep):
+            break
+        keep = refined_keep
+
+    center_shift = float(np.linalg.norm(fitted_center - initial_center))
+    fit_residual = float(np.median(np.abs(residual[keep])))
+    reliable = bool(
+        center_shift <= initial_radius * 0.45
+        and initial_radius * 0.55 <= fitted_radius <= initial_radius * 1.55
+        and fit_residual <= max(1.5, fitted_radius * 0.06)
+    )
+    if not reliable:
+        return replace(candidate, fit_residual=fit_residual)
+
+    refined_inward_angle = math.atan2(
+        float(wafer_center[1]) - float(fitted_center[1]),
+        float(wafer_center[0]) - float(fitted_center[0]),
+    )
+    edge_support, arc_coverage, _, arc_points = _sample_semicircle_support(
+        edge,
+        (float(fitted_center[0]), float(fitted_center[1])),
+        fitted_radius,
+        refined_inward_angle,
+    )
+    return replace(
+        candidate,
+        center=(float(fitted_center[0]), float(fitted_center[1])),
+        radius=float(fitted_radius),
+        edge_support=float(edge_support),
+        arc_coverage=float(arc_coverage),
+        arc_points=arc_points,
+        fit_residual=fit_residual,
+    )
+
+
+def _detect_semicircle_in_roi(
+    edge: np.ndarray,
+    wafer_center: Point,
+    wafer_radius: float,
+    roi_center: Point,
+    roi_half_size: Point,
+    radius_range: Optional[Tuple[float, float]],
+) -> Optional[_LocalSemicircleCandidate]:
+    """Find a small inward-facing semicircle only inside a user ROI."""
+
+    height, width = edge.shape
+    x0 = max(0, int(math.floor(float(roi_center[0]) - float(roi_half_size[0]))))
+    y0 = max(0, int(math.floor(float(roi_center[1]) - float(roi_half_size[1]))))
+    x1 = min(width, int(math.ceil(float(roi_center[0]) + float(roi_half_size[0]))) + 1)
+    y1 = min(height, int(math.ceil(float(roi_center[1]) + float(roi_half_size[1]))) + 1)
+    if x1 - x0 < 24 or y1 - y0 < 24:
+        raise ValueError("notch ROI is too small or lies outside the image.")
+
+    minimum_half_size = min(float(roi_half_size[0]), float(roi_half_size[1]))
+    if radius_range is None:
+        min_radius = max(3.0, minimum_half_size * 0.035)
+        max_radius = max(min_radius + 2.0, minimum_half_size * 0.55)
+    else:
+        min_radius, max_radius = float(radius_range[0]), float(radius_range[1])
+        if min_radius <= 0.0 or max_radius <= min_radius:
+            raise ValueError(
+                "notch_semicircle_radius_range_px must be (positive_min, larger_max)."
+            )
+
+    crop = np.clip(edge[y0:y1, x0:x1] * 255.0, 0.0, 255.0).astype(np.uint8)
+    crop = cv2.GaussianBlur(crop, (5, 5), 0)
+    circles = cv2.HoughCircles(
+        crop,
+        cv2.HOUGH_GRADIENT,
+        dp=1.0,
+        minDist=max(4.0, min_radius * 0.70),
+        param1=40.0,
+        param2=max(6.0, min(crop.shape) * 0.018),
+        minRadius=max(2, int(math.floor(min_radius))),
+        maxRadius=max(3, int(math.ceil(max_radius))),
+    )
+    if circles is None:
+        return None
+
+    wafer_center_array = np.asarray(wafer_center, dtype=np.float64)
+    roi_center_array = np.asarray(roi_center, dtype=np.float64)
+    # The caller supplies this coordinate precisely because the hardware keeps
+    # the notch in a stable area. Give proximity real weight after the arc has
+    # passed the geometric filters; otherwise a stronger decorative/internal
+    # circle elsewhere in a large ROI can still win.
+    roi_scale = max(4.0, 0.20 * minimum_half_size)
+    candidate_pool: List[_LocalSemicircleCandidate] = []
+    for local_x, local_y, candidate_radius in circles[0]:
+        center = np.asarray(
+            (float(local_x) + float(x0), float(local_y) + float(y0)),
+            dtype=np.float64,
+        )
+        radius = float(candidate_radius)
+        center_radius = float(np.linalg.norm(center - wafer_center_array))
+        ring_error = abs(center_radius - float(wafer_radius))
+        if ring_error > max(radius * 2.0, minimum_half_size * 0.20):
+            continue
+
+        inward_angle = math.atan2(
+            float(wafer_center[1]) - float(center[1]),
+            float(wafer_center[0]) - float(center[0]),
+        )
+        edge_support, arc_coverage, symmetry, arc_points = _sample_semicircle_support(
+            edge, (float(center[0]), float(center[1])), radius, inward_angle
+        )
+        hint_distance = float(np.linalg.norm(center - roi_center_array))
+        center_prior = math.exp(-0.5 * (hint_distance / roi_scale) ** 2)
+        ring_prior = math.exp(
+            -0.5 * (ring_error / max(2.0, radius * 0.90)) ** 2
+        )
+        score = float(np.clip(
+            0.32 * edge_support
+            + 0.16 * arc_coverage
+            + 0.12 * symmetry
+            + 0.32 * center_prior
+            + 0.08 * ring_prior,
+            0.0,
+            1.0,
+        ))
+        candidate = _LocalSemicircleCandidate(
+            center=(float(center[0]), float(center[1])),
+            radius=radius,
+            score=score,
+            edge_support=edge_support,
+            arc_coverage=arc_coverage,
+            arc_points=arc_points,
+            roi_bounds=(x0, y0, x1, y1),
+        )
+        candidate_pool.append(candidate)
+    if not candidate_pool:
+        return None
+
+    # Refine several strong coarse candidates. Decorative circles can have a
+    # slightly higher Hough score, while the true notch wins decisively after
+    # its inward arc is fitted with a low radial residual.
+    best: Optional[_LocalSemicircleCandidate] = None
+    for coarse in sorted(
+        candidate_pool, key=lambda item: item.score, reverse=True
+    )[:20]:
+        refined = _refine_semicircle_candidate(edge, wafer_center, coarse)
+        fit_quality = (
+            math.exp(
+                -float(refined.fit_residual)
+                / max(1.5, float(refined.radius) * 0.06)
+            )
+            if refined.fit_residual > 0.0
+            else 0.0
+        )
+        refined = replace(
+            refined,
+            score=float(np.clip(0.80 * coarse.score + 0.20 * fit_quality, 0.0, 1.0)),
+        )
+        if best is None or refined.score > best.score:
+            best = refined
+    return best
+
+
 def detect_wafer_notch(
     image: ImageInput,
     *,
@@ -2366,6 +2682,10 @@ def detect_wafer_notch(
     search_half_width_deg: float = 45.0,
     wafer_center_hint_px: Optional[Point] = None,
     wafer_radius_hint_px: Optional[float] = None,
+    notch_roi_center_px: Optional[Point] = None,
+    notch_roi_half_size_px: Union[float, Tuple[float, float]] = 600.0,
+    notch_semicircle_radius_range_px: Optional[Tuple[float, float]] = None,
+    notch_semicircle_min_score: float = 0.55,
     failure_mode: Literal["error", "zero"] = "error",
     require_notch: Optional[bool] = None,
 ) -> NotchAngleResult:
@@ -2377,8 +2697,12 @@ def detect_wafer_notch(
 
     No foreground/background colour is assumed. LAB colour-gradient magnitude
     supplies edge evidence only. The circle is fitted outside the configured
-    bottom search sector, and the notch is the supported inward edge deviation
-    within that sector. Hints are full-resolution image coordinates.
+    search sector. When ``notch_roi_center_px=(x, y)`` is supplied, the notch
+    calculation is forced into that full-resolution ROI and an inward-facing
+    local semicircle is used as the angle source. ``notch_roi_half_size_px``
+    is a scalar or ``(half_width, half_height)`` in full-resolution pixels.
+    ``notch_semicircle_radius_range_px`` is also expressed in full-resolution
+    pixels. Wafer centre/radius hints remain full-resolution coordinates.
 
     ``failure_mode="error"`` raises when no notch is reliable.
     ``failure_mode="zero"`` returns ``found=False`` and a zero correction.
@@ -2394,6 +2718,8 @@ def detect_wafer_notch(
         raise ValueError("search_half_width_deg must be between 2 and 120 degrees.")
     if not 0.50 <= float(radial_inner_ratio) < 1.0:
         raise ValueError("radial_inner_ratio must be in [0.50, 1.0).")
+    if not 0.0 <= float(notch_semicircle_min_score) <= 1.0:
+        raise ValueError("notch_semicircle_min_score must be between 0 and 1.")
 
     source = _load_bgr(image)
     full_height, full_width = source.shape[:2]
@@ -2411,10 +2737,6 @@ def detect_wafer_notch(
         2.0 * math.pi / angle_samples
     )
     angles_deg = np.degrees(angles)
-    search_distance = _angle_distance_deg(angles_deg, search_center_angle_deg)
-    search_mask = search_distance <= float(search_half_width_deg)
-    fit_mask = search_distance >= float(search_half_width_deg) + 5.0
-
     if wafer_center_hint_px is None:
         center = (work_width / 2.0, work_height / 2.0)
     else:
@@ -2422,6 +2744,40 @@ def detect_wafer_notch(
             float(wafer_center_hint_px[0]) * scale,
             float(wafer_center_hint_px[1]) * scale,
         )
+    roi_center: Optional[Point] = None
+    roi_half_size: Optional[Point] = None
+    semicircle_radius_range: Optional[Tuple[float, float]] = None
+    effective_search_center_angle_deg = float(search_center_angle_deg) % 360.0
+    if notch_roi_center_px is not None:
+        roi_center = (
+            float(notch_roi_center_px[0]) * scale,
+            float(notch_roi_center_px[1]) * scale,
+        )
+        if not (
+            -0.05 * work_width <= roi_center[0] <= 1.05 * work_width
+            and -0.05 * work_height <= roi_center[1] <= 1.05 * work_height
+        ):
+            raise ValueError("notch_roi_center_px lies outside the input image.")
+        roi_half_size = _normalise_roi_half_size(
+            notch_roi_half_size_px, scale=scale
+        )
+        effective_search_center_angle_deg = float(
+            math.degrees(
+                math.atan2(roi_center[1] - center[1], roi_center[0] - center[0])
+            )
+            % 360.0
+        )
+        if notch_semicircle_radius_range_px is not None:
+            semicircle_radius_range = (
+                float(notch_semicircle_radius_range_px[0]) * scale,
+                float(notch_semicircle_radius_range_px[1]) * scale,
+            )
+    search_distance = _angle_distance_deg(
+        angles_deg, effective_search_center_angle_deg
+    )
+    search_mask = search_distance <= float(search_half_width_deg)
+    fit_mask = search_distance >= float(search_half_width_deg) + 5.0
+
     if wafer_radius_hint_px is None:
         radius, _ = _initial_outer_radius(edge, center, angles)
     else:
@@ -2460,6 +2816,16 @@ def detect_wafer_notch(
     cx, cy = center
     if not (-0.10 * work_width <= cx <= 1.10 * work_width and -0.10 * work_height <= cy <= 1.10 * work_height):
         raise RuntimeError("Estimated wafer centre is outside the image.")
+
+    if roi_center is not None:
+        effective_search_center_angle_deg = float(
+            math.degrees(math.atan2(roi_center[1] - cy, roi_center[0] - cx))
+            % 360.0
+        )
+        search_distance = _angle_distance_deg(
+            angles_deg, effective_search_center_angle_deg
+        )
+        search_mask = search_distance <= float(search_half_width_deg)
 
     inward_range = max(8.0, radius * (1.0 - float(radial_inner_ratio)))
     outward_range = max(5.0, radius * 0.018)
@@ -2593,14 +2959,91 @@ def detect_wafer_notch(
         0.0,
         1.0,
     ))
+    detection_method = "geometry_edge_bottom_sector"
+    local_arc: Optional[Tuple[Point, ...]] = None
+    semicircle_candidate: Optional[_LocalSemicircleCandidate] = None
+    if roi_center is not None and roi_half_size is not None:
+        semicircle_candidate = _detect_semicircle_in_roi(
+            edge,
+            center,
+            radius,
+            roi_center,
+            roi_half_size,
+            semicircle_radius_range,
+        )
+        detection_method = "geometry_edge_manual_roi_semicircle"
+        if semicircle_candidate is None:
+            found = False
+            confidence = 0.0
+            candidate_support = 0.0
+            peak_depth = 0.0
+            notch_width_deg = 0.0
+            notch_width_px = 0.0
+            candidate_indices = np.asarray((), dtype=np.int64)
+        else:
+            local_arc = semicircle_candidate.arc_points
+            semicircle_center = np.asarray(
+                semicircle_candidate.center, dtype=np.float64
+            )
+            wafer_center_array = np.asarray(center, dtype=np.float64)
+            outward_vector = semicircle_center - wafer_center_array
+            outward_length = float(np.linalg.norm(outward_vector))
+            if outward_length <= 1e-6:
+                found = False
+                outward_unit = np.asarray((0.0, 1.0), dtype=np.float64)
+            else:
+                outward_unit = outward_vector / outward_length
+            inward_unit = -outward_unit
+            deepest = semicircle_center + inward_unit * float(
+                semicircle_candidate.radius
+            )
+            notch_angle_rad = float(
+                math.atan2(float(outward_unit[1]), float(outward_unit[0]))
+                % (2.0 * math.pi)
+            )
+            notch_angle_deg = float(math.degrees(notch_angle_rad) % 360.0)
+            notch_deepest_point = (float(deepest[0]), float(deepest[1]))
+            notch_point = (
+                float(cx + math.cos(notch_angle_rad) * radius),
+                float(cy + math.sin(notch_angle_rad) * radius),
+            )
+            peak_depth = max(
+                0.0,
+                float(radius)
+                - float(np.linalg.norm(deepest - wafer_center_array)),
+            )
+            notch_width_px = float(2.0 * semicircle_candidate.radius)
+            notch_width_deg = float(math.degrees(
+                2.0 * math.asin(
+                    min(1.0, float(semicircle_candidate.radius) / max(radius, 1e-6))
+                )
+            ))
+            candidate_support = float(semicircle_candidate.edge_support)
+            found = bool(
+                outward_length > 1e-6
+                and semicircle_candidate.score >= float(notch_semicircle_min_score)
+                and semicircle_candidate.arc_coverage >= 0.55
+                and peak_depth >= max(0.60, depth_limit * 0.40)
+            )
+            confidence = (
+                float(semicircle_candidate.score) if found else 0.0
+            )
+            candidate_indices = np.asarray((), dtype=np.int64)
     if not found:
         confidence = 0.0
         if mode == "error":
+            roi_message = ""
+            if roi_center is not None:
+                roi_message = (
+                    f" roi_center=({roi_center[0] / scale:.1f},"
+                    f"{roi_center[1] / scale:.1f}),"
+                    f" semicircle_score={0.0 if semicircle_candidate is None else semicircle_candidate.score:.3f}."
+                )
             raise RuntimeError(
                 f"Wafer notch was not found: peak_depth={peak_depth / scale:.2f}px, "
                 f"width={notch_width_deg:.2f}deg, required_depth={depth_limit / scale:.2f}px. "
-                f"search={float(search_center_angle_deg):.1f}+/-{float(search_half_width_deg):.1f}deg. "
-                "Use failure_mode='zero' to return angle 0, or provide wafer centre/radius hints."
+                f"search={effective_search_center_angle_deg:.1f}+/-{float(search_half_width_deg):.1f}deg."
+                f"{roi_message} Use failure_mode='zero' to return angle 0, or correct the ROI/wafer hints."
             )
         notch_angle_deg = float(reference_angle_deg) % 360.0
         notch_angle_rad = math.radians(notch_angle_deg)
@@ -2622,13 +3065,19 @@ def detect_wafer_notch(
         float(notch_deepest_point[0] * inv_scale),
         float(notch_deepest_point[1] * inv_scale),
     )
-    arc = tuple(
-        (
-            float((cx + math.cos(angles[index]) * boundary[index]) * inv_scale),
-            float((cy + math.sin(angles[index]) * boundary[index]) * inv_scale),
+    if local_arc is not None:
+        arc = tuple(
+            (float(point[0] * inv_scale), float(point[1] * inv_scale))
+            for point in local_arc
         )
-        for index in candidate_indices[::max(1, len(candidate_indices) // 48)]
-    )
+    else:
+        arc = tuple(
+            (
+                float((cx + math.cos(angles[index]) * boundary[index]) * inv_scale),
+                float((cy + math.sin(angles[index]) * boundary[index]) * inv_scale),
+            )
+            for index in candidate_indices[::max(1, len(candidate_indices) // 48)]
+        )
     contour_stride = max(1, angle_samples // 1440)
     contour_indices = np.arange(0, angle_samples, contour_stride, dtype=np.int64)
     contour_points = np.column_stack((
@@ -2657,11 +3106,42 @@ def detect_wafer_notch(
         segmentation_threshold=float(edge_normaliser),
         scale=scale,
         failure_mode=mode,
-        detection_method="geometry_edge_bottom_sector",
-        search_center_angle_deg=float(search_center_angle_deg) % 360.0,
+        detection_method=detection_method,
+        search_center_angle_deg=effective_search_center_angle_deg,
         search_half_width_deg=float(search_half_width_deg),
         edge_support=float(candidate_support),
         circle_fit_residual_px=float(circle_fit_noise * inv_scale),
+        roi_center_px=(
+            None
+            if roi_center is None
+            else (float(roi_center[0] * inv_scale), float(roi_center[1] * inv_scale))
+        ),
+        roi_bounds_px=(
+            None
+            if semicircle_candidate is None
+            else tuple(float(value * inv_scale) for value in semicircle_candidate.roi_bounds)
+        ),
+        semicircle_center_px=(
+            None
+            if semicircle_candidate is None
+            else (
+                float(semicircle_candidate.center[0] * inv_scale),
+                float(semicircle_candidate.center[1] * inv_scale),
+            )
+        ),
+        semicircle_radius_px=(
+            None
+            if semicircle_candidate is None
+            else float(semicircle_candidate.radius * inv_scale)
+        ),
+        semicircle_score=(
+            0.0 if semicircle_candidate is None else float(semicircle_candidate.score)
+        ),
+        semicircle_fit_residual_px=(
+            0.0
+            if semicircle_candidate is None
+            else float(semicircle_candidate.fit_residual * inv_scale)
+        ),
     )
 
 
@@ -2711,6 +3191,9 @@ def _transform_result_for_visual(
             float(point[1]) * float(scale) + float(offset[1]),
         )
 
+    def transform_optional_point(point: Optional[Point]) -> Optional[Point]:
+        return None if point is None else transform_point(point)
+
     contour = result.wafer_contour_px.astype(np.float64) * float(scale)
     contour[:, :, 0] += float(offset[0])
     contour[:, :, 1] += float(offset[1])
@@ -2726,6 +3209,26 @@ def _transform_result_for_visual(
         candidate_arc_px=tuple(transform_point(point) for point in result.candidate_arc_px),
         wafer_contour_px=np.rint(contour).astype(np.int32),
         circle_fit_residual_px=float(result.circle_fit_residual_px) * float(scale),
+        roi_center_px=transform_optional_point(result.roi_center_px),
+        roi_bounds_px=(
+            None
+            if result.roi_bounds_px is None
+            else (
+                float(result.roi_bounds_px[0]) * float(scale) + float(offset[0]),
+                float(result.roi_bounds_px[1]) * float(scale) + float(offset[1]),
+                float(result.roi_bounds_px[2]) * float(scale) + float(offset[0]),
+                float(result.roi_bounds_px[3]) * float(scale) + float(offset[1]),
+            )
+        ),
+        semicircle_center_px=transform_optional_point(result.semicircle_center_px),
+        semicircle_radius_px=(
+            None
+            if result.semicircle_radius_px is None
+            else float(result.semicircle_radius_px) * float(scale)
+        ),
+        semicircle_fit_residual_px=(
+            float(result.semicircle_fit_residual_px) * float(scale)
+        ),
     )
 
 
@@ -2778,6 +3281,34 @@ def make_notch_overlay(
     if result.candidate_arc_px:
         arc = np.rint(np.asarray(result.candidate_arc_px)).astype(np.int32)
         cv2.polylines(overlay, [arc], False, (0, 255, 255), max(2, thickness), cv2.LINE_AA)
+    if result.roi_bounds_px is not None:
+        x0, y0, x1, y1 = (int(round(value)) for value in result.roi_bounds_px)
+        cv2.rectangle(
+            overlay, (x0, y0), (x1, y1), (255, 0, 255),
+            max(2, thickness), cv2.LINE_AA
+        )
+    if result.roi_center_px is not None:
+        roi_center = tuple(int(round(value)) for value in result.roi_center_px)
+        cv2.drawMarker(
+            overlay, roi_center, (255, 0, 255), cv2.MARKER_CROSS,
+            max(12, thickness * 8), max(2, thickness), cv2.LINE_AA
+        )
+    if result.semicircle_center_px is not None and result.semicircle_radius_px is not None:
+        local_center = tuple(
+            int(round(value)) for value in result.semicircle_center_px
+        )
+        if result.candidate_arc_px:
+            fitted_arc = np.rint(
+                np.asarray(result.candidate_arc_px)
+            ).astype(np.int32)
+            cv2.polylines(
+                overlay, [fitted_arc], False, (255, 180, 0),
+                max(2, thickness), cv2.LINE_AA
+            )
+        cv2.circle(
+            overlay, local_center, max(4, thickness * 2),
+            (255, 180, 0), -1, cv2.LINE_AA
+        )
     cv2.arrowedLine(
         overlay, center, notch, (0, 220, 0), max(2, thickness), cv2.LINE_AA, tipLength=0.025
     )
@@ -2800,7 +3331,9 @@ def make_notch_overlay(
     )
     diagnostic_text = (
         f"method={result.detection_method}  edge={result.edge_support:.3f}  "
-        f"circle_residual={result.circle_fit_residual_px:.2f}px"
+        f"circle_residual={result.circle_fit_residual_px:.2f}px  "
+        f"semicircle={result.semicircle_score:.3f}  "
+        f"arc_fit={result.semicircle_fit_residual_px:.2f}px"
     )
     cv2.putText(
         overlay, diagnostic_text, (24, 74), cv2.FONT_HERSHEY_SIMPLEX, 0.62,
@@ -3400,6 +3933,10 @@ def build_die_map_from_yolo(
     notch_search_half_width_deg: float = 45.0,
     notch_wafer_center_hint_px: Optional[Point] = None,
     notch_wafer_radius_hint_px: Optional[float] = None,
+    notch_roi_center_px: Optional[Point] = None,
+    notch_roi_half_size_px: Union[float, Tuple[float, float]] = 600.0,
+    notch_semicircle_radius_range_px: Optional[Tuple[float, float]] = None,
+    notch_semicircle_min_score: float = 0.55,
     notch_failure_mode: Literal["error", "zero"] = "error",
     return_aligned_image: bool = True,
     return_notch_visuals: bool = True,
@@ -3412,9 +3949,11 @@ def build_die_map_from_yolo(
     """Build a die map with the wafer notch as the sole angle source.
 
     The notch detector does not require a black background. It fits the wafer
-    circle from colour-gradient geometry outside the expected notch sector,
-    then searches only ``notch_search_center_angle_deg +/-
-    notch_search_half_width_deg`` for a continuous inward depression.
+    circle from colour-gradient geometry outside the expected notch sector.
+    Set ``notch_roi_center_px=(x, y)`` to force the final notch calculation
+    into a stable full-image coordinate area. In ROI mode an inward-facing
+    local semicircle, rather than any depression in the wide sector, supplies
+    the correction angle. ``notch_roi_half_size_px`` controls that area.
 
     If the automatic circle is wrong on production data, pass full-image
     ``notch_wafer_center_hint_px=(x, y)`` and
@@ -3451,6 +3990,10 @@ def build_die_map_from_yolo(
         search_half_width_deg=notch_search_half_width_deg,
         wafer_center_hint_px=notch_wafer_center_hint_px,
         wafer_radius_hint_px=notch_wafer_radius_hint_px,
+        notch_roi_center_px=notch_roi_center_px,
+        notch_roi_half_size_px=notch_roi_half_size_px,
+        notch_semicircle_radius_range_px=notch_semicircle_radius_range_px,
+        notch_semicircle_min_score=notch_semicircle_min_score,
         failure_mode=notch_failure_mode,
     )
     if clip_origin is None:
@@ -3611,6 +4154,12 @@ def build_die_map_from_yolo(
     die_map.notch_circle_fit_residual_px = notch.circle_fit_residual_px
     die_map.notch_search_center_angle_deg = notch.search_center_angle_deg
     die_map.notch_search_half_width_deg = notch.search_half_width_deg
+    die_map.notch_roi_center_px = notch.roi_center_px
+    die_map.notch_roi_bounds_px = notch.roi_bounds_px
+    die_map.notch_semicircle_center_px = notch.semicircle_center_px
+    die_map.notch_semicircle_radius_px = notch.semicircle_radius_px
+    die_map.notch_semicircle_score = notch.semicircle_score
+    die_map.notch_semicircle_fit_residual_px = notch.semicircle_fit_residual_px
     die_map.notch_correction_angle_deg = float(notch.correction_angle_deg)
     die_map.notch_point_aligned_px = _affine_point(matrix, notch.notch_point_px)
     die_map.notch_deepest_point_aligned_px = _affine_point(

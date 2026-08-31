@@ -26,6 +26,9 @@ __all__.extend([
 ])
 
 
+_geometry_detect_wafer_notch = detect_wafer_notch
+
+
 def detect_wafer_notch(
     image: ImageInput,
     *,
@@ -41,6 +44,10 @@ def detect_wafer_notch(
     search_half_width_deg: float = 45.0,
     wafer_center_hint_px: Optional[Point] = None,
     wafer_radius_hint_px: Optional[float] = None,
+    notch_roi_center_px: Optional[Point] = None,
+    notch_roi_half_size_px: Union[float, Tuple[float, float]] = 600.0,
+    notch_semicircle_radius_range_px: Optional[Tuple[float, float]] = None,
+    notch_semicircle_min_score: float = 0.55,
     failure_mode: Literal["error", "zero"] = "error",
     require_notch: Optional[bool] = None,
     background_palette_size: int = 3,
@@ -62,6 +69,31 @@ def detect_wafer_notch(
     if mode not in ("error", "zero"):
         raise ValueError("failure_mode must be 'error' or 'zero'.")
     _ = baseline_window_deg, radial_inner_ratio, min_wide_notch_deg
+
+    # A manual ROI is an explicit request for the local semicircle detector
+    # embedded in the base standalone. With no ROI this derived file keeps its
+    # historical adaptive-background V5 angle override.
+    if notch_roi_center_px is not None:
+        return _geometry_detect_wafer_notch(
+            image,
+            reference_angle_deg=reference_angle_deg,
+            max_dimension=max_dimension,
+            angle_samples=angle_samples,
+            baseline_window_deg=baseline_window_deg,
+            radial_inner_ratio=radial_inner_ratio,
+            min_notch_depth_px=min_notch_depth_px,
+            min_notch_depth_ratio=min_notch_depth_ratio,
+            min_wide_notch_deg=min_wide_notch_deg,
+            search_center_angle_deg=search_center_angle_deg,
+            search_half_width_deg=search_half_width_deg,
+            wafer_center_hint_px=wafer_center_hint_px,
+            wafer_radius_hint_px=wafer_radius_hint_px,
+            notch_roi_center_px=notch_roi_center_px,
+            notch_roi_half_size_px=notch_roi_half_size_px,
+            notch_semicircle_radius_range_px=notch_semicircle_radius_range_px,
+            notch_semicircle_min_score=notch_semicircle_min_score,
+            failure_mode=mode,
+        )
 
     guide = _adaptive_draw_aligned_wafer_notch_guide(
         image,
