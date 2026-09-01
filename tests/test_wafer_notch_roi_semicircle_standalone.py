@@ -2,6 +2,7 @@ import importlib.util
 import inspect
 import sys
 import unittest
+from unittest import mock
 from pathlib import Path
 
 import cv2
@@ -155,6 +156,33 @@ def synthetic_noisy_wide_shallow_notch(
 
 
 class RoiSemicircleStandaloneTests(unittest.TestCase):
+    def test_detect_reuses_a_single_bgr_to_lab_conversion(self):
+        image, _, roi_center = synthetic_wide_shallow_notch(
+            108.0, 38.0, (185, 185, 185)
+        )
+        original_cvt_color = MODULE.cv2.cvtColor
+        bgr_to_lab_calls = 0
+
+        def counting_cvt_color(source, code, *args, **kwargs):
+            nonlocal bgr_to_lab_calls
+            if code == cv2.COLOR_BGR2LAB:
+                bgr_to_lab_calls += 1
+            return original_cvt_color(source, code, *args, **kwargs)
+
+        with mock.patch.object(MODULE.cv2, "cvtColor", side_effect=counting_cvt_color):
+            result = MODULE.detect_wafer_notch(
+                image,
+                notch_roi_center_px=roi_center,
+                notch_roi_half_size_px=(140, 90),
+                notch_semicircle_radius_range_px=(35, 80),
+                notch_background_palette_size=5,
+                notch_background_morph_px=4,
+                failure_mode="error",
+            )
+
+        self.assertTrue(result.found)
+        self.assertEqual(bgr_to_lab_calls, 1)
+
     def test_roi_semicircle_supplies_opposite_rotation_correction(self):
         image, _, roi_center = synthetic_semicircle_notch(rotation_deg=13.0)
         result = MODULE.detect_wafer_notch(

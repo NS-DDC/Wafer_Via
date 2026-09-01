@@ -17,6 +17,10 @@ wafer_via_notch_standalone.py
 
 외부 패키지는 `numpy`, `opencv-python`만 필요합니다.
 
+성능상 `detect_wafer_notch()`는 축소 분석 영상을 BGR에서 LAB으로 한 번만 변환합니다.
+같은 raw LAB 배열을 배경 palette 거리 계산에 사용하고, edge 계산은 그 배열의 blur
+복사본을 사용합니다. 따라서 색상 분할 결과를 바꾸지 않고 중복 LAB 변환만 제거합니다.
+
 ## 가장 간단한 호출
 
 ```python

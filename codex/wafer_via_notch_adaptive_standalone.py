@@ -2201,10 +2201,12 @@ def _normalise_angle(angle_deg: float) -> float:
     return float((float(angle_deg) + 180.0) % 360.0 - 180.0)
 
 
-def _lab_edge_strength(image_bgr: np.ndarray):
-    """Return colour-transition strength without choosing either side's colour."""
+def _lab_edge_strength_from_lab(lab_image: np.ndarray):
+    """Return colour-transition strength from a reusable raw LAB image."""
 
-    lab = cv2.cvtColor(image_bgr, cv2.COLOR_BGR2LAB)
+    lab = np.asarray(lab_image)
+    if lab.ndim != 3 or lab.shape[2] != 3:
+        raise ValueError("lab_image must have shape (height, width, 3).")
     lab = cv2.GaussianBlur(lab, (5, 5), 0).astype(np.float32)
     squared = np.zeros(lab.shape[:2], dtype=np.float32)
     for channel_index in range(3):
@@ -2219,6 +2221,13 @@ def _lab_edge_strength(image_bgr: np.ndarray):
     edge = np.clip(edge / normaliser, 0.0, 1.0)
     edge = cv2.GaussianBlur(edge, (3, 3), 0)
     return edge.astype(np.float32), normaliser
+
+
+def _lab_edge_strength(image_bgr: np.ndarray):
+    """Return colour-transition strength without choosing either side's colour."""
+
+    lab = cv2.cvtColor(image_bgr, cv2.COLOR_BGR2LAB)
+    return _lab_edge_strength_from_lab(lab)
 
 
 def _angle_distance_deg(angles_deg: np.ndarray, centre_deg: float) -> np.ndarray:
@@ -2466,6 +2475,7 @@ def _learn_background_from_notch_roi(
     distance_threshold_lab: Optional[float] = None,
     noise_margin_lab: float = 4.0,
     morph_size_px: float = 24.0,
+    lab_image: Optional[np.ndarray] = None,
 ) -> _RoiBackgroundGeometry:
     """Learn exterior colour in the outward ROI band and segment the wafer."""
 
@@ -2504,7 +2514,15 @@ def _learn_background_from_notch_roi(
     sample_mask = np.zeros((height, width), dtype=np.uint8)
     sample_mask[y0:y1, x0:x1] = sample_local.astype(np.uint8) * 255
 
-    lab = cv2.cvtColor(image_bgr, cv2.COLOR_BGR2LAB).astype(np.float32)
+    if lab_image is None:
+        lab = cv2.cvtColor(image_bgr, cv2.COLOR_BGR2LAB)
+    else:
+        lab = np.asarray(lab_image)
+        if lab.shape != image_bgr.shape:
+            raise ValueError("lab_image shape must match image_bgr shape.")
+        if lab.ndim != 3 or lab.shape[2] != 3:
+            raise ValueError("lab_image must have shape (height, width, 3).")
+    lab = lab.astype(np.float32, copy=False)
     samples = lab[y0:y1, x0:x1][sample_local].reshape(-1, 3)
     if len(samples) < 64:
         raise RuntimeError("The outward notch ROI band has too few background pixels.")
@@ -3376,7 +3394,10 @@ def detect_wafer_notch(
     else:
         work = source
 
-    edge, edge_normaliser = _lab_edge_strength(work)
+    # Convert once. Edge extraction uses a blurred copy while ROI background
+    # learning uses the unblurred LAB values for colour-distance segmentation.
+    work_lab = cv2.cvtColor(work, cv2.COLOR_BGR2LAB)
+    edge, edge_normaliser = _lab_edge_strength_from_lab(work_lab)
     work_height, work_width = work.shape[:2]
 
     angle_samples = max(720, int(angle_samples))
@@ -3431,9 +3452,11 @@ def detect_wafer_notch(
                 distance_threshold_lab=notch_background_distance_threshold_lab,
                 noise_margin_lab=notch_background_noise_margin_lab,
                 morph_size_px=float(notch_background_morph_px) * scale,
+                lab_image=work_lab,
             )
             if wafer_center_hint_px is None:
                 center = background_geometry.wafer_center
+    del work_lab
     search_distance = _angle_distance_deg(
         angles_deg, effective_search_center_angle_deg
     )
