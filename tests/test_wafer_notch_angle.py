@@ -107,7 +107,15 @@ class WaferNotchAngleTests(unittest.TestCase):
             for token in tokenize.generate_tokens(io.StringIO(text).readline)
             if token.type == tokenize.COMMENT
         ]
-        self.assertEqual(comments, [])
+        self.assertEqual(len(comments), 13)
+        self.assertEqual(comments[0].string, "# INPUT")
+        self.assertEqual(comments[6].string, "# OUTPUT")
+        self.assertTrue(
+            text.rstrip().endswith(
+                "# dm.notch_overlay_image / dm.notch_zoom_image: "
+                "return_notch_visuals=True일 때만 생성"
+            )
+        )
         with tempfile.TemporaryDirectory() as directory:
             isolated = Path(directory) / source.name
             copy2(source, isolated)

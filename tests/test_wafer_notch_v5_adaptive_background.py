@@ -113,9 +113,9 @@ class AdaptiveBackgroundNotchTests(unittest.TestCase):
             / "codex"
             / "wafer_via_notch_standalone.py"
         ).read_text(encoding="utf-8")
-        original_builder = original_source[
-            original_source.index("def build_die_map_from_yolo("):
-        ].rstrip()
+        builder_start = original_source.index("def build_die_map_from_yolo(")
+        builder_end = original_source.index("\n# INPUT", builder_start)
+        original_builder = original_source[builder_start:builder_end].rstrip()
         self.assertNotIn("import wafer_notch_angle", text)
         self.assertNotIn("import wafer_via", text)
         comments = [
@@ -123,7 +123,15 @@ class AdaptiveBackgroundNotchTests(unittest.TestCase):
             for token in tokenize.generate_tokens(io.StringIO(text).readline)
             if token.type == tokenize.COMMENT
         ]
-        self.assertEqual(comments, [])
+        self.assertEqual(len(comments), 13)
+        self.assertEqual(comments[0].string, "# INPUT")
+        self.assertEqual(comments[6].string, "# OUTPUT")
+        self.assertTrue(
+            text.rstrip().endswith(
+                "# dm.notch_overlay_image / dm.notch_zoom_image: "
+                "return_notch_visuals=True일 때만 생성"
+            )
+        )
         self.assertIn(original_builder, text)
         with tempfile.TemporaryDirectory() as directory:
             isolated = Path(directory) / source.name

@@ -2,7 +2,7 @@
 
 from pathlib import Path
 
-from build_wafer_via_notch_standalone import _strip_comments
+from build_wafer_via_notch_standalone import _append_io_footer, _strip_comments
 
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -236,6 +236,7 @@ def main() -> None:
         + "\n"
     )
     output = _strip_comments(output)
+    output = _append_io_footer(output)
     OUTPUT_PATH.write_text(output, encoding="utf-8", newline="\n")
 
 

@@ -11,6 +11,22 @@ NOTCH_PATH = ROOT / "codex" / "wafer_notch_angle.py"
 PIPELINE_PATH = ROOT / "codex" / "wafer_via_notch.py"
 OUTPUT_PATH = ROOT / "codex" / "wafer_via_notch_standalone.py"
 
+IO_FOOTER = """
+# INPUT
+# wafer_image: 전체 wafer 경로 또는 uint8 BGR ndarray (H, W, 3)
+# clip_image: YOLO를 실행한 중심 clip 경로 또는 BGR ndarray
+# detections: YOLO 중심점/box의 numpy 배열 또는 list
+# clip_origin: 중심 clip이 아닐 때 전체 이미지 기준 좌상단 (x, y)
+# notch_roi_center_px: 선택 사항, 전체 이미지 기준 예상 notch 중심 (x, y)
+# OUTPUT
+# 반환값: WaferDieMap
+# dm.aligned_image: notch angle이 보정된 전체 이미지 (기본 결과 이미지)
+# dm.grid_angle_deg: 보정 좌표계이므로 0.0
+# dm.notch_result: notch 위치, 각도, 깊이, 폭, 신뢰도 등 수치 결과
+# dm.dies / locate_die(): 보정 이미지 좌표계의 die-map 결과
+# dm.notch_overlay_image / dm.notch_zoom_image: return_notch_visuals=True일 때만 생성
+"""
+
 
 def _strip_comments(source: str) -> str:
     """Remove Python comments while preserving strings and executable code."""
@@ -34,6 +50,10 @@ def _strip_comments(source: str) -> str:
             if blank_count <= 2:
                 compact.append("")
     return "\n".join(compact).rstrip() + "\n"
+
+
+def _append_io_footer(source: str) -> str:
+    return source.rstrip() + "\n\n" + IO_FOOTER.strip() + "\n"
 
 
 def _remove_between(source: str, start: str, end: str) -> str:
@@ -155,6 +175,7 @@ __all__.extend([
 """
     output = base.rstrip() + exports + notch_tail.rstrip() + "\n\n\n" + pipeline_tail
     output = _strip_comments(output)
+    output = _append_io_footer(output)
     OUTPUT_PATH.write_text(output, encoding="utf-8", newline="\n")
 
 

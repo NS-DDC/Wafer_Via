@@ -4229,3 +4229,17 @@ def build_die_map_from_yolo(
 
 
 build_die_map = build_die_map_from_yolo
+
+# INPUT
+# wafer_image: 전체 wafer 경로 또는 uint8 BGR ndarray (H, W, 3)
+# clip_image: YOLO를 실행한 중심 clip 경로 또는 BGR ndarray
+# detections: YOLO 중심점/box의 numpy 배열 또는 list
+# clip_origin: 중심 clip이 아닐 때 전체 이미지 기준 좌상단 (x, y)
+# notch_roi_center_px: 선택 사항, 전체 이미지 기준 예상 notch 중심 (x, y)
+# OUTPUT
+# 반환값: WaferDieMap
+# dm.aligned_image: notch angle이 보정된 전체 이미지 (기본 결과 이미지)
+# dm.grid_angle_deg: 보정 좌표계이므로 0.0
+# dm.notch_result: notch 위치, 각도, 깊이, 폭, 신뢰도 등 수치 결과
+# dm.dies / locate_die(): 보정 이미지 좌표계의 die-map 결과
+# dm.notch_overlay_image / dm.notch_zoom_image: return_notch_visuals=True일 때만 생성
