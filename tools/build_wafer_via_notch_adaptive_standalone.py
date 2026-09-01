@@ -2,6 +2,8 @@
 
 from pathlib import Path
 
+from build_wafer_via_notch_standalone import _strip_comments
+
 
 ROOT = Path(__file__).resolve().parents[1]
 BASE_STANDALONE = ROOT / "codex" / "wafer_via_notch_standalone.py"
@@ -233,6 +235,7 @@ def main() -> None:
         + ADAPTER
         + "\n"
     )
+    output = _strip_comments(output)
     OUTPUT_PATH.write_text(output, encoding="utf-8", newline="\n")
 
 

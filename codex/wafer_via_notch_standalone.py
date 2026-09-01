@@ -185,10 +185,8 @@ class WaferDieMap:
     detected_pitch_x: Optional[float] = None
     detected_pitch_y: Optional[float] = None
     pitch_source: str = "direct"
-    # Coordinate-space and notch diagnostics. The base builder keeps the
-    # historical ``original_image`` defaults. The notch builder returns an
-    # axis-aligned map in ``aligned_image`` coordinates and records the source
-    # angle/origin separately.
+
+
     coordinate_space: str = "original_image"
     source_grid_angle_deg: Optional[float] = None
     image_rotation_deg: float = 0.0
@@ -217,7 +215,6 @@ class WaferDieMap:
         return self.dies_by_index.get((ix, iy))
 
 
-# [SECTOR: 10_YOLO_COORDINATES] ----------------------------------------------
 def _tensor_to_numpy(value: Any) -> Optional[np.ndarray]:
     """Convert a torch/numpy-like value to CPU numpy without importing torch."""
 
@@ -299,7 +296,7 @@ def inspect_yolo_results(results: Any, *, max_rows: int = 10) -> Dict[str, Any]:
             try:
                 raw_value = getattr(boxes, attribute, None)
                 array = _tensor_to_numpy(raw_value)
-            except Exception as exc:  # diagnostic output must continue for other attributes
+            except Exception as exc:
                 box_summary["arrays"][attribute] = {"error": str(exc)}
                 print(f"{attribute}: ERROR {exc}")
                 continue
@@ -390,7 +387,7 @@ def parse_yolo_points(
                 values, item_format = item["xywh"], "xywh"
             elif "bbox" in item:
                 values = item["bbox"]
-                item_format = str(item.get("bbox_format", "xyxy"))  # type: ignore[assignment]
+                item_format = str(item.get("bbox_format", "xyxy"))
             else:
                 raise ValueError(f"Unsupported detection dictionary keys: {sorted(item)}")
         else:
@@ -407,11 +404,8 @@ def parse_yolo_points(
             elif len(row) == 5:
                 item_format = "yolo_txt"
             elif len(row) == 6:
-                # Resolve the two common six-column layouts. Normalized YOLO
-                # labels start with an integer class and keep cx/cy/w/h in
-                # [0,1]. Pixel-space six-column rows remain explicitly
-                # selectable with detection_format when their layout is
-                # ambiguous.
+
+
                 looks_like_normalized_yolo = (
                     row[0] >= 0.0
                     and abs(row[0] - round(row[0])) < 1e-6
@@ -478,7 +472,6 @@ def parse_yolo_points(
     return deduplicated
 
 
-# [SECTOR: 20_COLOR_INVARIANT_REFINEMENT] ------------------------------------
 def _profile_street_center(profile: np.ndarray, approximate: float, max_width: int) -> Tuple[float, float]:
     values = np.asarray(profile, dtype=np.float64)
     if values.size < 7:
@@ -590,9 +583,8 @@ def _corner_colour_candidate(
     )
     difference = lab[:, :, None, :] - references[None, None, :, :]
     distance_to_die = np.sqrt(np.sum(difference * difference, axis=3)).min(axis=2)
-    # OpenCV supports large median kernels for uint8 images, while float32
-    # medianBlur is limited to small kernels. The source image already receives
-    # the requested denoising above, so a maximum 5x5 response filter is enough.
+
+
     response_kernel = _odd_kernel(min(noise_kernel, 5), min(height, width))
     if response_kernel >= 3:
         distance_to_die = cv2.medianBlur(distance_to_die.astype(np.float32), response_kernel)
@@ -704,7 +696,6 @@ def refine_cross_point(
     return combined, combined_confidence
 
 
-# [SECTOR: 30_GRID_ESTIMATION] ------------------------------------------------
 def _fold_grid_angle(angle_deg: float) -> float:
     return (float(angle_deg) + 45.0) % 90.0 - 45.0
 
@@ -735,7 +726,6 @@ def _select_axis_neighbour(
     return selected, vector
 
 
-# [SECTOR: 40_WAFER_BOUNDARY] -------------------------------------------------
 def detect_wafer_boundary(
     image: ImageInput,
     *,
@@ -807,7 +797,6 @@ def detect_wafer_boundary(
     )
 
 
-# [SECTOR: 50_DIE_MAP] --------------------------------------------------------
 def _normalize_edge_mode(edge_mode: str) -> str:
     value = str(edge_mode).strip().lower()
     aliases = {"partial": "circle", "disc": "circle", "outer": "ring", "grid": "ring", "all": "both"}
@@ -982,7 +971,6 @@ def generate_die_map(
     )
 
 
-# [SECTOR: 60_LOCATE_DIE] -----------------------------------------------------
 def locate_die(
     die_map: WaferDieMap,
     point: Optional[Point] = None,
@@ -996,7 +984,7 @@ def locate_die(
         qx, qy = (float(bbox[0]) + float(bbox[2])) / 2.0, (float(bbox[1]) + float(bbox[3])) / 2.0
         input_type = "bbox"
     else:
-        qx, qy = float(point[0]), float(point[1])  # type: ignore[index]
+        qx, qy = float(point[0]), float(point[1])
         input_type = "point"
     relative = np.array((qx - die_map.x0, qy - die_map.y0), dtype=np.float64)
     axis_x = np.asarray(die_map.axis_x)
@@ -1078,7 +1066,6 @@ def locate_die(
     }
 
 
-# [SECTOR: 65_ANGLE_ALIGNED_IMAGE] --------------------------------------------
 def _alignment_matrices(center_px: Point, angle_deg: float) -> Tuple[np.ndarray, np.ndarray]:
     matrix = cv2.getRotationMatrix2D(
         (float(center_px[0]), float(center_px[1])), float(angle_deg), 1.0
@@ -1145,7 +1132,6 @@ def transform_point_to_original(die_map: WaferDieMap, point: Point) -> Point:
     return _transform_point(matrix, point)
 
 
-# [SECTOR: 70_OVERLAY] --------------------------------------------------------
 def make_clip_overlay(clip_image: ImageInput, estimate: GridEstimate) -> np.ndarray:
     overlay = _load_bgr(clip_image).copy()
     if estimate.raw_points_clip:
@@ -1213,9 +1199,7 @@ def make_wafer_overlay(
                max(5, thickness * 4), (0, 255, 0), -1)
     return overlay
 
-# [SECTOR: 85_NOTCH_ANGLE] ---------------------------------------------------
-# Angle is detected only from the notch. YOLO points are retained solely for
-# centre-corner and X/Y pitch selection.
+
 __all__.extend([
     "AlignedNotchGuideResult",
     "NotchAngleResult",
@@ -1390,8 +1374,8 @@ def _initial_outer_radius(
         raise RuntimeError("Wafer centre hint leaves too little room for an outer circle.")
     radii = np.linspace(max_radius * 0.55, max_radius * 0.995, max(128, int(max_radius * 0.50)))
     polar = _polar_sample(edge, center, radii, angles)
-    # A true circumference is present at the same radius over many angles.
-    # The 65th percentile rejects isolated die/street edges.
+
+
     radial_score = np.percentile(polar, 65.0, axis=0).astype(np.float32)
     radial_score = cv2.GaussianBlur(radial_score.reshape(1, -1), (11, 1), 0).reshape(-1)
     outer_bias = 0.70 + 0.30 * (radii - radii[0]) / max(1e-6, radii[-1] - radii[0])
@@ -1424,8 +1408,7 @@ def _track_outer_edge(
     angular_kernel = max(3, int(round(0.45 * samples_per_degree)) | 1)
     polar = cv2.GaussianBlur(polar, (3, angular_kernel), 0)
 
-    # Only a weak distance prior is used. At a notch the outer-circle edge is
-    # absent, so the actual inner arc must still be allowed to win.
+
     distance = np.abs(radii - float(radius))
     prior = np.exp(-distance / max(2.0, float(inward_px) * 0.55))
     scored = polar * (0.82 + 0.18 * prior[None, :])
@@ -1861,7 +1844,7 @@ def _fit_semiellipse_from_background_boundary(
     if len(depth) < 24:
         return None
 
-    # Keep the deepest exterior-boundary sample in each tangential pixel bin.
+
     bins = np.rint(tangential).astype(np.int32)
     unique_bins = np.unique(bins)
     fitted_t = []
@@ -1910,8 +1893,7 @@ def _fit_semiellipse_from_background_boundary(
     if len(fitted_t) < 18:
         return None
 
-    # Semi-ellipse linearisation: d^2 = A*t^2 + B*t + C.  Robust iterations
-    # reject texture/noise points while retaining the broad, shallow arc.
+
     origin_t = float(np.median(fitted_t))
     x = fitted_t - origin_t
     keep = np.ones(len(x), dtype=bool)
@@ -2360,10 +2342,8 @@ def _detect_semicircle_in_roi(
 
     wafer_center_array = np.asarray(wafer_center, dtype=np.float64)
     roi_center_array = np.asarray(roi_center, dtype=np.float64)
-    # The caller supplies this coordinate precisely because the hardware keeps
-    # the notch in a stable area. Give proximity real weight after the arc has
-    # passed the geometric filters; otherwise a stronger decorative/internal
-    # circle elsewhere in a large ROI can still win.
+
+
     roi_scale = max(4.0, 0.20 * minimum_half_size)
     candidate_pool: List[_LocalSemicircleCandidate] = []
     for local_x, local_y, candidate_radius in circles[0]:
@@ -2411,9 +2391,7 @@ def _detect_semicircle_in_roi(
     if not candidate_pool:
         return None
 
-    # Refine several strong coarse candidates. Decorative circles can have a
-    # slightly higher Hough score, while the true notch wins decisively after
-    # its inward arc is fitted with a low radial residual.
+
     best: Optional[_LocalSemicircleCandidate] = None
     for coarse in sorted(
         candidate_pool, key=lambda item: item.score, reverse=True
@@ -2510,8 +2488,7 @@ def detect_wafer_notch(
     else:
         work = source
 
-    # Convert once. Edge extraction uses a blurred copy while ROI background
-    # learning uses the unblurred LAB values for colour-distance segmentation.
+
     work_lab = cv2.cvtColor(work, cv2.COLOR_BGR2LAB)
     edge, edge_normaliser = _lab_edge_strength_from_lab(work_lab)
     work_height, work_width = work.shape[:2]
@@ -2593,8 +2570,8 @@ def detect_wafer_notch(
         float(background_geometry.wafer_circle_residual)
         if background_geometry is not None else float("inf")
     )
-    # Re-centre using the first harmonic of the tracked radius. The notch
-    # sector is excluded, so a wide or deep notch cannot pull the fitted circle.
+
+
     for _ in range(0 if background_geometry is not None else 4):
         fit_window = max(12.0, radius * 0.08)
         boundary, support = _track_outer_edge(
@@ -2659,8 +2636,7 @@ def detect_wafer_notch(
         1.4826 * np.median(np.abs(fit_residual - fit_residual_median))
     )
 
-    # ``baseline_window_deg`` remains accepted so old copy/paste calls do not
-    # break. Geometry fitting outside the search sector replaces that baseline.
+
     _ = baseline_window_deg
     depth_limit = (
         float(min_notch_depth_px) * scale
@@ -2670,13 +2646,11 @@ def detect_wafer_notch(
     candidate_threshold = max(
         0.50, depth_limit * 0.40, 2.5 * radial_noise
     )
-    # Do not reject a notch because its edge is weak: low contrast is exactly
-    # the difficult production case. Edge support contributes to confidence,
-    # while geometry (depth/width/area) decides whether the depression exists.
+
+
     active = search_mask & (deficit >= candidate_threshold)
-    # The notch edge can be interrupted by glare, die streets, or texture.
-    # Join only short angular gaps; this preserves one physical depression
-    # without requiring every ray to contain a strong gradient.
+
+
     bridge_kernel = max(3, int(round(0.80 * samples_per_degree)) | 1)
     half_bridge = bridge_kernel // 2
     extended_active = np.concatenate(
@@ -2728,9 +2702,7 @@ def detect_wafer_notch(
     )
     found = bool(strong_notch or wide_shallow_notch)
 
-    # The requested reference is the angular midpoint of the separated notch
-    # region, not the depth-weighted apex. Unwrap group indices so a notch
-    # crossing 0/360 degrees is handled correctly.
+
     unwrapped = np.unwrap(
         candidate_indices.astype(np.float64) * 2.0 * math.pi / angle_samples
     )
@@ -2745,8 +2717,8 @@ def detect_wafer_notch(
         float(cx + math.cos(deepest_angle) * notch_radius),
         float(cy + math.sin(deepest_angle) * notch_radius),
     )
-    # This is the user-confirmed red point: the notch centre direction at the
-    # fitted wafer outer circle, i.e. where the circle would be without a cut.
+
+
     notch_point = (
         float(cx + math.cos(notch_angle_rad) * radius),
         float(cy + math.sin(notch_angle_rad) * radius),
@@ -3258,8 +3230,8 @@ def make_notch_zoom(
     source = _load_bgr(image)
     height, width = source.shape[:2]
     crop_size = int(size_px or max(80, round(result.wafer_radius_px * 0.13)))
-    # Centre the crop between the outer reference and inner apex so both remain
-    # visible even when the outer reference is very close to the image border.
+
+
     cx = int(round((result.notch_point_px[0] + result.notch_deepest_point_px[0]) / 2.0))
     cy = int(round((result.notch_point_px[1] + result.notch_deepest_point_px[1]) / 2.0))
     x0, x1 = max(0, cx - crop_size), min(width, cx + crop_size)
@@ -3498,9 +3470,7 @@ def draw_aligned_wafer_notch_guide(
     gray = cv2.cvtColor(source, cv2.COLOR_BGR2GRAY)
     height, width = gray.shape
 
-    # V5 detect_wafer(): largest threshold component after a 25x25 close/open,
-    # followed by minEnclosingCircle. Kernel sizes remain configurable only so
-    # production images can be tuned without changing the implementation.
+
     _, wafer_mask = cv2.threshold(
         gray, int(bg_threshold), 255, cv2.THRESH_BINARY
     )
@@ -3531,8 +3501,7 @@ def draw_aligned_wafer_notch_guide(
     if wafer_radius <= 0.0:
         raise RuntimeError("V5 wafer ring radius is invalid.")
 
-    # V5 _wafer_silhouette(): optional light opening and largest connected
-    # contour. Unlike the closed mask above, this keeps the notch concavity.
+
     _, silhouette_mask = cv2.threshold(
         gray, int(bg_threshold), 255, cv2.THRESH_BINARY
     )
@@ -3681,7 +3650,7 @@ def draw_aligned_wafer_notch_guide(
     center_int = (int(round(wafer_cx)), int(round(wafer_cy)))
     radius_int = int(round(wafer_radius))
 
-    # Actual threshold contour (gray) and ideal V5 enclosing ring (cyan).
+
     cv2.drawContours(
         overlay, [wafer_contour], -1, (150, 150, 150),
         max(1, line_width // 2), cv2.LINE_AA
@@ -3701,7 +3670,7 @@ def draw_aligned_wafer_notch_guide(
             int(round(wafer_cy + wafer_radius * ratio * math.sin(angle_rad))),
         )
 
-    # Search-sector limits are magenta; aligned reference is green.
+
     for search_angle in (
         float(reference_angle_deg) - float(search_half_width_deg),
         float(reference_angle_deg) + float(search_half_width_deg),
@@ -3750,8 +3719,7 @@ def draw_aligned_wafer_notch_guide(
             (0, 0, 255), -1, cv2.LINE_AA
         )
 
-        # Draw the signed shortest arc from the green reference to the red
-        # detected direction. This is the residual angle in the aligned image.
+
         arc_count = max(8, int(abs(residual_angle) * 2.0) + 2)
         guide_angles = np.linspace(
             float(reference_angle_deg),
@@ -3909,7 +3877,7 @@ def estimate_grid_from_yolo_notch(
     )
     center = array[center_index]
 
-    # This is the essential change: axes come only from the notch correction.
+
     angle = math.radians(float(notch_correction_angle_deg))
     axis_x = np.asarray((math.cos(angle), math.sin(angle)), dtype=np.float64)
     axis_y = np.asarray((-math.sin(angle), math.cos(angle)), dtype=np.float64)
@@ -4127,9 +4095,7 @@ def build_die_map_from_yolo(
         map_pitch_x, map_pitch_y = float(pitch_values[0]), float(pitch_values[1])
         pitch_source = "manual"
 
-    # The notch angle rotates the image into its canonical orientation. The
-    # returned DM is generated in that aligned-image coordinate system with a
-    # zero grid angle; the map itself must not be rotated a second time.
+
     matrix = cv2.getRotationMatrix2D(
         notch.wafer_center_px, notch.correction_angle_deg, 1.0
     )

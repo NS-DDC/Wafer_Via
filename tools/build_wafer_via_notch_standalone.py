@@ -1,6 +1,8 @@
 """Build the copy-paste single-file notch die-map distribution."""
 
+import io
 from pathlib import Path
+import tokenize
 
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -8,6 +10,30 @@ BASE_PATH = ROOT / "codex" / "wafer_via.py"
 NOTCH_PATH = ROOT / "codex" / "wafer_notch_angle.py"
 PIPELINE_PATH = ROOT / "codex" / "wafer_via_notch.py"
 OUTPUT_PATH = ROOT / "codex" / "wafer_via_notch_standalone.py"
+
+
+def _strip_comments(source: str) -> str:
+    """Remove Python comments while preserving strings and executable code."""
+
+    lines = source.splitlines()
+    tokens = tokenize.generate_tokens(io.StringIO(source).readline)
+    for token in tokens:
+        if token.type != tokenize.COMMENT:
+            continue
+        line_index, column = token.start[0] - 1, token.start[1]
+        lines[line_index] = lines[line_index][:column].rstrip()
+
+    compact = []
+    blank_count = 0
+    for line in lines:
+        if line.strip():
+            blank_count = 0
+            compact.append(line.rstrip())
+        else:
+            blank_count += 1
+            if blank_count <= 2:
+                compact.append("")
+    return "\n".join(compact).rstrip() + "\n"
 
 
 def _remove_between(source: str, start: str, end: str) -> str:
@@ -128,6 +154,7 @@ __all__.extend([
 
 """
     output = base.rstrip() + exports + notch_tail.rstrip() + "\n\n\n" + pipeline_tail
+    output = _strip_comments(output)
     OUTPUT_PATH.write_text(output, encoding="utf-8", newline="\n")
 
 

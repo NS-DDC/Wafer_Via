@@ -1,6 +1,8 @@
+import io
 import runpy
 import tempfile
 import unittest
+import tokenize
 from pathlib import Path
 from shutil import copy2
 
@@ -100,6 +102,12 @@ class WaferNotchAngleTests(unittest.TestCase):
         self.assertNotIn("_legacy_build_die_map_from_yolo", text)
         self.assertNotIn("robust_angle_deg", text)
         self.assertNotIn("local_angle_deg", text)
+        comments = [
+            token
+            for token in tokenize.generate_tokens(io.StringIO(text).readline)
+            if token.type == tokenize.COMMENT
+        ]
+        self.assertEqual(comments, [])
         with tempfile.TemporaryDirectory() as directory:
             isolated = Path(directory) / source.name
             copy2(source, isolated)

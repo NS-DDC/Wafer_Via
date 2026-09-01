@@ -1,6 +1,8 @@
+import io
 import runpy
 import tempfile
 import unittest
+import tokenize
 from pathlib import Path
 from shutil import copy2
 
@@ -116,7 +118,12 @@ class AdaptiveBackgroundNotchTests(unittest.TestCase):
         ].rstrip()
         self.assertNotIn("import wafer_notch_angle", text)
         self.assertNotIn("import wafer_via", text)
-        self.assertIn("86_ADAPTIVE_BACKGROUND_ANGLE_OVERRIDE", text)
+        comments = [
+            token
+            for token in tokenize.generate_tokens(io.StringIO(text).readline)
+            if token.type == tokenize.COMMENT
+        ]
+        self.assertEqual(comments, [])
         self.assertIn(original_builder, text)
         with tempfile.TemporaryDirectory() as directory:
             isolated = Path(directory) / source.name
