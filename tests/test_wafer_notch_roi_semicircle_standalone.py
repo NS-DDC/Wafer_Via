@@ -346,8 +346,8 @@ class RoiSemicircleStandaloneTests(unittest.TestCase):
         self.assertEqual(dm.coordinate_space, "aligned_image")
         self.assertEqual(dm.grid_angle_deg, 0.0)
         self.assertIsNotNone(dm.aligned_image)
-        self.assertIsNotNone(dm.notch_overlay_image)
-        self.assertEqual(dm.notch_overlay_image.shape, image.shape)
+        self.assertIsNone(dm.notch_overlay_image)
+        self.assertIsNone(dm.notch_zoom_image)
         self.assertIsNotNone(dm.notch_semicircle_center_px)
         self.assertGreater(dm.notch_semicircle_score, 0.55)
 

@@ -154,8 +154,8 @@ class AdaptiveBackgroundNotchTests(unittest.TestCase):
             self.assertAlmostEqual(die_map.pitch_x, 70.0, places=5)
             self.assertAlmostEqual(die_map.pitch_y, 82.0, places=5)
             self.assertEqual(die_map.aligned_image.shape, image.shape)
-            self.assertIsNotNone(die_map.notch_overlay_image)
-            self.assertIsNotNone(die_map.notch_zoom_image)
+            self.assertIsNone(die_map.notch_overlay_image)
+            self.assertIsNone(die_map.notch_zoom_image)
             located = namespace["locate_die"](
                 die_map, point=(die_map.x0, die_map.y0)
             )

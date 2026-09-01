@@ -15,6 +15,7 @@ full wafer의 **아래쪽 외곽 원에 파인 notch**로만 회전각을 계산
 - 복붙용 단일 파일: [`codex/wafer_via_notch_standalone.py`](codex/wafer_via_notch_standalone.py)
 - 유지보수용 조립 파일: [`codex/wafer_via_notch.py`](codex/wafer_via_notch.py)
 - notch 검출/오버레이: [`codex/wafer_notch_angle.py`](codex/wafer_notch_angle.py)
+- notch-only 리팩터링·출력 성능 측정: [`codex/NOTCH_ONLY_REFACTOR_BENCHMARK_KO.md`](codex/NOTCH_ONLY_REFACTOR_BENCHMARK_KO.md)
 - 기본 YOLO/DM 상세 설명: [`codex/README.md`](codex/README.md)
 - 샘플: [`codex/sample_img/Clip_sample.png`](codex/sample_img/Clip_sample.png)
 - 테스트: [`tests/test_wafer_notch_angle.py`](tests/test_wafer_notch_angle.py) · [`tests/test_wafer_via.py`](tests/test_wafer_via.py)
@@ -33,6 +34,8 @@ dm = build_die_map_from_yolo(
     notch_search_half_width_deg=45.0,
     notch_max_dimension=4096,  # 10000x10000에서 매우 얕은 notch
     notch_failure_mode="error",  # 또는 "zero"
+    # 기본값 False: overlay/zoom 없이 aligned_image만 생성
+    return_notch_visuals=False,
 )
 ```
 
@@ -41,7 +44,9 @@ notch pipeline의 angle fallback으로 호출되지 않습니다.
 
 notch 보정각은 이미지에 적용됩니다. 반환되는 `dm.dies`와 `locate_die()`는 회전된
 `dm.aligned_image` 좌표계에서 수평·수직이며 `dm.grid_angle_deg == 0.0`입니다.
-검출 결과 이미지는 `dm.notch_overlay_image`, `dm.notch_zoom_image`로 바로 확인합니다.
+기본 결과 이미지는 `dm.aligned_image` 하나입니다. 진단할 때만
+`return_notch_visuals=True`로 설정하여 `dm.notch_overlay_image`와
+`dm.notch_zoom_image`를 만듭니다.
 정렬된 이미지 위에서 V5 방식 외곽 원·notch·잔여각 선을 확인하고 직접 정답을
 덧그리려면 `draw_aligned_wafer_notch_guide(dm.aligned_image)`를 사용하십시오.
 

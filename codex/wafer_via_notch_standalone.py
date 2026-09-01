@@ -24,7 +24,6 @@ DetectionFormat = Literal[
     "auto", "point", "point_conf", "xyxy", "xywh", "yolo_txt", "xyxy_conf_class"
 ]
 RefinementMode = Literal["auto", "gradient", "corner_color"]
-AngleMode = Literal["robust", "local"]
 
 __all__ = [
     "GridEstimate",
@@ -33,11 +32,8 @@ __all__ = [
     "inspect_yolo_results",
     "parse_yolo_points",
     "refine_cross_point",
-    "estimate_grid_from_yolo",
     "detect_wafer_boundary",
     "generate_die_map",
-    "build_die_map_from_yolo",
-    "build_die_map",
     "locate_die",
     "align_wafer_image",
     "transform_point_to_aligned",
@@ -91,15 +87,6 @@ class GridEstimate:
     center_corner_raw_clip: Optional[Point] = None
     side_corner_raw_clip: Optional[Point] = None
     below_corner_raw_clip: Optional[Point] = None
-    angle_mode: str = "local"
-    robust_angle_deg: Optional[float] = None
-    local_angle_deg: Optional[float] = None
-    angle_pairs_clip: Tuple[PointPair, ...] = ()
-    angle_pairs_raw_clip: Tuple[PointPair, ...] = ()
-    angle_pair_axes: Tuple[str, ...] = ()
-    angle_pair_angles_deg: Tuple[float, ...] = ()
-    angle_pair_residuals_deg: Tuple[float, ...] = ()
-    angle_candidate_count: int = 0
 
     @property
     def pitch_x_points_clip(self) -> PointPair:
@@ -154,15 +141,6 @@ class GridEstimate:
             "pitch_y_points_clip": self.pitch_y_points_clip,
             "pitch_x_points_raw_clip": self.pitch_x_points_raw_clip,
             "pitch_y_points_raw_clip": self.pitch_y_points_raw_clip,
-            "angle_mode": self.angle_mode,
-            "robust_angle_deg": self.robust_angle_deg,
-            "local_angle_deg": self.local_angle_deg,
-            "angle_pairs_clip": self.angle_pairs_clip,
-            "angle_pairs_raw_clip": self.angle_pairs_raw_clip,
-            "angle_pair_axes": self.angle_pair_axes,
-            "angle_pair_angles_deg": self.angle_pair_angles_deg,
-            "angle_pair_residuals_deg": self.angle_pair_residuals_deg,
-            "angle_candidate_count": self.angle_candidate_count,
         }
 
 
@@ -207,8 +185,6 @@ class WaferDieMap:
     detected_pitch_x: Optional[float] = None
     detected_pitch_y: Optional[float] = None
     pitch_source: str = "direct"
-    angle_pairs_full: Tuple[PointPair, ...] = ()
-    angle_pairs_raw_full: Tuple[PointPair, ...] = ()
     # Coordinate-space and notch diagnostics. The base builder keeps the
     # historical ``original_image`` defaults. The notch builder returns an
     # axis-aligned map in ``aligned_image`` coordinates and records the source
@@ -733,98 +709,6 @@ def _fold_grid_angle(angle_deg: float) -> float:
     return (float(angle_deg) + 45.0) % 90.0 - 45.0
 
 
-def _weighted_median(values: np.ndarray, weights: np.ndarray) -> float:
-    order = np.argsort(values)
-    sorted_values, sorted_weights = values[order], weights[order]
-    index = int(np.searchsorted(np.cumsum(sorted_weights), sorted_weights.sum() * 0.5))
-    return float(sorted_values[min(index, len(sorted_values) - 1)])
-
-
-@dataclass(frozen=True)
-class _RobustAngleEstimate:
-    angle_deg: float
-    confidence: float
-    pair_indices: Tuple[Tuple[int, int], ...]
-    pair_axes: Tuple[str, ...]
-    pair_angles_deg: Tuple[float, ...]
-    pair_residuals_deg: Tuple[float, ...]
-    candidate_count: int
-
-
-def _estimate_grid_orientation(
-    points: np.ndarray,
-    max_rotation_deg: float,
-    inlier_tolerance_deg: float,
-) -> _RobustAngleEstimate:
-    angles: List[float] = []
-    weights: List[float] = []
-    pair_indices: List[Tuple[int, int]] = []
-    pair_axes: List[str] = []
-    seen_pairs: set[Tuple[int, int]] = set()
-    neighbour_count = min(8, len(points) - 1)
-    for index, point in enumerate(points):
-        delta = points - point
-        distances = np.linalg.norm(delta, axis=1)
-        neighbours = np.argsort(distances)[1:neighbour_count + 1]
-        for neighbour_value in neighbours:
-            neighbour = int(neighbour_value)
-            pair = (min(index, neighbour), max(index, neighbour))
-            if pair in seen_pairs or distances[neighbour] < 3.0:
-                continue
-            seen_pairs.add(pair)
-            vector = points[pair[1]] - points[pair[0]]
-            folded_angle = _fold_grid_angle(
-                math.degrees(math.atan2(float(vector[1]), float(vector[0])))
-            )
-            if abs(folded_angle) > max_rotation_deg:
-                continue
-            pair_indices.append(pair)
-            pair_axes.append("x" if abs(float(vector[0])) >= abs(float(vector[1])) else "y")
-            angles.append(folded_angle)
-            # Longer grid-aligned spans are less sensitive to a 1~2 px point
-            # localisation error. sqrt prevents a long span from dominating.
-            weights.append(math.sqrt(float(distances[neighbour])))
-    if not angles:
-        raise ValueError("No horizontal/vertical YOLO point pairs were found within max_rotation_deg.")
-
-    values = np.asarray(angles, dtype=np.float64)
-    weight_array = np.asarray(weights, dtype=np.float64)
-    first = _weighted_median(values, weight_array)
-    broad_keep = np.abs(values - first) <= max(4.0, inlier_tolerance_deg * 2.0)
-    robust_angle = _weighted_median(values[broad_keep], weight_array[broad_keep])
-    residuals = np.abs(values - robust_angle)
-    inliers = residuals <= inlier_tolerance_deg
-    if not np.any(inliers):
-        inliers[int(np.argmin(residuals))] = True
-    robust_angle = _weighted_median(values[inliers], weight_array[inliers])
-    residuals = np.abs(values - robust_angle)
-    inliers = residuals <= inlier_tolerance_deg
-
-    inlier_indices = np.flatnonzero(inliers)
-    inlier_ratio = float(len(inlier_indices) / len(values))
-    inlier_spread = _weighted_median(
-        residuals[inliers], weight_array[inliers]
-    ) if np.any(inliers) else inlier_tolerance_deg
-    axes_used = {pair_axes[int(index)] for index in inlier_indices}
-    axis_coverage = 1.0 if axes_used == {"x", "y"} else 0.70
-    confidence = float(np.clip(
-        inlier_ratio
-        * math.exp(-inlier_spread / max(inlier_tolerance_deg, 1e-6))
-        * axis_coverage,
-        0.0,
-        1.0,
-    ))
-    return _RobustAngleEstimate(
-        angle_deg=float(robust_angle),
-        confidence=confidence,
-        pair_indices=tuple(pair_indices[int(index)] for index in inlier_indices),
-        pair_axes=tuple(pair_axes[int(index)] for index in inlier_indices),
-        pair_angles_deg=tuple(float(values[int(index)]) for index in inlier_indices),
-        pair_residuals_deg=tuple(float(residuals[int(index)]) for index in inlier_indices),
-        candidate_count=len(values),
-    )
-
-
 def _select_axis_neighbour(
     delta: np.ndarray,
     primary: np.ndarray,
@@ -849,165 +733,6 @@ def _select_axis_neighbour(
     if float(vector @ primary) < 0:
         vector *= -1.0
     return selected, vector
-
-
-def estimate_grid_from_yolo(
-    clip_image: ImageInput,
-    detections: Union[str, Path, np.ndarray, Sequence[Any]],
-    *,
-    reference_point_clip: Optional[Point] = None,
-    detection_format: DetectionFormat = "auto",
-    normalized: Optional[bool] = None,
-    confidence_threshold: float = 0.25,
-    refine: bool = True,
-    refine_radius: int = 18,
-    refine_mode: RefinementMode = "auto",
-    refine_max_street_width: Optional[int] = None,
-    refine_corner_patch_ratio: float = 0.22,
-    refine_corner_reference_weight: float = 0.70,
-    refine_noise_kernel: int = 5,
-    refine_min_confidence: float = 0.15,
-    angle_mode: AngleMode = "robust",
-    angle_inlier_tolerance_deg: float = 2.5,
-    max_rotation_deg: float = 20.0,
-    axis_tolerance: float = 0.18,
-    perpendicular_tolerance_px: float = 5.0,
-    max_axis_disagreement_deg: float = 3.0,
-    strict: bool = True,
-) -> GridEstimate:
-    """Select the reference-nearest corner and its side/below neighbours.
-
-    ``reference_point_clip`` is normally the detected full-wafer centre
-    transformed into clip coordinates. Standalone calls fall back to the clip
-    image centre for backwards compatibility.
-    """
-
-    if not (0.0 <= float(refine_min_confidence) <= 1.0):
-        raise ValueError("refine_min_confidence must be between 0.0 and 1.0.")
-    if angle_mode not in ("robust", "local"):
-        raise ValueError("angle_mode must be 'robust' or 'local'.")
-    if not (0.05 <= float(angle_inlier_tolerance_deg) <= 10.0):
-        raise ValueError("angle_inlier_tolerance_deg must be between 0.05 and 10.0.")
-    image = _load_bgr(clip_image)
-    height, width = image.shape[:2]
-    points = parse_yolo_points(
-        detections,
-        (width, height),
-        detection_format=detection_format,
-        normalized=normalized,
-        confidence_threshold=confidence_threshold,
-    )
-    if len(points) < 3:
-        raise ValueError(f"At least three YOLO cross-points are required; received {len(points)}.")
-    raw_points = list(points)
-    refinement_confidences = [0.0] * len(points)
-    if refine:
-        refined_points: List[Point] = []
-        refinement_confidences = []
-        for point in raw_points:
-            candidate, candidate_confidence = refine_cross_point(
-                image,
-                point,
-                search_radius=refine_radius,
-                max_street_width=refine_max_street_width,
-                mode=refine_mode,
-                corner_patch_ratio=refine_corner_patch_ratio,
-                corner_reference_weight=refine_corner_reference_weight,
-                noise_kernel=refine_noise_kernel,
-            )
-            confidence_value = float(candidate_confidence)
-            refinement_confidences.append(confidence_value)
-            refined_points.append(
-                candidate if confidence_value >= float(refine_min_confidence) else point
-            )
-        points = refined_points
-    array = np.asarray(points, dtype=np.float64)
-    selection_reference = np.asarray(
-        reference_point_clip if reference_point_clip is not None else (width / 2.0, height / 2.0),
-        dtype=np.float64,
-    ).reshape(-1)
-    if selection_reference.size != 2 or not np.all(np.isfinite(selection_reference)):
-        raise ValueError("reference_point_clip must contain two finite coordinates.")
-    center_index = int(np.argmin(np.linalg.norm(array - selection_reference, axis=1)))
-    center = array[center_index]
-    robust_angle = _estimate_grid_orientation(
-        array, max_rotation_deg, angle_inlier_tolerance_deg
-    )
-    angle = math.radians(robust_angle.angle_deg)
-    axis_x = np.array((math.cos(angle), math.sin(angle)))
-    axis_y = np.array((-math.sin(angle), math.cos(angle)))
-    delta = array - center
-    delta[center_index] = 0.0
-
-    side_index, side_vector = _select_axis_neighbour(
-        delta, axis_x, axis_y,
-        prefer_positive=True,
-        axis_tolerance=axis_tolerance,
-        perpendicular_tolerance_px=perpendicular_tolerance_px,
-    )
-    below_index, below_vector = _select_axis_neighbour(
-        delta, axis_y, axis_x,
-        prefer_positive=True,
-        axis_tolerance=axis_tolerance,
-        perpendicular_tolerance_px=perpendicular_tolerance_px,
-    )
-    if side_index == below_index:
-        raise ValueError("The same YOLO point was selected for both pitch axes.")
-
-    pitch_x = float(np.linalg.norm(side_vector))
-    pitch_y = float(np.linalg.norm(below_vector))
-    angle_x = _fold_grid_angle(math.degrees(math.atan2(side_vector[1], side_vector[0])))
-    angle_y = _fold_grid_angle(math.degrees(math.atan2(-below_vector[0], below_vector[1])))
-    disagreement = abs(angle_x - angle_y)
-    if angle_mode == "local" and strict and disagreement > max_axis_disagreement_deg:
-        raise ValueError(
-            f"X/Y angle disagreement is {disagreement:.3f} deg, above "
-            f"{max_axis_disagreement_deg:.3f} deg. Check YOLO false positives."
-        )
-    local_angle = float((angle_x + angle_y) / 2.0)
-    local_confidence = float(np.clip(
-        1.0 - disagreement / max(max_axis_disagreement_deg * 2.0, 1e-6),
-        0.0,
-        1.0,
-    ))
-    combined_angle = robust_angle.angle_deg if angle_mode == "robust" else local_angle
-    confidence = robust_angle.confidence if angle_mode == "robust" else local_confidence
-    angle_pairs = tuple(
-        (_point(array[first]), _point(array[second]))
-        for first, second in robust_angle.pair_indices
-    )
-    raw_angle_pairs = tuple(
-        (_point(raw_points[first]), _point(raw_points[second]))
-        for first, second in robust_angle.pair_indices
-    )
-    return GridEstimate(
-        points_clip=tuple(_point(point) for point in array),
-        center_corner_clip=_point(center),
-        side_corner_clip=_point(array[side_index]),
-        below_corner_clip=_point(array[below_index]),
-        pitch_x=pitch_x,
-        pitch_y=pitch_y,
-        angle_deg=combined_angle,
-        angle_x_deg=float(angle_x),
-        angle_y_deg=float(angle_y),
-        angle_confidence=confidence,
-        refined=bool(refine),
-        raw_points_clip=tuple(_point(point) for point in raw_points),
-        refinement_confidences=tuple(refinement_confidences),
-        refinement_mode=refine_mode if refine else "none",
-        center_corner_raw_clip=_point(raw_points[center_index]),
-        side_corner_raw_clip=_point(raw_points[side_index]),
-        below_corner_raw_clip=_point(raw_points[below_index]),
-        angle_mode=angle_mode,
-        robust_angle_deg=robust_angle.angle_deg,
-        local_angle_deg=local_angle,
-        angle_pairs_clip=angle_pairs,
-        angle_pairs_raw_clip=raw_angle_pairs,
-        angle_pair_axes=robust_angle.pair_axes,
-        angle_pair_angles_deg=robust_angle.pair_angles_deg,
-        angle_pair_residuals_deg=robust_angle.pair_residuals_deg,
-        angle_candidate_count=robust_angle.candidate_count,
-    )
 
 
 # [SECTOR: 40_WAFER_BOUNDARY] -------------------------------------------------
@@ -1423,14 +1148,6 @@ def transform_point_to_original(die_map: WaferDieMap, point: Point) -> Point:
 # [SECTOR: 70_OVERLAY] --------------------------------------------------------
 def make_clip_overlay(clip_image: ImageInput, estimate: GridEstimate) -> np.ndarray:
     overlay = _load_bgr(clip_image).copy()
-    if estimate.angle_pairs_clip:
-        angle_layer = overlay.copy()
-        for pair, axis in zip(estimate.angle_pairs_clip, estimate.angle_pair_axes):
-            first = tuple(np.rint(pair[0]).astype(int))
-            second = tuple(np.rint(pair[1]).astype(int))
-            colour = (255, 170, 40) if axis == "x" else (210, 80, 255)
-            cv2.line(angle_layer, first, second, colour, 1, cv2.LINE_AA)
-        overlay = cv2.addWeighted(angle_layer, 0.45, overlay, 0.55, 0.0)
     if estimate.raw_points_clip:
         for raw_point, refined_point in zip(estimate.raw_points_clip, estimate.points_clip):
             raw = tuple(np.rint(raw_point).astype(int))
@@ -1461,8 +1178,7 @@ def make_clip_overlay(clip_image: ImageInput, estimate: GridEstimate) -> np.ndar
         )
     label = (
         f"Px={estimate.pitch_x:.2f} Py={estimate.pitch_y:.2f} "
-        f"A={estimate.angle_deg:.3f}deg({estimate.angle_mode}) "
-        f"N={len(estimate.angle_pairs_clip)}/{estimate.angle_candidate_count} "
+        f"A={estimate.angle_deg:.3f}deg(notch) "
         f"R={estimate.refinement_mode}"
     )
     cv2.putText(overlay, label, (8, max(20, overlay.shape[0] - 10)),
@@ -1497,611 +1213,9 @@ def make_wafer_overlay(
                max(5, thickness * 4), (0, 255, 0), -1)
     return overlay
 
-
-# [SECTOR: 80_PIPELINE] -------------------------------------------------------
-def _legacy_build_die_map_from_yolo(
-    wafer_image: ImageInput,
-    clip_image: ImageInput,
-    detections: Union[str, Path, np.ndarray, Sequence[Any]],
-    *,
-    clip_origin: Optional[Point] = None,
-    detection_format: DetectionFormat = "auto",
-    normalized: Optional[bool] = None,
-    confidence_threshold: float = 0.25,
-    refine: bool = True,
-    refine_radius: int = 18,
-    refine_mode: RefinementMode = "auto",
-    refine_max_street_width: Optional[int] = None,
-    refine_corner_patch_ratio: float = 0.22,
-    refine_corner_reference_weight: float = 0.70,
-    refine_noise_kernel: int = 5,
-    refine_min_confidence: float = 0.15,
-    angle_mode: AngleMode = "robust",
-    angle_inlier_tolerance_deg: float = 2.5,
-    pitch_size: Optional[Tuple[float, float]] = None,
-    pixel_per_unit: float = 32.0,
-    include_edge: bool = True,
-    edge_margin: float = 1.0,
-    edge_mode: str = "circle",
-    boundary_max_dimension: int = 2048,
-    return_aligned_image: bool = True,
-    alignment_interpolation: int = cv2.INTER_CUBIC,
-    alignment_border_value: Tuple[int, int, int] = (0, 0, 0),
-) -> WaferDieMap:
-    """End-to-end entry point for a full wafer image and centre-clip YOLO output.
-
-    ``wafer_image`` and ``clip_image`` accept either an image path or an
-    already-decoded OpenCV/numpy image. For production, uint8 BGR arrays are
-    recommended. ``detections`` accepts memory arrays/lists as well as a YOLO
-    text path. See ``[SECTOR: 90_USAGE_REFERENCE]`` below for detailed examples.
-    """
-
-    wafer = _load_bgr(wafer_image)
-    clip = _load_bgr(clip_image)
-    full_height, full_width = wafer.shape[:2]
-    clip_height, clip_width = clip.shape[:2]
-    if clip_origin is None:
-        clip_origin = ((full_width - clip_width) / 2.0, (full_height - clip_height) / 2.0)
-    boundary = detect_wafer_boundary(wafer, max_dimension=boundary_max_dimension)
-    wafer_center_clip = (
-        float(boundary.center_px[0]) - float(clip_origin[0]),
-        float(boundary.center_px[1]) - float(clip_origin[1]),
-    )
-    estimate = estimate_grid_from_yolo(
-        clip, detections,
-        reference_point_clip=wafer_center_clip,
-        detection_format=detection_format,
-        normalized=normalized,
-        confidence_threshold=confidence_threshold,
-        refine=refine,
-        refine_radius=refine_radius,
-        refine_mode=refine_mode,
-        refine_max_street_width=refine_max_street_width,
-        refine_corner_patch_ratio=refine_corner_patch_ratio,
-        refine_corner_reference_weight=refine_corner_reference_weight,
-        refine_noise_kernel=refine_noise_kernel,
-        refine_min_confidence=refine_min_confidence,
-        angle_mode=angle_mode,
-        angle_inlier_tolerance_deg=angle_inlier_tolerance_deg,
-    )
-    origin_full = (clip_origin[0] + estimate.center_corner_clip[0],
-                   clip_origin[1] + estimate.center_corner_clip[1])
-    if pitch_size is None:
-        map_pitch_x, map_pitch_y = estimate.pitch_x, estimate.pitch_y
-        pitch_source = "detected"
-    else:
-        pitch_values = np.asarray(pitch_size, dtype=np.float64).reshape(-1)
-        if (
-            pitch_values.size != 2
-            or not np.all(np.isfinite(pitch_values))
-            or np.any(pitch_values <= 0.0)
-        ):
-            raise ValueError("pitch_size must be a positive finite (pitch_x, pitch_y) pair.")
-        map_pitch_x, map_pitch_y = float(pitch_values[0]), float(pitch_values[1])
-        pitch_source = "manual"
-    die_map = generate_die_map(
-        boundary, (full_height, full_width), origin_full,
-        map_pitch_x, map_pitch_y, estimate.angle_deg,
-        pixel_per_unit=pixel_per_unit,
-        include_edge=include_edge,
-        edge_margin=edge_margin,
-        edge_mode=edge_mode,
-        angle_confidence=estimate.angle_confidence,
-        grid_estimate=estimate,
-    )
-
-    def pair_to_full(pair: PointPair) -> PointPair:
-        return (
-            (
-                float(clip_origin[0]) + float(pair[0][0]),
-                float(clip_origin[1]) + float(pair[0][1]),
-            ),
-            (
-                float(clip_origin[0]) + float(pair[1][0]),
-                float(clip_origin[1]) + float(pair[1][1]),
-            ),
-        )
-
-    die_map.pitch_x_points_full = pair_to_full(estimate.pitch_x_points_clip)
-    die_map.pitch_y_points_full = pair_to_full(estimate.pitch_y_points_clip)
-    die_map.pitch_x_points_raw_full = pair_to_full(estimate.pitch_x_points_raw_clip)
-    die_map.pitch_y_points_raw_full = pair_to_full(estimate.pitch_y_points_raw_clip)
-    die_map.angle_pairs_full = tuple(pair_to_full(pair) for pair in estimate.angle_pairs_clip)
-    die_map.angle_pairs_raw_full = tuple(
-        pair_to_full(pair) for pair in estimate.angle_pairs_raw_clip
-    )
-    die_map.detected_pitch_x = float(estimate.pitch_x)
-    die_map.detected_pitch_y = float(estimate.pitch_y)
-    die_map.pitch_source = pitch_source
-    matrix, inverse = _alignment_matrices(
-        (die_map.wafer_cx, die_map.wafer_cy), die_map.grid_angle_deg
-    )
-    die_map.original_to_aligned_matrix = matrix
-    die_map.aligned_to_original_matrix = inverse
-    if return_aligned_image:
-        die_map.aligned_image, _, _ = align_wafer_image(
-            wafer,
-            (die_map.wafer_cx, die_map.wafer_cy),
-            die_map.grid_angle_deg,
-            interpolation=alignment_interpolation,
-            border_value=alignment_border_value,
-        )
-    return die_map
-
-
-build_die_map = _legacy_build_die_map_from_yolo
-
-
-# [SECTOR: 90_USAGE_REFERENCE] ------------------------------------------------
-# =============================================================================
-# 상세 사용법 (전부 주석이므로 이 파일을 통째로 복사해도 자동 실행되지 않습니다.)
-# =============================================================================
-#
-# 이 모듈의 가장 일반적인 처리 순서는 다음과 같습니다.
-#
-#   1) 10000x10000 전체 wafer 이미지를 메모리에 준비합니다.
-#   2) 전체 이미지의 중앙에서 512x512 clip을 만듭니다.
-#   3) 학습한 YOLO 모델로 clip 안의 십자점들을 검출합니다.
-#   4) 전체 이미지, clip 이미지, YOLO 좌표를 build_die_map_from_yolo()에 넣습니다.
-#   5) 반환된 dm으로 pitch/angle을 읽고 locate_die()를 호출합니다.
-#
-# 중요:
-#   - 함수 하나만 복사하면 안 됩니다. 이 wafer_via.py 파일 전체를 복사해야 합니다.
-#   - 이 파일 위쪽에 있는 numpy/cv2 import와 모든 class/helper 함수가 필요합니다.
-#   - 이미지 색상으로 십자점을 새로 찾는 구조가 아닙니다. YOLO 좌표가 기준입니다.
-#   - Python OpenCV 이미지는 일반적으로 dtype=uint8, shape=(H,W,3), BGR 순서입니다.
-#   - JPEG/PNG 압축 bytes는 cv2.imdecode()로 ndarray로 바꾼 뒤 전달합니다.
-#
-# -----------------------------------------------------------------------------
-# 예제 0. Ultralytics results/list/boxes 구조 먼저 출력하기
-# -----------------------------------------------------------------------------
-#
-# results = model(center_clip_bgr)
-# summary = inspect_yolo_results(results, max_rows=10)
-#
-# # list 길이가 1이면 일반적으로 입력 이미지가 1장이라는 뜻입니다.
-# # 실제 십자점 검출 개수는 len(results[0].boxes)로 확인합니다.
-# # 출력된 boxes.xywh 또는 boxes.data를 아래 예제처럼 detections로 변환합니다.
-#
-# -----------------------------------------------------------------------------
-# 예제 1. 전체 wafer 이미지와 중앙 512x512 clip이 모두 메모리에 있을 때
-# -----------------------------------------------------------------------------
-#
-# # wafer_bgr: 전체 원본 이미지, 예: shape=(10000, 10000, 3), dtype=uint8
-# full_h, full_w = wafer_bgr.shape[:2]
-# clip_w = 512
-# clip_h = 512
-# clip_x = (full_w - clip_w) // 2
-# clip_y = (full_h - clip_h) // 2
-#
-# # copy()는 선택입니다. view를 그대로 전달해도 현재 로직은 정상 동작합니다.
-# center_clip_bgr = wafer_bgr[
-#     clip_y:clip_y + clip_h,
-#     clip_x:clip_x + clip_w,
-# ].copy()
-#
-# # exact center clip이면 clip_origin을 생략해도 같은 값이 자동 계산됩니다.
-# clip_origin = (clip_x, clip_y)
-#
-# -----------------------------------------------------------------------------
-# 예제 2. YOLO 검출 좌표를 메모리 배열로 준비하는 방법
-# -----------------------------------------------------------------------------
-#
-# 아래 형식 중 하나를 사용합니다. 모든 좌표는 512x512 clip 기준입니다.
-# confidence_threshold보다 작은 detection은 자동 제외됩니다.
-#
-# 2-A) 십자점 중심만 있는 Nx2 형식: [x, y]
-# yolo_points = np.array([
-#     [166.2, 164.8],
-#     [256.1, 169.5],
-#     [345.9, 174.1],
-#     [161.5, 256.3],
-#     [251.4, 260.9],  # 검출된 wafer 중심에 가장 가까운 점 -> center corner 후보
-#     [341.3, 265.6],  # center corner 옆 점 -> pitch_x 계산
-#     [246.7, 352.8],  # center corner 아래 점 -> pitch_y 계산
-# ], dtype=np.float32)
-#
-# dm = build_die_map_from_yolo(
-#     wafer_image=wafer_bgr,
-#     clip_image=center_clip_bgr,
-#     detections=yolo_points,
-#     detection_format="point",   # auto도 가능
-#     normalized=False,           # x,y가 pixel 좌표이므로 False
-#     clip_origin=clip_origin,
-# )
-#
-# 2-B) 점 + 신뢰도 Nx3 형식: [x, y, confidence]
-# yolo_points_conf = np.array([
-#     [251.4, 260.9, 0.98],
-#     [341.3, 265.6, 0.96],
-#     [246.7, 352.8, 0.97],
-# ], dtype=np.float32)
-#
-# dm = build_die_map_from_yolo(
-#     wafer_bgr,
-#     center_clip_bgr,
-#     yolo_points_conf,
-#     detection_format="point_conf",  # auto도 가능
-#     normalized=False,
-#     confidence_threshold=0.25,
-#     clip_origin=clip_origin,
-# )
-#
-# 2-C) Ultralytics boxes.xyxy Nx4 형식: [x1, y1, x2, y2]
-# yolo_xyxy = results[0].boxes.xyxy.cpu().numpy()
-#
-# dm = build_die_map_from_yolo(
-#     wafer_bgr,
-#     center_clip_bgr,
-#     yolo_xyxy,
-#     detection_format="xyxy",
-#     normalized=False,
-#     clip_origin=clip_origin,
-# )
-#
-# 2-D) Ultralytics boxes.data Nx6 형식:
-#      [x1, y1, x2, y2, confidence, class]
-# yolo_data = results[0].boxes.data.cpu().numpy()
-#
-# dm = build_die_map_from_yolo(
-#     wafer_bgr,
-#     center_clip_bgr,
-#     yolo_data,
-#     detection_format="xyxy_conf_class",  # auto도 가능
-#     normalized=False,
-#     confidence_threshold=0.25,
-#     clip_origin=clip_origin,
-# )
-#
-# 2-E) 정규화 YOLO Nx5/Nx6 형식:
-#      [class, center_x, center_y, width, height, (optional confidence)]
-# yolo_normalized = np.array([
-#     [0, 0.4910, 0.5096, 0.0200, 0.0200, 0.98],
-#     [0, 0.6666, 0.5188, 0.0200, 0.0200, 0.96],
-#     [0, 0.4818, 0.6891, 0.0200, 0.0200, 0.97],
-# ], dtype=np.float32)
-#
-# dm = build_die_map_from_yolo(
-#     wafer_bgr,
-#     center_clip_bgr,
-#     yolo_normalized,
-#     detection_format="yolo_txt",  # normalized 6열은 auto 판별도 가능
-#     normalized=True,
-#     clip_origin=clip_origin,
-# )
-#
-# 주의: pixel 단위의 [class,cx,cy,w,h,confidence] 6열은 다른 6열 형식과
-#       모호하므로 detection_format="yolo_txt", normalized=False를 명시합니다.
-#
-# -----------------------------------------------------------------------------
-# 예제 3. 가장 권장하는 전체 호출 형태
-# -----------------------------------------------------------------------------
-#
-# dm = build_die_map_from_yolo(
-#     wafer_image=wafer_bgr,          # 전체 wafer BGR ndarray
-#     clip_image=center_clip_bgr,     # YOLO에 넣었던 512x512 BGR ndarray
-#     detections=yolo_data,           # YOLO 결과 ndarray/list
-#     clip_origin=(clip_x, clip_y),   # clip 왼쪽 위의 full-image 좌표
-#     detection_format="xyxy_conf_class",
-#     normalized=False,
-#     confidence_threshold=0.25,
-#     refine=True,                    # 기본값: 코너 die 색상 + Lab 경계로 중심 보정
-#     refine_mode="auto",            # auto | corner_color | gradient
-#     refine_radius=18,               # YOLO 중심 주변 탐색 반경(px)
-#     refine_min_confidence=0.15,     # 이보다 낮으면 YOLO 원좌표 유지
-#     angle_mode="robust",           # robust=전체 점, local=기존 P0/PX/PY
-#     angle_inlier_tolerance_deg=2.5,
-#     pitch_size=None,               # None=자동, 또는 (pitch_x, pitch_y)
-#     pixel_per_unit=32.0,            # 실좌표 환산용 px/unit
-#     include_edge=True,              # wafer 외곽의 partial die도 map에 포함
-#     edge_margin=1.0,
-#     edge_mode="circle",            # circle | ring | both
-#     boundary_max_dimension=2048,    # 외곽선 검출용 downscale 상한
-#     return_aligned_image=True,      # angle 보정된 full image를 dm에 저장
-# )
-#
-# exact center clip이면 clip_origin은 생략할 수 있습니다.
-# 하지만 생산 코드에서는 clip 위치 실수를 방지하기 위해 명시하는 것을 권장합니다.
-# 전체 image 중심과 실제 wafer 중심이 달라도 괜찮습니다. build_die_map_from_yolo()는
-# 먼저 wafer 외곽선을 검출하고, wafer 중심을 clip 좌표로 변환한 뒤 가장 가까운
-# YOLO 십자점을 (0,0) grid origin으로 선택합니다.
-#
-# -----------------------------------------------------------------------------
-# 예제 4. 반환값에서 center corner, pitch, angle 확인
-# -----------------------------------------------------------------------------
-#
-# print("wafer center:", (dm.wafer_cx, dm.wafer_cy))
-# print("wafer radius:", dm.wafer_r)
-# print("center corner(full image):", (dm.x0, dm.y0))
-# print("pitch_x:", dm.pitch_x)
-# print("pitch_y:", dm.pitch_y)
-# print("pitch source:", dm.pitch_source)  # detected / manual
-# print("detected pitch:", (dm.detected_pitch_x, dm.detected_pitch_y))
-# print("pitch_x points(full):", dm.pitch_x_points_full)
-# print("pitch_y points(full):", dm.pitch_y_points_full)
-# print("pitch_x raw points(full):", dm.pitch_x_points_raw_full)
-# print("pitch_y raw points(full):", dm.pitch_y_points_raw_full)
-# print("grid angle(deg):", dm.grid_angle_deg)
-# print("angle confidence:", dm.angle_confidence)
-# print("angle pairs(full):", dm.angle_pairs_full)
-# print("angle pairs raw(full):", dm.angle_pairs_raw_full)
-# print("number of dies:", dm.num_dies)
-# print("full image shape:", dm.image_shape)
-# print("aligned image:", None if dm.aligned_image is None else dm.aligned_image.shape)
-#
-# # 512 clip 안에서 실제 선택된 세 점도 확인할 수 있습니다.
-# estimate = dm.grid_estimate
-# if estimate is not None:
-#     print("center corner in clip:", estimate.center_corner_clip)
-#     print("side corner in clip:", estimate.side_corner_clip)
-#     print("below corner in clip:", estimate.below_corner_clip)
-#     print("pitch_x points(clip):", estimate.pitch_x_points_clip)
-#     print("pitch_y points(clip):", estimate.pitch_y_points_clip)
-#     print("pitch_x raw points(clip):", estimate.pitch_x_points_raw_clip)
-#     print("pitch_y raw points(clip):", estimate.pitch_y_points_raw_clip)
-#     print("angle from X vector:", estimate.angle_x_deg)
-#     print("angle from Y vector:", estimate.angle_y_deg)
-#     print("robust angle:", estimate.robust_angle_deg)
-#     print("local angle:", estimate.local_angle_deg)
-#     print("angle pairs(clip):", estimate.angle_pairs_clip)
-#     print("angle pair axes:", estimate.angle_pair_axes)
-#     print("angle pair residuals:", estimate.angle_pair_residuals_deg)
-#
-# angle 규칙:
-#   - angle > 0이면 오른쪽 이웃으로 갈수록 영상의 Y가 증가하는 기울기입니다.
-#   - 같은 +angle 값을 cv2.getRotationMatrix2D에 사용하면 수평 보정할 수 있습니다.
-#   - die lattice와 locate_die()는 원본 이미지 좌표계를 유지합니다.
-#   - dm.aligned_image에는 angle이 보정된 full image가 별도로 들어 있습니다.
-#   - 보정 이미지의 좌표는 transform_point_to_original()로 되돌린 뒤 locate_die()에 넣습니다.
-#
-# -----------------------------------------------------------------------------
-# 예제 5. full-image의 point 좌표로 die index 찾기
-# -----------------------------------------------------------------------------
-#
-# result = locate_die(dm, point=(5499, 4700))
-#
-# print("die index:", result["die_index"])
-# print("query point:", result["query_px"])
-# print("die center:", result["die_center_px"])
-# print("die polygon:", result["die_polygon_px"])
-# print("die bounding rect:", result["die_rect_px"])
-# print("real coordinate:", result["real_coord"])
-# print("inside wafer:", result["in_wafer"])
-# print("edge die:", result["is_edge"])
-#
-# index 규칙:
-#   - ix + 방향 = 영상 오른쪽
-#   - iy + 방향 = 영상 위쪽
-#   - 회전각이 있어도 위 규칙은 grid 축 기준으로 유지됩니다.
-#   - include_edge=True이면 중심이 wafer/image 밖이어도 일부가 wafer에 걸치는
-#     die index는 유지됩니다.
-#   - polygon_px는 index용 전체 polygon, wafer_polygon_px는 wafer 외곽 절단 결과,
-#     visible_polygon_px는 wafer와 이미지 범위로 모두 절단한 결과입니다.
-#
-# -----------------------------------------------------------------------------
-# 예제 6. 검사/불량 BBox 중심이 어느 die인지 찾기
-# -----------------------------------------------------------------------------
-#
-# defect_bbox = (4880, 5080, 4980, 5180)  # full-image x1,y1,x2,y2
-# result = locate_die(dm, bbox=defect_bbox)
-# print(result["die_index"])
-#
-# point와 bbox를 동시에 넣으면 안 됩니다. 둘 중 정확히 하나만 지정합니다.
-# bbox는 내부적으로 중심 좌표를 계산해서 해당 die를 찾습니다.
-#
-# -----------------------------------------------------------------------------
-# 예제 7. index로 이미 생성된 die 정보 직접 조회
-# -----------------------------------------------------------------------------
-#
-# die = dm.get_die(ix=2, iy=-3)
-# if die is not None:
-#     print(die["center_px"])
-#     print(die["polygon_px"])
-#     print(die["is_edge_partial"])
-#     print(die["is_edge_ring"])
-#
-# -----------------------------------------------------------------------------
-# 예제 8. 512 clip에서 center/side/below 선택 결과 오버레이
-# -----------------------------------------------------------------------------
-#
-# if dm.grid_estimate is not None:
-#     clip_overlay = make_clip_overlay(center_clip_bgr, dm.grid_estimate)
-#     cv2.imwrite("clip_grid_overlay.png", clip_overlay)
-#
-# overlay 색상:
-#   - 초록점: 선택된 center corner
-#   - 파란 화살표: pitch_x를 만든 옆 점 방향
-#   - 자홍 화살표: pitch_y를 만든 아래 점 방향
-#   - 흰색 빈 원: 보정 전 YOLO bbox 중심
-#   - 회색 선: 보정 전 중심에서 보정 후 중심까지의 이동량
-#   - 노란점: 실제 pitch/angle 계산에 사용한 보정 후 십자점
-#
-# -----------------------------------------------------------------------------
-# 예제 8-B. angle 보정된 full image 저장과 좌표 변환
-# -----------------------------------------------------------------------------
-#
-# # return_aligned_image=True가 기본값입니다.
-# if dm.aligned_image is not None:
-#     cv2.imwrite("wafer_aligned.png", dm.aligned_image)
-#
-# # 원본 좌표 -> angle 보정 이미지 좌표
-# original_point = (5499.0, 4700.0)
-# aligned_point = transform_point_to_aligned(dm, original_point)
-#
-# # angle 보정 이미지 좌표 -> 원본 좌표
-# restored_point = transform_point_to_original(dm, aligned_point)
-#
-# # locate_die()는 원본 좌표를 받으므로 aligned image에서 검출한 점은 되돌립니다.
-# aligned_defect = (5503.2, 4691.8)
-# original_defect = transform_point_to_original(dm, aligned_defect)
-# result = locate_die(dm, point=original_defect)
-#
-# # 10000x10000 BGR 보정 이미지의 추가 메모리가 부담되면 다음 옵션을 사용합니다.
-# dm_without_aligned = build_die_map_from_yolo(
-#     wafer_bgr,
-#     center_clip_bgr,
-#     yolo_data,
-#     clip_origin=clip_origin,
-#     detection_format="xyxy_conf_class",
-#     return_aligned_image=False,
-# )
-# # 이 경우 aligned_image만 None이며 좌표 변환 matrix는 계속 반환됩니다.
-#
-# -----------------------------------------------------------------------------
-# 예제 9. full wafer 외곽선 + 전체 die map 오버레이
-# -----------------------------------------------------------------------------
-#
-# wafer_overlay = make_wafer_overlay(
-#     wafer_bgr,
-#     dm,
-#     draw_dies=True,
-#     thickness=1,
-# )
-# cv2.imwrite("wafer_die_map_overlay.png", wafer_overlay)
-#
-# 주의: 10000x10000 uint8 BGR 원본은 약 300MB입니다.
-# 기본 aligned_image가 약 300MB, make_wafer_overlay() 출력도 약 300MB가 추가됩니다.
-# 메모리가 부족하면 draw_dies=False로 외곽선/기준점만 확인하거나 작은 preview를 씁니다.
-#
-# -----------------------------------------------------------------------------
-# 예제 10. 노이즈가 심하고 YOLO 중심좌표가 street 중앙에서 벗어난 경우
-# -----------------------------------------------------------------------------
-#
-# dm = build_die_map_from_yolo(
-#     wafer_bgr,
-#     center_clip_bgr,
-#     yolo_data,
-#     clip_origin=clip_origin,
-#     detection_format="xywh",
-#     refine=True,
-#     refine_mode="auto",
-#     refine_radius=24,               # 예상 bbox 오차보다 조금 크게 설정
-#     refine_corner_patch_ratio=0.22,
-#     refine_corner_reference_weight=0.70,
-#     refine_noise_kernel=5,
-#     refine_min_confidence=0.15,
-# )
-#
-# refine=False:
-#   - 학습 모델의 bbox 중심을 신뢰하고 색상 영향을 전혀 받지 않습니다.
-#   - 보정 전/후 결과 비교 또는 영상에 실제 street가 보이지 않을 때 사용합니다.
-#
-# refine=True (기본값), refine_mode="auto":
-#   1) 각 YOLO 점 주변 ROI의 네 꼭짓점 patch에서 die 대표색을 각각 median으로 학습합니다.
-#   2) 네 die 대표색 중 어느 것과도 다른 픽셀을 street 후보로 만듭니다.
-#   3) median filter와 X/Y projection으로 강한 점 노이즈를 억제하고 교차 중심을 찾습니다.
-#   4) 동시에 Lab 양방향 경계쌍으로 구한 중심과 결합합니다.
-#   5) 보정 confidence가 refine_min_confidence보다 낮으면 YOLO 원좌표를 그대로 씁니다.
-#
-# 색상 관련 중요 사항:
-#   - 특정 빨강/초록/파랑 hue나 고정 RGB/HSV threshold를 사용하지 않습니다.
-#   - 네 corner die가 서로 다른 색이어도 각각을 reference로 사용합니다.
-#   - street 색이 corner die 중 하나와 비슷하면 corner_color confidence가 낮아지고
-#     auto가 Lab gradient 결과를 사용합니다.
-#
-# 모드 선택:
-#   - auto: 기본 권장. corner_color와 gradient를 함께 사용합니다.
-#   - corner_color: 네 corner die 색상과 다른 band만 사용합니다.
-#   - gradient: 기존 Lab 경계쌍 방식만 사용합니다.
-#
-# 튜닝 순서:
-#   - 실제 중심이 탐색 범위 밖이면 refine_radius를 키웁니다(예: 18 -> 24/30).
-#   - salt-and-pepper 노이즈가 강하면 refine_noise_kernel을 5 또는 7로 둡니다.
-#   - die 내부 무늬가 corner patch를 많이 차지하면 refine_corner_patch_ratio를
-#     0.15~0.28 범위에서 조정합니다.
-#   - make_clip_overlay()로 흰 원 -> 노란 점 이동 방향을 반드시 확인합니다.
-#
-# 보정 상세값:
-# estimate = dm.grid_estimate
-# print(estimate.raw_points_clip)          # 보정 전 YOLO 중심들
-# print(estimate.points_clip)              # 실제 계산에 사용된 보정 후 중심들
-# print(estimate.refinement_confidences)   # 점별 보정 confidence
-# print(estimate.refinement_mode)          # auto / corner_color / gradient / none
-#
-# -----------------------------------------------------------------------------
-# 예제 11. 중앙이 아닌 위치에서 512 clip을 만든 경우
-# -----------------------------------------------------------------------------
-#
-# clip_x = 4200
-# clip_y = 4650
-# center_clip_bgr = wafer_bgr[clip_y:clip_y + 512, clip_x:clip_x + 512]
-#
-# dm = build_die_map_from_yolo(
-#     wafer_bgr,
-#     center_clip_bgr,
-#     yolo_data,
-#     clip_origin=(clip_x, clip_y),  # 반드시 실제 clip 왼쪽 위 좌표
-#     detection_format="xyxy_conf_class",
-# )
-#
-# clip_origin을 잘못 넣으면 pitch와 angle은 맞아도 full-image center corner와 모든
-# die 좌표가 같은 양만큼 이동하므로 반드시 실제 crop 위치와 일치시킵니다.
-#
-# -----------------------------------------------------------------------------
-# 예제 12. JPEG/PNG 압축 bytes가 메모리에 있을 때
-# -----------------------------------------------------------------------------
-#
-# # encoded_wafer_bytes / encoded_clip_bytes가 bytes 또는 bytearray라고 가정합니다.
-# wafer_buffer = np.frombuffer(encoded_wafer_bytes, dtype=np.uint8)
-# clip_buffer = np.frombuffer(encoded_clip_bytes, dtype=np.uint8)
-# wafer_bgr = cv2.imdecode(wafer_buffer, cv2.IMREAD_COLOR)
-# center_clip_bgr = cv2.imdecode(clip_buffer, cv2.IMREAD_COLOR)
-# if wafer_bgr is None or center_clip_bgr is None:
-#     raise ValueError("이미지 bytes decode 실패")
-#
-# dm = build_die_map_from_yolo(wafer_bgr, center_clip_bgr, yolo_data)
-#
-# -----------------------------------------------------------------------------
-# 예제 13. 자주 발생하는 오류와 확인할 값
-# -----------------------------------------------------------------------------
-#
-# ValueError: At least three YOLO cross-points are required
-#   -> confidence_threshold 이후 남은 점이 center/side/below 최소 3개보다 적습니다.
-#
-# ValueError: The centre corner has no usable neighbour on one grid axis
-#   -> center 기준 옆 또는 아래 점이 없거나 false positive 때문에 축 방향이 깨졌습니다.
-#
-# ValueError: X/Y angle disagreement ...
-#   -> 옆 벡터와 아래 벡터가 직교 grid로 설명되지 않습니다.
-#      YOLO 좌표, class filtering, 중복 검출을 확인합니다.
-#
-# RuntimeError: Wafer boundary was not found
-#   -> wafer/background 대비가 너무 낮거나 wafer 면적이 기본 허용 범위를 벗어났습니다.
-#
-# 결과 승인 전 확인 권장:
-#   1) dm.grid_estimate.center_corner_clip이 실제 중앙 십자점인지
-#   2) side_corner_clip이 같은 row의 바로 옆 점인지
-#   3) below_corner_clip이 같은 column의 바로 아래 점인지
-#   4) pitch_x/pitch_y가 실제 die 간격과 일치하는지
-#   5) robust/local angle 차이와 angle_pair_residuals_deg가 작은지
-#   6) clip overlay와 wafer overlay가 실제 street/grid에 맞는지
-#
-# [고정 좌표 ROI에서 반원/얕은 반타원 notch로 angle 보정]
-# 장비에서 notch 위치가 늘 비슷하면 아래 두 값만 실제 full wafer 좌표로
-# 지정하는 것이 권장됩니다. ROI 밖의 외곽 함몰은 angle 후보가 될 수 없습니다.
-#
-#   dm = build_die_map_from_yolo(
-#       wafer_image=wafer_bgr,
-#       clip_image=center_clip_bgr,
-#       detections=yolo_points,
-#       detection_format="point",
-#       notch_roi_center_px=(5000, 9650),       # 예상 notch 중심 (x, y)
-#       notch_roi_half_size_px=(600, 600),      # 좌우/상하 반경, 실제값에 맞게 조절
-#       # 선택: 실제 notch 반지름 범위를 알 때 오검출을 더 줄임
-#       notch_semicircle_radius_range_px=(60, 300),
-#       notch_failure_mode="error",
-#   )
-#
-# ``notch_roi_center_px``는 축소 영상 좌표가 아니라 원본 ``wafer_image`` 좌표입니다.
-# image5의 10000x10000 샘플은 대략 (5000, 9650)을 사용했지만 실제 장비 영상에서는
-# overlay의 자홍색 ROI/십자와 하늘색 arc 표시를 보고 좌표와 크기를 조정하십시오.
-# 검출 결과는 dm.notch_result.roi_bounds_px, semicircle_center_px,
-# semicircle_radius_px, semicircle_score, semicircle_fit_residual_px에서
-# 확인할 수 있습니다.
-
 # [SECTOR: 85_NOTCH_ANGLE] ---------------------------------------------------
-# The notch detector and notch-only DM builder are embedded below. The legacy
-# YOLO angle helpers above are never called by the exported builder.
+# Angle is detected only from the notch. YOLO points are retained solely for
+# centre-corner and X/Y pitch selection.
 __all__.extend([
     "AlignedNotchGuideResult",
     "NotchAngleResult",
@@ -2110,8 +1224,9 @@ __all__.extend([
     "draw_aligned_wafer_notch_guide",
     "make_notch_overlay",
     "make_notch_zoom",
-    "make_notch_background_debug_contact_sheet",
     "estimate_grid_from_yolo_notch",
+    "build_die_map_from_yolo",
+    "build_die_map",
 ])
 
 @dataclass(frozen=True)
@@ -4845,15 +3960,6 @@ def estimate_grid_from_yolo_notch(
         center_corner_raw_clip=_point(raw_points[center_index]),
         side_corner_raw_clip=_point(raw_points[side_index]),
         below_corner_raw_clip=_point(raw_points[below_index]),
-        angle_mode="notch",
-        robust_angle_deg=float(notch_correction_angle_deg),
-        local_angle_deg=float((angle_x + angle_y) / 2.0),
-        angle_pairs_clip=(),
-        angle_pairs_raw_clip=(),
-        angle_pair_axes=(),
-        angle_pair_angles_deg=(),
-        angle_pair_residuals_deg=(),
-        angle_candidate_count=0,
     )
 
 
@@ -4902,7 +4008,7 @@ def build_die_map_from_yolo(
     notch_background_morph_px: float = 24.0,
     notch_failure_mode: Literal["error", "zero"] = "error",
     return_aligned_image: bool = True,
-    return_notch_visuals: bool = True,
+    return_notch_visuals: bool = False,
     notch_visual_max_dimension: int = 5000,
     notch_zoom_size_px: Optional[int] = 256,
     notch_zoom_scale: float = 2.0,
@@ -4913,12 +4019,8 @@ def build_die_map_from_yolo(
 
     The notch detector does not require a black background. It fits the wafer
     circle from colour-gradient geometry outside the expected notch sector.
-    Set ``notch_roi_center_px=(x, y)`` to force the final notch calculation
-    into a stable full-image coordinate area. In ROI mode an inward-facing
-    local semicircle or semi-ellipse, rather than any depression in the wide
-    sector, supplies the correction angle. ``notch_roi_half_size_px`` controls
-    that area. ``notch_semicircle_radius_range_px`` retains its historical
-    name and constrains the horizontal half-width for a semi-ellipse.
+    Set ``notch_roi_center_px=(x, y)`` to constrain the final angle source to
+    the local inward semicircle or semi-ellipse inside that full-image ROI.
 
     If the automatic circle is wrong on production data, pass full-image
     ``notch_wafer_center_hint_px=(x, y)`` and
@@ -4928,10 +4030,10 @@ def build_die_map_from_yolo(
     coordinate system and therefore have ``dm.grid_angle_deg == 0``. The
     applied image rotation is ``dm.image_rotation_deg``; original coordinates
     are preserved through the affine matrices and ``source_*`` fields.
-    Detailed diagnostics and images are returned as ``dm.notch_result``,
-    ``dm.notch_overlay_image``, and ``dm.notch_zoom_image``. The angle-result
-    overlay is capped at ``notch_visual_max_dimension=5000`` by default, so a
-    10000x10000 square source returns a 5000x5000 ``notch_overlay_image``.
+    By default the only generated result image is ``dm.aligned_image``.
+    Numeric notch diagnostics remain in ``dm.notch_result`` without drawing
+    any image. Set ``return_notch_visuals=True`` only while debugging to also
+    create ``dm.notch_overlay_image`` and ``dm.notch_zoom_image``.
     """
 
     if return_notch_visuals:
@@ -5092,8 +4194,6 @@ def build_die_map_from_yolo(
     die_map.source_pitch_y_points_full = source_pitch_y_points
     die_map.source_pitch_x_points_raw_full = source_pitch_x_points_raw
     die_map.source_pitch_y_points_raw_full = source_pitch_y_points_raw
-    die_map.angle_pairs_full = ()
-    die_map.angle_pairs_raw_full = ()
     die_map.detected_pitch_x = float(estimate.pitch_x)
     die_map.detected_pitch_y = float(estimate.pitch_y)
     die_map.pitch_source = pitch_source

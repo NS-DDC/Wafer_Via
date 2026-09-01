@@ -43,8 +43,8 @@ dm = build_die_map_from_yolo(
     # 검출된 notch를 정렬 후 6시 방향에 둡니다.
     notch_reference_angle_deg=90.0,
 
-    # angle 결과 오버레이를 5000×5000으로 반환합니다.
-    notch_visual_max_dimension=5000,
+    # 기본값 False: angle 보정된 aligned_image만 생성합니다.
+    return_notch_visuals=False,
 
     # 잘못된 angle로 계속 진행하지 않도록 운영에서는 error를 권장합니다.
     notch_failure_mode="error",
@@ -139,6 +139,11 @@ print(dm.grid_angle_deg)     # 0.0
 ```python
 import cv2
 
+dm = build_die_map_from_yolo(
+    ...,
+    return_notch_visuals=True,      # 진단할 때만 켭니다.
+    notch_visual_max_dimension=5000,
+)
 cv2.imwrite("notch_roi_overview_5000.png", dm.notch_overlay_image)
 cv2.imwrite("notch_roi_zoom.png", dm.notch_zoom_image)
 cv2.imwrite("wafer_aligned.png", dm.aligned_image)

@@ -44,7 +44,15 @@ except ImportError:
 ImageInput = Union[str, Path, np.ndarray]
 Point = Tuple[float, float]
 
-__all__ = list(_base.__all__) + [
+_NOTCH_ONLY_EXCLUDED_EXPORTS = {
+    "estimate_grid_from_yolo",
+    "build_die_map_from_yolo",
+    "build_die_map",
+}
+
+__all__ = [
+    name for name in _base.__all__ if name not in _NOTCH_ONLY_EXCLUDED_EXPORTS
+] + [
     "AlignedNotchGuideResult",
     "NotchAngleResult",
     "detect_wafer_notch",
@@ -196,14 +204,6 @@ def estimate_grid_from_yolo_notch(
         side_corner_raw_clip=_base._point(raw_points[side_index]),
         below_corner_raw_clip=_base._point(raw_points[below_index]),
         angle_mode="notch",
-        robust_angle_deg=float(notch_correction_angle_deg),
-        local_angle_deg=float((angle_x + angle_y) / 2.0),
-        angle_pairs_clip=(),
-        angle_pairs_raw_clip=(),
-        angle_pair_axes=(),
-        angle_pair_angles_deg=(),
-        angle_pair_residuals_deg=(),
-        angle_candidate_count=0,
     )
 
 
@@ -240,10 +240,20 @@ def build_die_map_from_yolo(
     notch_search_half_width_deg: float = 45.0,
     notch_wafer_center_hint_px: Optional[Point] = None,
     notch_wafer_radius_hint_px: Optional[float] = None,
+    notch_roi_center_px: Optional[Point] = None,
+    notch_roi_half_size_px: Union[float, Tuple[float, float]] = 600.0,
+    notch_semicircle_radius_range_px: Optional[Tuple[float, float]] = None,
+    notch_semicircle_min_score: float = 0.55,
+    notch_use_roi_background: bool = True,
+    notch_background_palette_size: int = 3,
+    notch_background_outer_band_fraction: float = 0.28,
+    notch_background_distance_threshold_lab: Optional[float] = None,
+    notch_background_noise_margin_lab: float = 4.0,
+    notch_background_morph_px: float = 24.0,
     notch_failure_mode: Literal["error", "zero"] = "error",
     return_aligned_image: bool = True,
-    return_notch_visuals: bool = True,
-    notch_visual_max_dimension: int = 2048,
+    return_notch_visuals: bool = False,
+    notch_visual_max_dimension: int = 5000,
     notch_zoom_size_px: Optional[int] = 256,
     notch_zoom_scale: float = 2.0,
     alignment_interpolation: int = cv2.INTER_CUBIC,
@@ -252,9 +262,9 @@ def build_die_map_from_yolo(
     """Build a die map with the wafer notch as the sole angle source.
 
     The notch detector does not require a black background. It fits the wafer
-    circle from colour-gradient geometry outside the expected notch sector,
-    then searches only ``notch_search_center_angle_deg +/-
-    notch_search_half_width_deg`` for a continuous inward depression.
+    circle from colour-gradient geometry outside the expected notch sector.
+    Set ``notch_roi_center_px=(x, y)`` to constrain the final angle source to
+    the local inward semicircle or semi-ellipse inside that full-image ROI.
 
     If the automatic circle is wrong on production data, pass full-image
     ``notch_wafer_center_hint_px=(x, y)`` and
@@ -264,8 +274,10 @@ def build_die_map_from_yolo(
     coordinate system and therefore have ``dm.grid_angle_deg == 0``. The
     applied image rotation is ``dm.image_rotation_deg``; original coordinates
     are preserved through the affine matrices and ``source_*`` fields.
-    Detailed diagnostics and images are returned as ``dm.notch_result``,
-    ``dm.notch_overlay_image``, and ``dm.notch_zoom_image``.
+    By default the only generated result image is ``dm.aligned_image``.
+    Numeric notch diagnostics remain in ``dm.notch_result`` without drawing
+    any image. Set ``return_notch_visuals=True`` only while debugging to also
+    create ``dm.notch_overlay_image`` and ``dm.notch_zoom_image``.
     """
 
     if return_notch_visuals:
@@ -291,6 +303,16 @@ def build_die_map_from_yolo(
         search_half_width_deg=notch_search_half_width_deg,
         wafer_center_hint_px=notch_wafer_center_hint_px,
         wafer_radius_hint_px=notch_wafer_radius_hint_px,
+        notch_roi_center_px=notch_roi_center_px,
+        notch_roi_half_size_px=notch_roi_half_size_px,
+        notch_semicircle_radius_range_px=notch_semicircle_radius_range_px,
+        notch_semicircle_min_score=notch_semicircle_min_score,
+        notch_use_roi_background=notch_use_roi_background,
+        notch_background_palette_size=notch_background_palette_size,
+        notch_background_outer_band_fraction=notch_background_outer_band_fraction,
+        notch_background_distance_threshold_lab=notch_background_distance_threshold_lab,
+        notch_background_noise_margin_lab=notch_background_noise_margin_lab,
+        notch_background_morph_px=notch_background_morph_px,
         failure_mode=notch_failure_mode,
     )
     if clip_origin is None:
@@ -416,8 +438,6 @@ def build_die_map_from_yolo(
     die_map.source_pitch_y_points_full = source_pitch_y_points
     die_map.source_pitch_x_points_raw_full = source_pitch_x_points_raw
     die_map.source_pitch_y_points_raw_full = source_pitch_y_points_raw
-    die_map.angle_pairs_full = ()
-    die_map.angle_pairs_raw_full = ()
     die_map.detected_pitch_x = float(estimate.pitch_x)
     die_map.detected_pitch_y = float(estimate.pitch_y)
     die_map.pitch_source = pitch_source
@@ -451,6 +471,20 @@ def build_die_map_from_yolo(
     die_map.notch_circle_fit_residual_px = notch.circle_fit_residual_px
     die_map.notch_search_center_angle_deg = notch.search_center_angle_deg
     die_map.notch_search_half_width_deg = notch.search_half_width_deg
+    die_map.notch_roi_center_px = notch.roi_center_px
+    die_map.notch_roi_bounds_px = notch.roi_bounds_px
+    die_map.notch_semicircle_center_px = notch.semicircle_center_px
+    die_map.notch_semicircle_radius_px = notch.semicircle_radius_px
+    die_map.notch_semicircle_radius_x_px = notch.semicircle_radius_x_px
+    die_map.notch_semicircle_radius_y_px = notch.semicircle_radius_y_px
+    die_map.notch_semicircle_shape = notch.semicircle_shape
+    die_map.notch_semicircle_score = notch.semicircle_score
+    die_map.notch_semicircle_fit_residual_px = notch.semicircle_fit_residual_px
+    die_map.notch_background_segmentation_used = notch.background_segmentation_used
+    die_map.notch_background_palette_bgr = notch.background_palette_bgr
+    die_map.notch_background_distance_threshold_lab = (
+        notch.background_distance_threshold_lab
+    )
     die_map.notch_correction_angle_deg = float(notch.correction_angle_deg)
     die_map.notch_point_aligned_px = _affine_point(matrix, notch.notch_point_px)
     die_map.notch_deepest_point_aligned_px = _affine_point(

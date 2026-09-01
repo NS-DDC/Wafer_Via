@@ -112,8 +112,8 @@ print(dm.notch_result.circle_fit_residual_px)  # 기준 원 fitting 잔차
 print(dm.notch_result.search_center_angle_deg)
 print(dm.notch_result.search_half_width_deg)
 
-print(dm.notch_overlay_image)            # 원본 영상 위 notch 전체 진단 overlay
-print(dm.notch_zoom_image)               # notch 주변 확대 진단 이미지
+print(dm.notch_overlay_image)            # 기본 None, 진단 모드에서만 생성
+print(dm.notch_zoom_image)               # 기본 None, 진단 모드에서만 생성
 print(dm.notch_point_aligned_px)         # aligned_image 좌표의 notch 기준점
 
 print(dm.pitch_x, dm.pitch_y)
@@ -268,8 +268,8 @@ V5 방식은 기본적으로 배경을 `gray <= 20`으로 간주합니다. 기�
 | `notch_wafer_radius_hint_px` | `None` | 자동 원 검출이 틀릴 때 넣는 full wafer 이미지 반지름 px |
 | `notch_failure_mode` | `"error"` | 미검출 시 `"error"`는 예외, `"zero"`는 보정각 0 반환 |
 | `return_aligned_image` | `True` | notch 보정된 full wafer 이미지를 `dm.aligned_image`로 반환 |
-| `return_notch_visuals` | `True` | notch 전체 overlay와 확대 이미지를 반환 |
-| `notch_visual_max_dimension` | `2048` | 전체 overlay의 최대 변 길이. 10000px 원본 메모리 절감용 |
+| `return_notch_visuals` | `False` | 기본은 보정 이미지만 반환. `True`일 때만 overlay와 확대 이미지 생성 |
+| `notch_visual_max_dimension` | `5000` | 진단 모드 전체 overlay의 최대 변 길이 |
 | `notch_zoom_size_px` | `256` | 원본 좌표에서 notch 확대 crop의 반쪽 크기 |
 | `notch_zoom_scale` | `2.0` | notch 확대 이미지 배율 |
 
@@ -313,6 +313,10 @@ notch 검출 함수만 직접 호출할 때는 `failure_mode="zero"`로 같은 �
 4. 기준 원부터 틀렸다면 depth threshold를 바꾸기 전에 중심/반지름 hint를 넣습니다.
 
 ```python
+dm = build_die_map_from_yolo(
+    ...,
+    return_notch_visuals=True,
+)
 cv2.imwrite("notch_overview.png", dm.notch_overlay_image)
 cv2.imwrite("notch_zoom.png", dm.notch_zoom_image)
 cv2.imwrite("wafer_aligned.png", dm.aligned_image)
