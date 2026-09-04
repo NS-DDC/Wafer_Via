@@ -17,12 +17,12 @@ IO_FOOTER = """
 # clip_image: YOLO를 실행한 중심 clip 경로 또는 BGR ndarray
 # detections: YOLO 중심점/box의 numpy 배열 또는 list
 # clip_origin: 중심 clip이 아닐 때 전체 이미지 기준 좌상단 (x, y)
-# notch_roi_center_px: 선택 사항, 전체 이미지 기준 예상 notch 중심 (x, y)
+# notch_roi_center_px: 원본 좌표 (x, y); notch_fallback_mode="rim_intrusion"(기본, 실패시만)/"none"
 # OUTPUT
 # 반환값: WaferDieMap
 # dm.aligned_image: notch angle이 보정된 전체 이미지 (기본 결과 이미지)
 # dm.grid_angle_deg: 보정 좌표계이므로 0.0
-# dm.notch_result: notch 위치, 각도, 깊이, 폭, 신뢰도 등 수치 결과
+# dm.notch_result: notch 수치 결과; fallback_used / fallback_reason = 보완 사용 여부와 사유
 # dm.dies / locate_die(): 보정 이미지 좌표계의 die-map 결과
 # dm.notch_overlay_image / dm.notch_zoom_image: return_notch_visuals=True일 때만 생성
 """

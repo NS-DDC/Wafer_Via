@@ -2,8 +2,8 @@
 
 YOLO points are used for the centre corner and X/Y pitch only. No YOLO pair,
 projection, FFT, or die-render angle estimate is called by this pipeline.
-The detector follows colour-gradient geometry near the fitted wafer circle;
-neither the wafer colour nor the outside colour is classified.
+Without an ROI the detector follows colour-gradient geometry. ROI mode learns
+the exterior background, with optional shape-free recovery only on rejection.
 """
 
 from __future__ import annotations
@@ -250,6 +250,7 @@ def build_die_map_from_yolo(
     notch_background_distance_threshold_lab: Optional[float] = None,
     notch_background_noise_margin_lab: float = 4.0,
     notch_background_morph_px: float = 24.0,
+    notch_fallback_mode: Literal["rim_intrusion", "none"] = "rim_intrusion",
     notch_failure_mode: Literal["error", "zero"] = "error",
     return_aligned_image: bool = True,
     return_notch_visuals: bool = False,
@@ -313,6 +314,7 @@ def build_die_map_from_yolo(
         notch_background_distance_threshold_lab=notch_background_distance_threshold_lab,
         notch_background_noise_margin_lab=notch_background_noise_margin_lab,
         notch_background_morph_px=notch_background_morph_px,
+        notch_fallback_mode=notch_fallback_mode,
         failure_mode=notch_failure_mode,
     )
     if clip_origin is None:
@@ -460,6 +462,10 @@ def build_die_map_from_yolo(
         )
     die_map.angle_align_method = "notch" if notch.found else "notch_zero_fallback"
     die_map.notch_result = notch
+    die_map.notch_fallback_attempted = notch.fallback_attempted
+    die_map.notch_fallback_used = notch.fallback_used
+    die_map.notch_fallback_reason = notch.fallback_reason
+    die_map.notch_shoulder_points_px = notch.notch_shoulder_points_px
     die_map.notch_point_px = notch.notch_point_px
     die_map.notch_deepest_point_px = notch.notch_deepest_point_px
     die_map.notch_angle_deg = notch.notch_angle_deg

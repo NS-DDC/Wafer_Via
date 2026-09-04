@@ -56,6 +56,7 @@ def detect_wafer_notch(
     notch_background_distance_threshold_lab: Optional[float] = None,
     notch_background_noise_margin_lab: float = 4.0,
     notch_background_morph_px: float = 24.0,
+    notch_fallback_mode: Literal["rim_intrusion", "none"] = "rim_intrusion",
     failure_mode: Literal["error", "zero"] = "error",
     require_notch: Optional[bool] = None,
     background_palette_size: int = 3,
@@ -76,6 +77,8 @@ def detect_wafer_notch(
         mode = "error" if bool(require_notch) else "zero"
     if mode not in ("error", "zero"):
         raise ValueError("failure_mode must be 'error' or 'zero'.")
+    if str(notch_fallback_mode).strip().lower() not in ("rim_intrusion", "none"):
+        raise ValueError("notch_fallback_mode must be 'rim_intrusion' or 'none'.")
     _ = baseline_window_deg, radial_inner_ratio, min_wide_notch_deg
 
     # A manual ROI is an explicit request for the local semicircle detector
@@ -106,6 +109,7 @@ def detect_wafer_notch(
             notch_background_distance_threshold_lab=notch_background_distance_threshold_lab,
             notch_background_noise_margin_lab=notch_background_noise_margin_lab,
             notch_background_morph_px=notch_background_morph_px,
+            notch_fallback_mode=notch_fallback_mode,
             failure_mode=mode,
         )
 

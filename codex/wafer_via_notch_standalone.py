@@ -1250,6 +1250,11 @@ class NotchAngleResult:
     background_segmentation_used: bool = False
     background_palette_bgr: Tuple[Tuple[int, int, int], ...] = ()
     background_distance_threshold_lab: float = 0.0
+    fallback_attempted: bool = False
+    fallback_used: bool = False
+    fallback_reason: str = ""
+    notch_shoulder_points_px: Optional[Tuple[Point, Point]] = None
+    fallback_angle_stability_deg: float = 0.0
 
 
 @dataclass(frozen=True)
@@ -1523,6 +1528,206 @@ class _RoiBackgroundGeometry:
     wafer_circle_residual: float
     roi_bounds: Tuple[int, int, int, int]
     outward_unit: Point
+
+
+@dataclass(frozen=True)
+class _RimIntrusionCandidate:
+    angle_deg: float
+    depth: float
+    width_deg: float
+    confidence: float
+    arc_points: Tuple[Point, ...]
+    shoulder_points: Tuple[Point, Point]
+    deepest_point: Point
+    angle_stability_deg: float
+
+
+def _detect_roi_rim_intrusion(
+    geometry: _RoiBackgroundGeometry,
+    center: Point,
+    radius: float,
+    roi_center: Point,
+    *,
+    search_half_width_deg: float,
+    radial_inner_ratio: float,
+    min_depth: float,
+    radius_range: Optional[Tuple[float, float]],
+) -> Tuple[Optional[_RimIntrusionCandidate], str]:
+    """Shape-free, conservative recovery inside the *same* background ROI.
+
+    All lengths are analysis pixels. Follow each ray from exterior background
+    to its first wafer pixel, never through an isolated internal dark feature.
+    Use the angular midpoint of two intact mouth shoulders, not the deepest
+    pixel. No image reload, new segmentation, circle refit, or exception catch.
+    """
+
+    circle_noise = float(geometry.wafer_circle_residual)
+    if not math.isfinite(circle_noise) or circle_noise > max(1.5, radius * 0.005):
+        return None, "unreliable_wafer_circle"
+    mask = geometry.exterior_background_mask
+    height, width = mask.shape
+    x0, y0, x1, y1 = geometry.roi_bounds
+    central_angle = math.atan2(roi_center[1] - center[1], roi_center[0] - center[0])
+    half_angle = math.radians(float(search_half_width_deg))
+
+    count = max(31, int(math.ceil(2.0 * half_angle * radius / 0.6)) + 1)
+    theta = np.linspace(central_angle - half_angle, central_angle + half_angle, count)
+    arc_step = float((theta[1] - theta[0]) * radius)
+    outer_margin = max(5.0, 4.0 * circle_noise, radius * 0.008)
+    inner_depth = max(6.0, radius * (1.0 - radial_inner_ratio))
+    radial = np.arange(radius + outer_margin, radius - inner_depth, -0.75)
+    boundary = np.empty(count, dtype=np.float64)
+    valid = np.zeros(count, dtype=bool)
+
+
+    for start in range(0, count, 512):
+        stop = min(count, start + 512)
+        xs = center[0] + np.cos(theta[start:stop])[:, None] * radial[None, :]
+        ys = center[1] + np.sin(theta[start:stop])[:, None] * radial[None, :]
+        in_bounds = (
+            (xs >= max(1, x0 + 1)) & (xs < min(width - 1, x1 - 1))
+            & (ys >= max(1, y0 + 1)) & (ys < min(height - 1, y1 - 1))
+        )
+        xi = np.clip(np.rint(xs).astype(np.int32), 0, width - 1)
+        yi = np.clip(np.rint(ys).astype(np.int32), 0, height - 1)
+        sampled = (mask[yi, xi] != 0) & in_bounds
+        foreground = ~sampled & in_bounds
+        first = np.argmax(foreground, axis=1)
+        rows = np.arange(stop - start)
+
+        invalid_prefix = np.cumsum(~in_bounds, axis=1)
+        valid[start:stop] = (
+            sampled[:, 0] & foreground.any(axis=1) & (first > 0)
+            & (invalid_prefix[rows, first] == 0) & (first < len(radial) - 2)
+        )
+        boundary[start:stop] = radial[first] + 0.375
+    if int(valid.sum()) < 24:
+        return None, "insufficient_roi_rim_support"
+    raw_depth = radius - boundary
+    baseline_samples = raw_depth[valid]
+    baseline_samples = baseline_samples[
+        baseline_samples <= np.percentile(baseline_samples, 45.0)
+    ]
+    baseline = float(np.median(baseline_samples))
+    noise = float(1.4826 * np.median(np.abs(baseline_samples - baseline)))
+    if abs(baseline) > max(4.0, circle_noise * 4.0):
+        return None, "rim_disagrees_with_wafer_circle"
+    profile = np.where(valid, raw_depth - baseline, 0.0).astype(np.float32)
+    profile = cv2.medianBlur(profile.reshape(1, -1), 3).ravel().astype(np.float64)
+    threshold = max(1.5, noise * 3.0, circle_noise * 2.0)
+
+
+    mouth_level = max(1.5, threshold * 0.6)
+    required_peak = max(float(min_depth), 3.0, threshold * 2.0)
+    shoulder_count = max(4, int(math.ceil(4.0 / arc_step)))
+    bridge_count = max(1, int(math.floor(2.0 / arc_step)))
+
+    def groups_at(level: float):
+        active = valid & (profile > level)
+        indices = np.flatnonzero(active)
+        for left, right in zip(indices[:-1], indices[1:]):
+            if 1 < right - left <= bridge_count + 1 and valid[left:right + 1].all():
+                active[left:right + 1] = True
+        starts = np.flatnonzero(active & ~np.r_[False, active[:-1]])
+        ends = np.flatnonzero(active & ~np.r_[active[1:], False])
+        return list(zip(starts, ends))
+
+    candidates = []
+    seen_mouths = set()
+    rejected_reason = "no_significant_rim_intrusion"
+    for left, right in groups_at(threshold):
+        peak_index = int(left + np.argmax(profile[left:right + 1]))
+        peak = float(profile[peak_index])
+        if peak < required_peak:
+            continue
+
+        lo, hi = int(left), int(right)
+        while lo > 0 and valid[lo - 1] and profile[lo - 1] > mouth_level:
+            lo -= 1
+        while hi + 1 < count and valid[hi + 1] and profile[hi + 1] > mouth_level:
+            hi += 1
+        if (lo, hi) in seen_mouths:
+            continue
+        seen_mouths.add((lo, hi))
+        peak_index = int(lo + np.argmax(profile[lo:hi + 1]))
+        peak = float(profile[peak_index])
+        start, stop = lo - shoulder_count, hi + shoulder_count + 1
+        if start < 0 or stop > count or not valid[start:stop].all():
+            rejected_reason = "missing_or_clipped_shoulders"
+            continue
+        flanks = np.r_[profile[start:lo], profile[hi + 1:stop]]
+        if np.max(flanks) > threshold or abs(float(np.median(flanks))) > threshold:
+            rejected_reason = "shoulders_do_not_return_to_rim"
+            continue
+        span = float(theta[hi + 1] - theta[lo - 1])
+        width_px = float(2.0 * radius * math.sin(span * 0.5))
+        if (
+            width_px < max(4.0, 4.0 * arc_step)
+            or math.degrees(span) > 25.0
+            or hi - lo + 1 > int(valid.sum()) * 0.65
+        ):
+            rejected_reason = "implausible_intrusion_width"
+            continue
+        if radius_range is not None and not radius_range[0] <= width_px * 0.5 <= radius_range[1]:
+            rejected_reason = "intrusion_width_outside_radius_range"
+            continue
+        mean_depth = float(np.mean(np.maximum(0.0, profile[lo:hi + 1])))
+        if mean_depth < max(threshold, peak * 0.12):
+            rejected_reason = "insufficient_intrusion_area"
+            continue
+        angle = float((theta[lo - 1] + theta[hi + 1]) * 0.5)
+
+        trial_angles = []
+        for multiplier in (0.8, 1.2):
+            matching = [
+                (a, b) for a, b in groups_at(max(1.5, mouth_level * multiplier))
+                if a <= peak_index <= b
+            ]
+            if len(matching) != 1:
+                break
+            a, b = matching[0]
+            if a < shoulder_count or b + shoulder_count >= count or not valid[a - shoulder_count:b + shoulder_count + 1].all():
+                break
+            trial_angles.append(float((theta[a - 1] + theta[b + 1]) * 0.5))
+        if len(trial_angles) != 2:
+            rejected_reason = "unstable_mouth_shoulders"
+            continue
+        stability = math.degrees(max(abs(value - angle) for value in trial_angles))
+        if stability > max(0.25, math.degrees(2.0 / radius)):
+            rejected_reason = "unstable_mouth_angle"
+            continue
+        score = float(np.clip(
+            0.5 * min(1.0, peak / (required_peak * 2.0))
+            + 0.25 * min(1.0, mean_depth / (threshold * 3.0))
+            + 0.25 * max(0.0, 1.0 - stability / max(0.5, math.degrees(4.0 / radius))),
+            0.0, 1.0,
+        ))
+        arc_indices = np.arange(lo - 1, hi + 2)
+        arc = tuple(
+            (float(center[0] + math.cos(theta[i]) * boundary[i]),
+             float(center[1] + math.sin(theta[i]) * boundary[i]))
+            for i in arc_indices
+        )
+        shoulders = tuple(
+            (float(center[0] + math.cos(theta[i]) * radius),
+             float(center[1] + math.sin(theta[i]) * radius))
+            for i in (lo - 1, hi + 1)
+        )
+        candidates.append(_RimIntrusionCandidate(
+            angle_deg=math.degrees(angle) % 360.0,
+            depth=max(0.0, float(raw_depth[peak_index])),
+            width_deg=math.degrees(span), confidence=score,
+            arc_points=arc, shoulder_points=shoulders,
+            deepest_point=(float(center[0] + math.cos(theta[peak_index]) * boundary[peak_index]),
+                           float(center[1] + math.sin(theta[peak_index]) * boundary[peak_index])),
+            angle_stability_deg=stability,
+        ))
+    if not candidates:
+        return None, rejected_reason
+    candidates.sort(key=lambda item: item.confidence, reverse=True)
+    if len(candidates) > 1 and candidates[1].confidence >= candidates[0].confidence * 0.75:
+        return None, "ambiguous_multiple_intrusions"
+    return candidates[0], "rim_intrusion_accepted"
 
 
 def _robust_circle_from_points(
@@ -2439,6 +2644,7 @@ def detect_wafer_notch(
     notch_background_distance_threshold_lab: Optional[float] = None,
     notch_background_noise_margin_lab: float = 4.0,
     notch_background_morph_px: float = 24.0,
+    notch_fallback_mode: Literal["rim_intrusion", "none"] = "rim_intrusion",
     failure_mode: Literal["error", "zero"] = "error",
     require_notch: Optional[bool] = None,
 ) -> NotchAngleResult:
@@ -2462,6 +2668,10 @@ def detect_wafer_notch(
     ``failure_mode="error"`` raises when no notch is reliable.
     ``failure_mode="zero"`` returns ``found=False`` and a zero correction.
     ``require_notch`` remains as a backwards-compatible alias.
+    ``notch_fallback_mode="rim_intrusion"`` retries rejected ROI shape fits
+    using the same border-connected background and circle. It never changes a
+    successful primary result, and never catches unrelated exceptions. Use
+    ``"none"`` to disable it. Without a background ROI this retry is inapplicable.
     """
 
     mode = str(failure_mode).strip().lower()
@@ -2469,6 +2679,9 @@ def detect_wafer_notch(
         mode = "error" if bool(require_notch) else "zero"
     if mode not in ("error", "zero"):
         raise ValueError("failure_mode must be 'error' or 'zero'.")
+    fallback_mode = str(notch_fallback_mode).strip().lower()
+    if fallback_mode not in ("rim_intrusion", "none"):
+        raise ValueError("notch_fallback_mode must be 'rim_intrusion' or 'none'.")
     if not 2.0 <= float(search_half_width_deg) <= 120.0:
         raise ValueError("search_half_width_deg must be between 2 and 120 degrees.")
     if not 0.50 <= float(radial_inner_ratio) < 1.0:
@@ -2741,6 +2954,10 @@ def detect_wafer_notch(
     detection_method = "geometry_edge_bottom_sector"
     local_arc: Optional[Tuple[Point, ...]] = None
     semicircle_candidate: Optional[_LocalSemicircleCandidate] = None
+    fallback_attempted = False
+    fallback_used = False
+    fallback_reason = ""
+    fallback_candidate: Optional[_RimIntrusionCandidate] = None
     if roi_center is not None and roi_half_size is not None:
         if background_geometry is not None:
             semicircle_candidate = _fit_semicircle_from_background_boundary(
@@ -2827,6 +3044,38 @@ def detect_wafer_notch(
                 float(semicircle_candidate.score) if found else 0.0
             )
             candidate_indices = np.asarray((), dtype=np.int64)
+
+
+    if not found and fallback_mode == "rim_intrusion" and background_geometry is not None:
+        fallback_attempted = True
+        fallback_candidate, fallback_reason = _detect_roi_rim_intrusion(
+            background_geometry, center, radius, roi_center,
+            search_half_width_deg=float(search_half_width_deg),
+            radial_inner_ratio=float(radial_inner_ratio),
+            min_depth=depth_limit,
+            radius_range=semicircle_radius_range,
+        )
+
+        semicircle_candidate = None
+        local_arc = ()
+        if fallback_candidate is not None:
+            fallback_used = True
+            found = True
+            detection_method = "roi_background_rim_intrusion_fallback"
+            notch_angle_deg = fallback_candidate.angle_deg
+            notch_angle_rad = math.radians(notch_angle_deg)
+            notch_point = (
+                float(cx + math.cos(notch_angle_rad) * radius),
+                float(cy + math.sin(notch_angle_rad) * radius),
+            )
+            notch_deepest_point = fallback_candidate.deepest_point
+            peak_depth = fallback_candidate.depth
+            notch_width_deg = fallback_candidate.width_deg
+            notch_width_px = float(2.0 * radius * math.sin(math.radians(notch_width_deg) * 0.5))
+            confidence = fallback_candidate.confidence
+            candidate_support = 1.0
+            local_arc = fallback_candidate.arc_points
+            candidate_indices = np.asarray((), dtype=np.int64)
     if not found:
         confidence = 0.0
         if mode == "error":
@@ -2841,7 +3090,8 @@ def detect_wafer_notch(
                 f"Wafer notch was not found: peak_depth={peak_depth / scale:.2f}px, "
                 f"width={notch_width_deg:.2f}deg, required_depth={depth_limit / scale:.2f}px. "
                 f"search={effective_search_center_angle_deg:.1f}+/-{float(search_half_width_deg):.1f}deg."
-                f"{roi_message} Use failure_mode='zero' to return angle 0, or correct the ROI/wafer hints."
+                f"{roi_message} fallback={fallback_reason or 'not_attempted'}. "
+                "Use failure_mode='zero' to return angle 0, or correct the ROI/wafer hints."
             )
         notch_angle_deg = float(reference_angle_deg) % 360.0
         notch_angle_rad = math.radians(notch_angle_deg)
@@ -2932,7 +3182,8 @@ def detect_wafer_notch(
             else (float(roi_center[0] * inv_scale), float(roi_center[1] * inv_scale))
         ),
         roi_bounds_px=(
-            None
+            (tuple(float(value * inv_scale) for value in background_geometry.roi_bounds)
+             if fallback_attempted else None)
             if semicircle_candidate is None
             else tuple(float(value * inv_scale) for value in semicircle_candidate.roi_bounds)
         ),
@@ -2987,6 +3238,18 @@ def detect_wafer_notch(
         background_segmentation_used=background_geometry is not None,
         background_palette_bgr=palette_bgr,
         background_distance_threshold_lab=background_threshold,
+        fallback_attempted=fallback_attempted,
+        fallback_used=fallback_used,
+        fallback_reason=fallback_reason,
+        notch_shoulder_points_px=(
+            None if fallback_candidate is None else tuple(
+                (float(point[0] * inv_scale), float(point[1] * inv_scale))
+                for point in fallback_candidate.shoulder_points
+            )
+        ),
+        fallback_angle_stability_deg=(
+            0.0 if fallback_candidate is None else fallback_candidate.angle_stability_deg
+        ),
     )
 
 
@@ -3048,6 +3311,11 @@ def _transform_result_for_visual(
         wafer_radius_px=float(result.wafer_radius_px) * float(scale),
         notch_point_px=transform_point(result.notch_point_px),
         notch_deepest_point_px=transform_point(result.notch_deepest_point_px),
+        notch_shoulder_points_px=(
+            None if result.notch_shoulder_points_px is None else tuple(
+                transform_point(point) for point in result.notch_shoulder_points_px
+            )
+        ),
         notch_depth_px=float(result.notch_depth_px) * float(scale),
         notch_width_px=float(result.notch_width_px) * float(scale),
         radial_noise_px=float(result.radial_noise_px) * float(scale),
@@ -3136,6 +3404,13 @@ def make_notch_overlay(
     if result.candidate_arc_px:
         arc = np.rint(np.asarray(result.candidate_arc_px)).astype(np.int32)
         cv2.polylines(overlay, [arc], False, (0, 255, 255), max(2, thickness), cv2.LINE_AA)
+    if result.notch_shoulder_points_px is not None:
+        for point in result.notch_shoulder_points_px:
+            cv2.drawMarker(
+                overlay, tuple(int(round(value)) for value in point),
+                (0, 165, 255), cv2.MARKER_TILTED_CROSS,
+                max(12, thickness * 7), max(2, thickness), cv2.LINE_AA,
+            )
     if result.roi_bounds_px is not None:
         x0, y0, x1, y1 = (int(round(value)) for value in result.roi_bounds_px)
         cv2.rectangle(
@@ -3164,13 +3439,15 @@ def make_notch_overlay(
             overlay, local_center, max(4, thickness * 2),
             (255, 180, 0), -1, cv2.LINE_AA
         )
-    cv2.arrowedLine(
-        overlay, center, notch, (0, 220, 0), max(2, thickness), cv2.LINE_AA, tipLength=0.025
-    )
+    if result.found:
+        cv2.arrowedLine(
+            overlay, center, notch, (0, 220, 0), max(2, thickness), cv2.LINE_AA, tipLength=0.025
+        )
     cv2.circle(overlay, center, max(5, thickness * 3), (255, 0, 0), -1, cv2.LINE_AA)
-    cv2.circle(overlay, deepest, max(4, thickness * 2), (0, 255, 0), -1, cv2.LINE_AA)
-    cv2.circle(overlay, notch, max(6, thickness * 4), (0, 0, 255), -1, cv2.LINE_AA)
-    cv2.circle(overlay, notch, max(10, thickness * 6), (255, 255, 255), thickness, cv2.LINE_AA)
+    if result.found:
+        cv2.circle(overlay, deepest, max(4, thickness * 2), (0, 255, 0), -1, cv2.LINE_AA)
+        cv2.circle(overlay, notch, max(6, thickness * 4), (0, 0, 255), -1, cv2.LINE_AA)
+        cv2.circle(overlay, notch, max(10, thickness * 6), (255, 255, 255), thickness, cv2.LINE_AA)
     text = (
         f"found={result.found}  notch={result.notch_angle_deg:.3f} deg  "
         f"correction={result.correction_angle_deg:+.3f} deg  "
@@ -3215,6 +3492,16 @@ def make_notch_overlay(
             overlay, background_text, (24, 106), cv2.FONT_HERSHEY_SIMPLEX, 0.62,
             (255, 255, 255), 1, cv2.LINE_AA
         )
+    if result.fallback_attempted:
+        fallback_text = (
+            f"fallback_used={result.fallback_used} reason={result.fallback_reason} "
+            f"stability={result.fallback_angle_stability_deg:.3f}deg"
+        )
+        for colour, line_width in (((0, 0, 0), 4), ((255, 255, 255), 1)):
+            cv2.putText(
+                overlay, fallback_text, (24, 138), cv2.FONT_HERSHEY_SIMPLEX,
+                0.62, colour, line_width, cv2.LINE_AA,
+            )
     return overlay
 
 
@@ -3974,6 +4261,7 @@ def build_die_map_from_yolo(
     notch_background_distance_threshold_lab: Optional[float] = None,
     notch_background_noise_margin_lab: float = 4.0,
     notch_background_morph_px: float = 24.0,
+    notch_fallback_mode: Literal["rim_intrusion", "none"] = "rim_intrusion",
     notch_failure_mode: Literal["error", "zero"] = "error",
     return_aligned_image: bool = True,
     return_notch_visuals: bool = False,
@@ -4037,6 +4325,7 @@ def build_die_map_from_yolo(
         notch_background_distance_threshold_lab=notch_background_distance_threshold_lab,
         notch_background_noise_margin_lab=notch_background_noise_margin_lab,
         notch_background_morph_px=notch_background_morph_px,
+        notch_fallback_mode=notch_fallback_mode,
         failure_mode=notch_failure_mode,
     )
     if clip_origin is None:
@@ -4182,6 +4471,10 @@ def build_die_map_from_yolo(
         )
     die_map.angle_align_method = "notch" if notch.found else "notch_zero_fallback"
     die_map.notch_result = notch
+    die_map.notch_fallback_attempted = notch.fallback_attempted
+    die_map.notch_fallback_used = notch.fallback_used
+    die_map.notch_fallback_reason = notch.fallback_reason
+    die_map.notch_shoulder_points_px = notch.notch_shoulder_points_px
     die_map.notch_point_px = notch.notch_point_px
     die_map.notch_deepest_point_px = notch.notch_deepest_point_px
     die_map.notch_angle_deg = notch.notch_angle_deg
@@ -4235,11 +4528,11 @@ build_die_map = build_die_map_from_yolo
 # clip_image: YOLO를 실행한 중심 clip 경로 또는 BGR ndarray
 # detections: YOLO 중심점/box의 numpy 배열 또는 list
 # clip_origin: 중심 clip이 아닐 때 전체 이미지 기준 좌상단 (x, y)
-# notch_roi_center_px: 선택 사항, 전체 이미지 기준 예상 notch 중심 (x, y)
+# notch_roi_center_px: 원본 좌표 (x, y); notch_fallback_mode="rim_intrusion"(기본, 실패시만)/"none"
 # OUTPUT
 # 반환값: WaferDieMap
 # dm.aligned_image: notch angle이 보정된 전체 이미지 (기본 결과 이미지)
 # dm.grid_angle_deg: 보정 좌표계이므로 0.0
-# dm.notch_result: notch 위치, 각도, 깊이, 폭, 신뢰도 등 수치 결과
+# dm.notch_result: notch 수치 결과; fallback_used / fallback_reason = 보완 사용 여부와 사유
 # dm.dies / locate_die(): 보정 이미지 좌표계의 die-map 결과
 # dm.notch_overlay_image / dm.notch_zoom_image: return_notch_visuals=True일 때만 생성

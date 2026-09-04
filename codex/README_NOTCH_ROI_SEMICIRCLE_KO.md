@@ -1,12 +1,14 @@
-# 고정 ROI 얕은 타원형 notch angle 보정 사용법
+# 고정 ROI notch angle 보정 사용법
 
 ## 목적
 
 장비에서 wafer notch가 항상 비슷한 좌표에 나타날 때, 사용자가 지정한 원본
 이미지 ROI의 **wafer 바깥쪽 색**을 먼저 학습합니다. 영상 테두리와 연결된 배경만
 남겨 wafer 실루엣과 외곽원을 다시 만들고, 같은 배경 경계에서 U자 반원 또는
-옆으로 길고 얕은 반타원(semi-ellipse)을 찾아
-full wafer 이미지와 die-map을 회전 보정합니다. ROI 밖의 외곽선, die street,
+옆으로 길고 얕은 반타원(semi-ellipse)을 찾습니다. 이 형상 검출이 실패할 때만
+동일한 ROI·외곽원·연결 배경에서 형상에 제한을 두지 않는 함몰 검출로 보완합니다.
+그 결과로 full wafer 이미지를 회전하고 die-map 좌표를 같은 정렬 좌표계로 변환합니다.
+ROI 밖의 외곽선, die street,
 장식성 원형 edge는 notch angle 후보가 될 수 없습니다.
 
 복사할 파일은 아래 하나입니다.
@@ -16,6 +18,8 @@ wafer_via_notch_standalone.py
 ```
 
 외부 패키지는 `numpy`, `opencv-python`만 필요합니다.
+파일 전체를 자기 코드 위에 붙여 넣었다면 아래 예시의 `from ... import ...` 줄은
+생략합니다. 보완 로직도 같은 파일에 포함되어 별도 프로젝트 모듈이 필요 없습니다.
 
 성능상 `detect_wafer_notch()`는 축소 분석 영상을 BGR에서 LAB으로 한 번만 변환합니다.
 같은 raw LAB 배열을 배경 palette 거리 계산에 사용하고, edge 계산은 그 배열의 blur
@@ -29,9 +33,10 @@ from wafer_via_notch_standalone import build_die_map_from_yolo
 dm = build_die_map_from_yolo(
     wafer_image=wafer_bgr,             # full wafer BGR ndarray 또는 경로
     clip_image=center_clip_bgr,         # YOLO를 수행한 중앙 clip
-    detections=yolo_points,
-    detection_format="point",
-    clip_origin=(clip_x, clip_y),
+    detections=results[0].boxes.xywh.cpu().numpy(),  # (N, 4), clip 픽셀 단위
+    detection_format="xywh",          # 중심 x, 중심 y, 너비, 높이
+    # 중앙 clip이 아니면 원본에서 잘라낸 시작점도 지정합니다.
+    # clip_origin=(clip_x, clip_y),
 
     # 원본 full wafer 이미지 좌표입니다.
     notch_roi_center_px=(5000, 9650),
@@ -40,13 +45,16 @@ dm = build_die_map_from_yolo(
     # 기본값 True: ROI 바깥쪽 band의 배경색을 학습합니다.
     notch_use_roi_background=True,
 
+    # 기본값: 위 형상 검출이 실패할 때만 보완합니다. "none"으로 끌 수 있습니다.
+    notch_fallback_mode="rim_intrusion",
+
     # 검출된 notch를 정렬 후 6시 방향에 둡니다.
     notch_reference_angle_deg=90.0,
 
     # 기본값 False: angle 보정된 aligned_image만 생성합니다.
     return_notch_visuals=False,
 
-    # 잘못된 angle로 계속 진행하지 않도록 운영에서는 error를 권장합니다.
+    # 기존 검출과 보완 검출이 모두 실패한 경우의 정책입니다.
     notch_failure_mode="error",
 )
 ```
@@ -90,11 +98,20 @@ dm = build_die_map_from_yolo(
 6. `depth² = A·x² + B·x + C` robust fitting으로 반타원의 가로 반폭과 깊이를 각각
    계산합니다. 가로와 세로가 같을 필요가 없어 얕고 넓은 notch도 검출합니다.
 7. `wafer 중심 → 반타원 기준점` 방향을 `notch_angle_deg`로 사용합니다.
-8. notch가 `notch_reference_angle_deg`에 오도록 full wafer 이미지를 회전합니다.
-9. 같은 affine matrix로 YOLO 기준점과 die-map 좌표를 변환합니다.
+8. 위 형상 검출이 불합격일 때만, 같은 ROI에서 외부 배경이 원 안으로 들어온 깊이
+   profile을 검사합니다. 정상 외곽으로 돌아오는 양쪽 입구 경계(어깨)가 확인되면
+   그 **두 방향의 각도 중간**을 사용합니다. 가장 깊게 깨진 점을 angle로 쓰지 않습니다.
+9. notch가 `notch_reference_angle_deg`에 오도록 full wafer 이미지를 회전합니다.
+10. 같은 affine matrix로 YOLO 기준점과 die-map 좌표를 변환합니다.
+
+보완 검출은 작은 끊김과 노이즈를 제한적으로 처리하며, 여러 후보가 비슷하거나
+양쪽 어깨가 잘렸거나 외곽원과 맞지 않으면 거절합니다. 기존 형상 검출이 성공하면
+결과를 그대로 유지하고 보완 검출은 호출하지 않습니다.
+[보완 검출의 조건·반환값·실패 이유](README_NOTCH_FALLBACK_KO.md)를 참고하십시오.
 
 기존 LAB edge/Hough 방식으로 비교해야 할 때만
 `notch_use_roi_background=False`로 설정할 수 있습니다.
+이 경로와 ROI를 지정하지 않은 경로에는 새 보완 검출을 적용하지 않습니다.
 
 이미지 좌표 angle은 오른쪽 `0°`, 아래쪽 `90°`, 왼쪽 `180°`, 위쪽 `270°`입니다.
 
@@ -119,12 +136,17 @@ print(dm.notch_semicircle_center_px)
 print(dm.notch_semicircle_radius_px)
 print(dm.notch_semicircle_radius_x_px)  # 가로 반폭
 print(dm.notch_semicircle_radius_y_px)  # 깊이
-print(dm.notch_semicircle_shape)        # "semiellipse" 또는 "semicircle"
+print(dm.notch_semicircle_shape)        # "semiellipse" / "semicircle" / "none"
 print(dm.notch_semicircle_score)
 print(dm.notch_semicircle_fit_residual_px)
 print(dm.notch_background_segmentation_used)
 print(dm.notch_background_palette_bgr)
 print(dm.notch_background_distance_threshold_lab)
+print(dm.notch_fallback_attempted)      # 기존 검출 미검출 뒤 보완을 시도했는가
+print(dm.notch_fallback_used)           # 보완 결과를 최종 angle에 사용했는가
+print(dm.notch_fallback_reason)         # 미시도 "", 성공/거절 이유 문자열
+print(dm.notch_shoulder_points_px)      # 보완 성공 시 양쪽 입구점; 원본 wafer 좌표
+print(dm.notch_result.fallback_angle_stability_deg)
 
 print(dm.coordinate_space)   # "aligned_image"
 print(dm.grid_angle_deg)     # 0.0
@@ -133,6 +155,9 @@ print(dm.grid_angle_deg)     # 0.0
 `semicircle_score`가 높더라도 오버레이 확인을 생략하면 안 됩니다. 실제 arc fitting이
 좋을수록 `semicircle_fit_residual_px`가 작습니다. 카메라 해상도와 blur가 달라지므로
 고정 합격값은 실제 양품 데이터로 정해야 합니다.
+보완 검출은 반원/반타원을 fitting하지 않으므로 이때 `notch_semicircle_shape`은
+`"none"`, 반원 중심·반지름은 `None`입니다. 보완 결과는 `found`, `confidence`,
+양쪽 입구점과 실제 경계 오버레이로 확인하십시오.
 
 ## 오버레이 저장과 판독
 
@@ -157,12 +182,15 @@ cv2.imwrite("wafer_aligned.png", dm.aligned_image)
 - 자홍색 십자: 사용자가 입력한 예상 notch 위치
 - 하늘색 arc와 점: robust fitting된 반원/반타원과 기준점
 - 노란 arc: angle 계산에 사용한 inward edge 구간
+- 주황색 X 두 개: 보완 검출에 사용한 양쪽 입구점(보완 성공 때만 표시)
 - 빨간점: wafer 외곽 원 위의 최종 notch 방향점
 - 초록선: wafer 중심에서 notch 방향으로 향하는 angle 벡터
 - 하늘색 큰 원: 연결 배경으로 만든 wafer 실루엣에 robust fitting한 외곽 원
 
 하늘색 notch 표시는 전체 원을 크게 그리지 않고, 실제 계산에 사용한 inward arc만
-표시합니다.
+표시합니다. 보완 성공 때는 가상의 반원/반타원을 그리지 않고 관측된 노란 경계를
+표시합니다. 반환 notch 좌표는 원본 wafer 좌표이고, 축소된 오버레이 픽셀이나
+`dm.aligned_image` 좌표와는 구분해야 합니다.
 
 ![ROI 반원 또는 반타원 notch 검출 예시](sample_img/notch_roi_semicircle_preview.png)
 
@@ -228,6 +256,7 @@ result = detect_wafer_notch(
     wafer_bgr,
     notch_roi_center_px=(5000, 9650),
     notch_roi_half_size_px=(600, 600),
+    notch_fallback_mode="rim_intrusion",
     failure_mode="error",
 )
 
@@ -239,6 +268,8 @@ print(result.semicircle_radius_y_px)
 print(result.semicircle_shape)
 print(result.background_palette_bgr)
 print(result.background_distance_threshold_lab)
+print(result.fallback_attempted, result.fallback_used, result.fallback_reason)
+print(result.notch_shoulder_points_px)
 
 overlay = make_notch_overlay(wafer_bgr, result, max_dimension=5000)
 cv2.imwrite("notch_roi_check.png", overlay)
@@ -252,9 +283,15 @@ cv2.imwrite("notch_roi_check.png", overlay)
 notch_failure_mode="error"
 ```
 
-notch arc를 못 찾으면 `RuntimeError`를 발생시켜 잘못된 wafer angle로 다음 검사를 진행하지
-않습니다. `"zero"`는 테스트나 notch 없는 이미지용이며 미검출 시 회전각을 `0°`로
-두고 계속 진행합니다.
+기존 형상 검출이 실패하면 먼저 보완 검출을 시도하고, **보완까지 실패한 경우에만**
+`RuntimeError`를 발생시킵니다. `notch_fallback_mode="none"`이면 기존 검출 실패 시
+바로 이 정책을 적용합니다. `"zero"`는 테스트나 notch 없는 이미지용이며 최종 미검출 시
+`found=False`, 보정각 `0°`로 계속 진행합니다. 이때 notch를 찾았다는 의미는 아닙니다.
+
+여기서 실패는 검출기의 미검출 판정입니다. 이미지 읽기, 인자 검증, 배경 분할이나
+원 fitting 단계의 예외를 무조건 잡아서 보완하거나 `0°`로 숨기지는 않습니다.
+기존 검출이 성공으로 통과한 오검출에는 보완 검출이 실행되지 않으므로 결과 이미지
+확인이 여전히 필요합니다.
 
 ## 실제 장비 적용 전 점검
 
