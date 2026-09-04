@@ -1,6 +1,8 @@
+import io
 import runpy
 import tempfile
 import unittest
+import tokenize
 from pathlib import Path
 from shutil import copy2
 
@@ -95,6 +97,25 @@ class WaferNotchAngleTests(unittest.TestCase):
         text = source.read_text(encoding="utf-8")
         self.assertNotIn("import wafer_via", text)
         self.assertNotIn("import wafer_notch_angle", text)
+        self.assertNotIn("def estimate_grid_from_yolo(", text)
+        self.assertNotIn("_estimate_grid_orientation", text)
+        self.assertNotIn("_legacy_build_die_map_from_yolo", text)
+        self.assertNotIn("robust_angle_deg", text)
+        self.assertNotIn("local_angle_deg", text)
+        comments = [
+            token
+            for token in tokenize.generate_tokens(io.StringIO(text).readline)
+            if token.type == tokenize.COMMENT
+        ]
+        self.assertEqual(len(comments), 13)
+        self.assertEqual(comments[0].string, "# INPUT")
+        self.assertEqual(comments[6].string, "# OUTPUT")
+        self.assertTrue(
+            text.rstrip().endswith(
+                "# dm.notch_overlay_image / dm.notch_zoom_image: "
+                "return_notch_visuals=True일 때만 생성"
+            )
+        )
         with tempfile.TemporaryDirectory() as directory:
             isolated = Path(directory) / source.name
             copy2(source, isolated)
@@ -126,8 +147,8 @@ class WaferNotchAngleTests(unittest.TestCase):
         self.assertEqual(die_map.angle_align_method, "notch")
         self.assertLess(abs(die_map.grid_angle_deg), 0.3)
         self.assertEqual(die_map.coordinate_space, "aligned_image")
-        self.assertIsNotNone(die_map.notch_overlay_image)
-        self.assertIsNotNone(die_map.notch_zoom_image)
+        self.assertIsNone(die_map.notch_overlay_image)
+        self.assertIsNone(die_map.notch_zoom_image)
 
     def test_aligned_v5_guide_returns_writable_full_resolution_overlay(self):
         image, center = synthetic_notched_wafer()
@@ -297,6 +318,7 @@ class WaferNotchAngleTests(unittest.TestCase):
             clip_origin=clip_origin,
             refine=False,
             return_aligned_image=True,
+            return_notch_visuals=True,
         )
 
         self.assertEqual(die_map.angle_align_method, "notch")
