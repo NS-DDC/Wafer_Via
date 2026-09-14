@@ -1,5 +1,6 @@
 def binarize_via(image, block_size=31, gray_drop=25.0, min_area=4, *,
-                 shape_filter=True, max_aspect_ratio=1.8, min_circularity=0.65):
+                 max_area=None, shape_filter=True,
+                 max_aspect_ratio=1.8, min_circularity=0.65):
     """원본 한 장에서 어두운 VIA 후보를 0/255 마스크로 반환한다.
 
     입력:
@@ -12,7 +13,10 @@ def binarize_via(image, block_size=31, gray_drop=25.0, min_area=4, *,
         gray_drop: 주변 평균보다 얼마나 어두워야 하는지(0~255 밝기 단위).
             기본 25. 누락 시 15~20으로 낮추고, 잡음이 많으면 30~40으로 올린다.
         min_area: 연결된 흰 픽셀의 최소 면적(px). 기본 4는 1~3픽셀 잡음 제거.
-            0이면 면적 필터만 끈다. 형상 필터까지 끄려면 shape_filter=False.
+            0이면 최소 면적 필터만 끈다.
+        max_area: 연결된 흰 픽셀의 최대 면적(px). 기본 None은 최대 면적 필터 끄기.
+            200이면 200픽셀까지 허용하고 201픽셀 이상인 덩어리는 통째로 제거.
+            양의 정수이며 min_area 이상이어야 한다. 형상 필터를 꺼도 적용된다.
         shape_filter: 기본 True. 가늘고 긴 선과 원형에서 크게 벗어난 덩어리 제거.
         max_aspect_ratio: 회전 사각형의 긴 변/짧은 변 상한. 기본 1.8.
             낮추면 타원/선에 엄격, 높이면 길쭉한 VIA도 허용. 1 이상이어야 한다.
@@ -42,9 +46,10 @@ def binarize_via(image, block_size=31, gray_drop=25.0, min_area=4, *,
 
     사용:
         via_bin = binarize_via(image)
+        via_bin = binarize_via(image, min_area=4, max_area=200)
         via_bin = binarize_via(image, gray_drop=20, min_circularity=0.55)
         # 이전처럼 이진화만 수행 (면적/형상 필터 모두 OFF):
-        via_bin = binarize_via(image, min_area=0, shape_filter=False)
+        via_bin = binarize_via(image, min_area=0, max_area=None, shape_filter=False)
     """
     # 함수 전체만 복사해도 사용할 수 있도록 의존성 import를 안에 둡니다.
     import cv2
@@ -61,6 +66,11 @@ def binarize_via(image, block_size=31, gray_drop=25.0, min_area=4, *,
         raise ValueError("gray_drop은 0 초과 255 이하의 유한한 값이어야 합니다.")
     if not isinstance(min_area, (int, np.integer)) or min_area < 0:
         raise ValueError("min_area는 0 이상의 정수여야 합니다.")
+    if max_area is not None:
+        if not isinstance(max_area, (int, np.integer)) or max_area < 1:
+            raise ValueError("max_area는 None 또는 양의 정수여야 합니다.")
+        if max_area < min_area:
+            raise ValueError("max_area는 min_area 이상이어야 합니다.")
     if not isinstance(shape_filter, (bool, np.bool_)):
         raise ValueError("shape_filter는 True 또는 False여야 합니다.")
     if not np.isfinite(max_aspect_ratio) or max_aspect_ratio < 1:
@@ -90,10 +100,12 @@ def binarize_via(image, block_size=31, gray_drop=25.0, min_area=4, *,
     mask = (gray_float < local_mean - float(gray_drop)).astype(np.uint8) * 255
     # [END SECTOR: VIA_BINARIZATION_CORE]
 
-    # [SECTOR: VIA_NOISE_FILTER] 작은 점 잡음과 선형/비원형 덩어리를 제거합니다.
-    if min_area > 1 or shape_filter:
+    # [SECTOR: VIA_NOISE_FILTER] 면적 범위 밖 잡음과 선형/비원형 덩어리 제거.
+    if min_area > 1 or max_area is not None or shape_filter:
         count, labels, stats, _ = cv2.connectedComponentsWithStats(mask, connectivity=8)
         keep = stats[:, cv2.CC_STAT_AREA] >= min_area
+        if max_area is not None:
+            keep &= stats[:, cv2.CC_STAT_AREA] <= max_area
         keep[0] = False  # 배경 라벨은 면적과 무관하게 0으로 유지합니다.
 
         if shape_filter:

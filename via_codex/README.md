@@ -1,5 +1,10 @@
 # PAD 평균 밝기 기반 중앙 VIA 검출 가이드
 
+원본 한 장에서 VIA 후보만 이진화하려면 독립 함수
+[`binarize_via`](via_binarize.py)를 사용하세요. 1/3/4채널 입력, `min_area`/
+`max_area`, 선형/원형도 필터의 사용법은
+[VIA 이진화 함수 사용 가이드](VIA_BINARIZE_USAGE.md)에 정리했습니다.
+
 이 문서는 `via_checker.py`의 단순화된 Codex 버전을 설명합니다. 기존
 `pad_via_inspector.py`와 `via_code.py`는 변경하지 않았습니다.
 
