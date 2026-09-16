@@ -1,0 +1,151 @@
+{
+  "evidence": "synthetic geometry, not a supplied failing production crop",
+  "lookup_audits": [
+    {
+      "angle": 0.0,
+      "centers_checked": 8551,
+      "random_bboxes_checked": 300,
+      "mismatches": {
+        "index": 0,
+        "die_rect": 0,
+        "crop_rect": 0,
+        "baseline": 0
+      }
+    },
+    {
+      "angle": 3.25,
+      "centers_checked": 8548,
+      "random_bboxes_checked": 300,
+      "mismatches": {
+        "index": 0,
+        "die_rect": 0,
+        "crop_rect": 0,
+        "baseline": 0
+      }
+    }
+  ],
+  "floating_boundary_examples": [
+    {
+      "nominal_right_cell": 1,
+      "quotient": 0.999999999999998,
+      "actual_cell": [
+        0,
+        0
+      ],
+      "point": [
+        5103.37,
+        4946.235000000001
+      ],
+      "all_cells": [
+        [
+          0,
+          0
+        ],
+        [
+          1,
+          0
+        ]
+      ]
+    },
+    {
+      "nominal_right_cell": 2,
+      "quotient": 1.999999999999996,
+      "actual_cell": [
+        1,
+        0
+      ],
+      "point": [
+        5193.57,
+        4946.235000000001
+      ],
+      "all_cells": [
+        [
+          1,
+          0
+        ],
+        [
+          2,
+          0
+        ]
+      ]
+    },
+    {
+      "nominal_right_cell": 6,
+      "quotient": 5.999999999999998,
+      "actual_cell": [
+        5,
+        0
+      ],
+      "point": [
+        5554.37,
+        4946.235000000001
+      ],
+      "all_cells": [
+        [
+          5,
+          0
+        ],
+        [
+          6,
+          0
+        ]
+      ]
+    }
+  ],
+  "rounded_overlay_boundary": {
+    "exact_x": 5103.37,
+    "rounded_x": 5103,
+    "rounded_lookup_cell": [
+      0,
+      0
+    ],
+    "nominal_right_cell": [
+      1,
+      0
+    ]
+  },
+  "coordinate_space_example": {
+    "correction_deg": 0.2,
+    "grid_angle_deg": 0.0,
+    "aligned_point": [
+      5198.57,
+      8698.310000000001
+    ],
+    "original_point": [
+      5185.659279208172,
+      8698.980607281406
+    ],
+    "delta_x_px": 12.91072079182868,
+    "correct_index": [
+      2,
+      -41
+    ],
+    "mixed_space_index": [
+      1,
+      -41
+    ]
+  },
+  "integer_pitch_drift": {
+    "pitch_x": 90.2,
+    "die_w": 90,
+    "columns": 40,
+    "exact_boundary_x": 8621.17,
+    "rounded_pitch_boundary_x": 8613.17,
+    "drift_px": -8.000000000000114
+  },
+  "stored_crop_slice": {
+    "rect": [
+      5193,
+      5176,
+      5284,
+      5269
+    ],
+    "shape": [
+      93,
+      91
+    ],
+    "first_pixel_x": 5193,
+    "last_pixel_x": 5283,
+    "matches_stored_rect": true
+  }
+}

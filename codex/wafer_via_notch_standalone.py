@@ -975,11 +975,22 @@ def locate_die(
     die_map: WaferDieMap,
     point: Optional[Point] = None,
     bbox: Optional[Tuple[float, float, float, float]] = None,
-) -> Dict[str, Any]:
-    """Return the rotated-grid die index and geometry for a point or bbox."""
+    *,
+    return_all: bool = False,
+) -> Union[Dict[str, Any], List[Dict[str, Any]]]:
+    """Return one die by default, or all matching stored dies as a list.
+
+    Coordinates use the die-map image space. With ``return_all=True``, a
+    point includes adjacent cells on a shared edge; a bbox includes cells
+    with positive-area overlap. No match returns []. Bbox edge contact alone
+    is excluded. Results are ordered by (iy, ix); query_px stays the input
+    point or bbox centre. The default single-die behaviour is unchanged.
+    """
 
     if (point is None) == (bbox is None):
         raise ValueError("Specify exactly one of point or bbox.")
+    if return_all:
+        return _locate_all_dies(die_map, point=point, bbox=bbox)
     if bbox is not None:
         qx, qy = (float(bbox[0]) + float(bbox[2])) / 2.0, (float(bbox[1]) + float(bbox[3])) / 2.0
         input_type = "bbox"
@@ -991,6 +1002,89 @@ def locate_die(
     axis_y = np.asarray(die_map.axis_y)
     ix = int(math.floor(float(relative @ axis_x) / die_map.pitch_x))
     iy = int(math.floor(-float(relative @ axis_y) / die_map.pitch_y))
+    return _describe_located_die(die_map, ix, iy, qx, qy, input_type)
+
+
+def _locate_all_dies(
+    die_map: WaferDieMap,
+    *,
+    point: Optional[Point],
+    bbox: Optional[Tuple[float, float, float, float]],
+) -> List[Dict[str, Any]]:
+    tolerance_px = 1e-7
+    if bbox is None:
+        query = np.asarray(point, dtype=np.float64)
+        if query.shape != (2,) or not np.all(np.isfinite(query)):
+            raise ValueError("point must contain two finite coordinates.")
+        corners = query.reshape(1, 2)
+        input_type = "point"
+    else:
+        bounds = np.asarray(bbox, dtype=np.float64)
+        if bounds.shape != (4,) or not np.all(np.isfinite(bounds)):
+            raise ValueError("bbox must contain four finite coordinates.")
+        if bounds[2] <= bounds[0] or bounds[3] <= bounds[1]:
+            raise ValueError("bbox must satisfy x1 < x2 and y1 < y2.")
+        x1, y1, x2, y2 = bounds
+        query = bounds[:2] / 2.0 + bounds[2:] / 2.0
+        corners = np.asarray(((x1, y1), (x2, y1), (x2, y2), (x1, y2)))
+        input_type = "bbox"
+
+    relative = corners - np.asarray((die_map.x0, die_map.y0))
+    projected = np.column_stack((
+        relative @ np.asarray(die_map.axis_x),
+        -(relative @ np.asarray(die_map.axis_y)),
+    ))
+    lower, upper = projected.min(axis=0), projected.max(axis=0)
+    pitch = np.asarray((die_map.pitch_x, die_map.pitch_y))
+    first = [math.ceil(float((lower[i] - tolerance_px) / pitch[i])) - 1 for i in (0, 1)]
+    last = [math.floor(float((upper[i] + tolerance_px) / pitch[i])) for i in (0, 1)]
+    candidate_count = (last[0] - first[0] + 1) * (last[1] - first[1] + 1)
+    if candidate_count <= len(die_map.dies_by_index):
+        candidates = (
+            (ix, iy)
+            for iy in range(first[1], last[1] + 1)
+            for ix in range(first[0], last[0] + 1)
+            if (ix, iy) in die_map.dies_by_index
+        )
+    else:
+        candidates = sorted(
+            (index for index in die_map.dies_by_index
+             if first[0] <= index[0] <= last[0] and first[1] <= index[1] <= last[1]),
+            key=lambda index: (index[1], index[0]),
+        )
+
+    matches = []
+    for ix, iy in candidates:
+        if bbox is not None:
+            cell_lower = np.asarray((ix, iy)) * pitch
+            cell_upper = cell_lower + pitch
+            grid_overlap = np.minimum(upper, cell_upper) - np.maximum(lower, cell_lower)
+            if np.any(grid_overlap <= tolerance_px):
+                continue
+            polygon = _die_polygon(
+                (die_map.x0, die_map.y0), ix, iy,
+                die_map.pitch_x, die_map.pitch_y, die_map.grid_angle_deg,
+            )
+            image_overlap = (
+                np.minimum(bounds[2:], polygon.max(axis=0))
+                - np.maximum(bounds[:2], polygon.min(axis=0))
+            )
+            if np.any(image_overlap <= tolerance_px):
+                continue
+        matches.append(_describe_located_die(
+            die_map, ix, iy, float(query[0]), float(query[1]), input_type
+        ))
+    return matches
+
+
+def _describe_located_die(
+    die_map: WaferDieMap,
+    ix: int,
+    iy: int,
+    qx: float,
+    qy: float,
+    input_type: str,
+) -> Dict[str, Any]:
     entry = die_map.get_die(ix, iy)
     polygon = _die_polygon((die_map.x0, die_map.y0), ix, iy,
                            die_map.pitch_x, die_map.pitch_y, die_map.grid_angle_deg)
@@ -4534,5 +4628,5 @@ build_die_map = build_die_map_from_yolo
 # dm.aligned_image: notch angle이 보정된 전체 이미지 (기본 결과 이미지)
 # dm.grid_angle_deg: 보정 좌표계이므로 0.0
 # dm.notch_result: notch 수치 결과; fallback_used / fallback_reason = 보완 사용 여부와 사유
-# dm.dies / locate_die(): 보정 이미지 좌표계의 die-map 결과
+# locate_die(dm, point=(x,y) 또는 bbox=(x1,y1,x2,y2)): 기본 dict; return_all=True면 모든 해당 die list
 # dm.notch_overlay_image / dm.notch_zoom_image: return_notch_visuals=True일 때만 생성

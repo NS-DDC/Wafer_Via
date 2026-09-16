@@ -23,7 +23,7 @@ IO_FOOTER = """
 # dm.aligned_image: notch angle이 보정된 전체 이미지 (기본 결과 이미지)
 # dm.grid_angle_deg: 보정 좌표계이므로 0.0
 # dm.notch_result: notch 수치 결과; fallback_used / fallback_reason = 보완 사용 여부와 사유
-# dm.dies / locate_die(): 보정 이미지 좌표계의 die-map 결과
+# locate_die(dm, point=(x,y) 또는 bbox=(x1,y1,x2,y2)): 기본 dict; return_all=True면 모든 해당 die list
 # dm.notch_overlay_image / dm.notch_zoom_image: return_notch_visuals=True일 때만 생성
 """
 

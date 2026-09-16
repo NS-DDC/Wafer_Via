@@ -1,5 +1,8 @@
 # Wafer notch angle pipeline
 
+`locate_die()`의 단일/다중 반환 플래그와 crop 좌표 사용법은
+[README_LOCATE_DIE_KO.md](README_LOCATE_DIE_KO.md)를 참고하십시오.
+
 입력부터 좌표 변환, `locate_die()`, 반환 이미지 저장까지 한 문서로 보려면 [NOTCH_ALIGNED_DM_GUIDE_KO.md](./NOTCH_ALIGNED_DM_GUIDE_KO.md)를 사용하십시오.
 
 notch 예상 좌표를 직접 지정하고 ROI 안의 반원만으로 angle을 보정하려면
