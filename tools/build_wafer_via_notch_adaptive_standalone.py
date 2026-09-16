@@ -2,6 +2,8 @@
 
 from pathlib import Path
 
+from build_wafer_via_notch_standalone import _append_io_footer, _strip_comments
+
 
 ROOT = Path(__file__).resolve().parents[1]
 BASE_STANDALONE = ROOT / "codex" / "wafer_via_notch_standalone.py"
@@ -26,6 +28,9 @@ __all__.extend([
 ])
 
 
+_geometry_detect_wafer_notch = detect_wafer_notch
+
+
 def detect_wafer_notch(
     image: ImageInput,
     *,
@@ -41,6 +46,17 @@ def detect_wafer_notch(
     search_half_width_deg: float = 45.0,
     wafer_center_hint_px: Optional[Point] = None,
     wafer_radius_hint_px: Optional[float] = None,
+    notch_roi_center_px: Optional[Point] = None,
+    notch_roi_half_size_px: Union[float, Tuple[float, float]] = 600.0,
+    notch_semicircle_radius_range_px: Optional[Tuple[float, float]] = None,
+    notch_semicircle_min_score: float = 0.55,
+    notch_use_roi_background: bool = True,
+    notch_background_palette_size: int = 3,
+    notch_background_outer_band_fraction: float = 0.28,
+    notch_background_distance_threshold_lab: Optional[float] = None,
+    notch_background_noise_margin_lab: float = 4.0,
+    notch_background_morph_px: float = 24.0,
+    notch_fallback_mode: Literal["rim_intrusion", "none"] = "rim_intrusion",
     failure_mode: Literal["error", "zero"] = "error",
     require_notch: Optional[bool] = None,
     background_palette_size: int = 3,
@@ -61,7 +77,41 @@ def detect_wafer_notch(
         mode = "error" if bool(require_notch) else "zero"
     if mode not in ("error", "zero"):
         raise ValueError("failure_mode must be 'error' or 'zero'.")
+    if str(notch_fallback_mode).strip().lower() not in ("rim_intrusion", "none"):
+        raise ValueError("notch_fallback_mode must be 'rim_intrusion' or 'none'.")
     _ = baseline_window_deg, radial_inner_ratio, min_wide_notch_deg
+
+    # A manual ROI is an explicit request for the local semicircle detector
+    # embedded in the base standalone. With no ROI this derived file keeps its
+    # historical adaptive-background V5 angle override.
+    if notch_roi_center_px is not None:
+        return _geometry_detect_wafer_notch(
+            image,
+            reference_angle_deg=reference_angle_deg,
+            max_dimension=max_dimension,
+            angle_samples=angle_samples,
+            baseline_window_deg=baseline_window_deg,
+            radial_inner_ratio=radial_inner_ratio,
+            min_notch_depth_px=min_notch_depth_px,
+            min_notch_depth_ratio=min_notch_depth_ratio,
+            min_wide_notch_deg=min_wide_notch_deg,
+            search_center_angle_deg=search_center_angle_deg,
+            search_half_width_deg=search_half_width_deg,
+            wafer_center_hint_px=wafer_center_hint_px,
+            wafer_radius_hint_px=wafer_radius_hint_px,
+            notch_roi_center_px=notch_roi_center_px,
+            notch_roi_half_size_px=notch_roi_half_size_px,
+            notch_semicircle_radius_range_px=notch_semicircle_radius_range_px,
+            notch_semicircle_min_score=notch_semicircle_min_score,
+            notch_use_roi_background=notch_use_roi_background,
+            notch_background_palette_size=notch_background_palette_size,
+            notch_background_outer_band_fraction=notch_background_outer_band_fraction,
+            notch_background_distance_threshold_lab=notch_background_distance_threshold_lab,
+            notch_background_noise_margin_lab=notch_background_noise_margin_lab,
+            notch_background_morph_px=notch_background_morph_px,
+            notch_fallback_mode=notch_fallback_mode,
+            failure_mode=mode,
+        )
 
     guide = _adaptive_draw_aligned_wafer_notch_guide(
         image,
@@ -189,6 +239,8 @@ def main() -> None:
         + ADAPTER
         + "\n"
     )
+    output = _strip_comments(output)
+    output = _append_io_footer(output)
     OUTPUT_PATH.write_text(output, encoding="utf-8", newline="\n")
 
 
