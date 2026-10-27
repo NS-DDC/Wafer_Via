@@ -299,17 +299,25 @@ def parse_yolo_points(
 
 
 # [SECTOR: 20_COLOR_INVARIANT_REFINEMENT] ------------------------------------
-def _profile_street_center(profile: np.ndarray, approximate: float, max_width: int) -> Tuple[float, float]:
+def _profile_street_candidate(
+    profile: np.ndarray, approximate: float, max_width: int,
+) -> Tuple[float, float, Optional[Tuple[int, int]]]:
+    """Find an unambiguous edge pair before deciding whether to move a seed.
+
+    Keep the strongest pair even when it is on the wrong side of the seed.
+    Silently selecting a weaker, seed-containing pair would hide conflicting
+    evidence from a nearby circuit pattern.
+    """
     values = np.asarray(profile, dtype=np.float64)
-    if values.size < 7:
-        return approximate, 0.0
+    if values.size < 7 or not np.all(np.isfinite(values)):
+        return approximate, 0.0, None
     values = cv2.GaussianBlur(values.reshape(1, -1), (0, 0), 1.0).ravel().astype(np.float32)
     dilated = cv2.dilate(values.reshape(1, -1), np.ones((1, 3), np.uint8)).ravel()
     local_max = values >= dilated
     peaks = np.flatnonzero(local_max)
     peaks = peaks[np.argsort(values[peaks])[-min(18, len(peaks)):]]
     baseline = float(np.median(values))
-    best_center, best_score = float(approximate), 0.0
+    candidates: List[Tuple[float, float, int, int]] = []
     min_width = 3
     for left in peaks:
         for right in peaks:
@@ -322,11 +330,44 @@ def _profile_street_center(profile: np.ndarray, approximate: float, max_width: i
             edge_strength = math.sqrt(max(0.0, values[left] - baseline) * max(0.0, values[right] - baseline))
             symmetry = math.exp(-abs(center - approximate) / max(2.0, max_width * 0.35))
             score = edge_strength * symmetry
-            if score > best_score:
-                best_center, best_score = center, score
+            if score > 1e-6:
+                candidates.append((score, center, int(left), int(right)))
+    if not candidates:
+        return approximate, 0.0, None
+    candidates.sort(key=lambda candidate: candidate[0], reverse=True)
+    best_score, best_center, left, right = candidates[0]
+    # Border responses have no two-sided context. Adjacent maxima on one
+    # broad edge can shift its midpoint by a pixel; treat a distinct competing
+    # centre (at least 2px away) with almost the same score as ambiguous.
+    if left < 2 or right > values.size - 3:
+        return approximate, 0.0, None
+    if any(abs(center - best_center) >= 2.0 and score >= best_score * 0.90
+           for score, center, _, _ in candidates[1:]):
+        return approximate, 0.0, None
+    # A pale neighbouring band can merge with the real street: its broad
+    # outer edges may even bracket the seed. If another substantial pair
+    # brackets the seed and stays distinctly closer to it, the image does not
+    # justify moving away from the model point to the broader pattern.
+    if any(candidate_left <= approximate <= candidate_right
+           and abs(center - approximate) + 2.0 <= abs(best_center - approximate)
+           and score >= best_score * 0.50
+           for score, center, candidate_left, candidate_right in candidates[1:]):
+        return approximate, 0.0, None
     scale = float(np.percentile(values, 90) - baseline) + 1e-9
     confidence = float(np.clip(best_score / scale, 0.0, 1.0))
-    return (best_center, confidence) if confidence >= 0.08 else (float(approximate), 0.0)
+    if confidence < 0.08:
+        return approximate, 0.0, None
+    return best_center, confidence, (left, right)
+
+
+def _profile_street_center(profile: np.ndarray, approximate: float, max_width: int) -> Tuple[float, float]:
+    center, confidence, pair = _profile_street_candidate(profile, approximate, max_width)
+    # A gradient magnitude alone cannot distinguish the white street from a
+    # neighbouring green circuit band. Without independent evidence, only
+    # refine within the strongest pair that already contains the model seed.
+    if pair is None or not (pair[0] <= approximate <= pair[1]):
+        return float(approximate), 0.0
+    return center, confidence
 
 
 def refine_cross_point(
@@ -340,6 +381,8 @@ def refine_cross_point(
 
     The two street centres are midpoints of paired Lab-gradient boundaries.
     Median projection suppresses sparse marks/noise and no hue is hard-coded.
+    Weak, truncated or competing evidence preserves the original model point
+    with zero confidence instead of snapping it to a neighbouring pattern.
     """
 
     image = _load_bgr(clip_image)
@@ -349,15 +392,20 @@ def refine_cross_point(
     x1, x2 = max(0, int(round(ax)) - radius), min(width, int(round(ax)) + radius + 1)
     y1, y2 = max(0, int(round(ay)) - radius), min(height, int(round(ay)) + radius + 1)
     roi = image[y1:y2, x1:x2]
-    if min(roi.shape[:2]) < 7:
+    if roi.shape[:2] != (2 * radius + 1, 2 * radius + 1):
         return (ax, ay), 0.0
 
     lab = cv2.cvtColor(roi, cv2.COLOR_BGR2LAB).astype(np.float32)
+    # Per-channel normalization must not turn a few quantization levels into
+    # convincing street boundaries. This gate uses unnormalised Lab evidence.
+    contrast = np.percentile(lab, 95, axis=(0, 1)) - np.percentile(lab, 5, axis=(0, 1))
+    if float(np.max(contrast)) < 6.0:
+        return (ax, ay), 0.0
     gx_energy = np.zeros(lab.shape[:2], np.float32)
     gy_energy = np.zeros(lab.shape[:2], np.float32)
     for channel in cv2.split(lab):
         centered = channel - float(np.median(channel))
-        robust_scale = float(np.percentile(np.abs(centered), 95)) + 1e-6
+        robust_scale = max(4.0, float(np.percentile(np.abs(centered), 95)))
         normalized_channel = centered / robust_scale
         gx_energy += cv2.Scharr(normalized_channel, cv2.CV_32F, 1, 0) ** 2
         gy_energy += cv2.Scharr(normalized_channel, cv2.CV_32F, 0, 1) ** 2
