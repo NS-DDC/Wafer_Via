@@ -472,8 +472,24 @@ def parse_yolo_points(
 
 
 def _profile_street_center(profile: np.ndarray, approximate: float, max_width: int) -> Tuple[float, float]:
+    return _profile_street_candidate(profile, approximate, max_width, require_seed_inside=True)
+
+
+def _profile_street_candidate(
+    profile: np.ndarray,
+    approximate: float,
+    max_width: int,
+    *,
+    require_seed_inside: bool,
+) -> Tuple[float, float]:
+    """Keep a unique paired-edge hypothesis; do not replace a rejected winner.
+
+    A single gradient cue must bracket the model seed. A colour candidate can
+    corroborate an off-seed pair separately, allowing a clear noisy cross to
+    correct a displaced model box without trusting an isolated edge pair.
+    """
     values = np.asarray(profile, dtype=np.float64)
-    if values.size < 7:
+    if values.size < 7 or not np.all(np.isfinite(values)):
         return approximate, 0.0
     values = cv2.GaussianBlur(values.reshape(1, -1), (0, 0), 1.0).ravel().astype(np.float32)
     dilated = cv2.dilate(values.reshape(1, -1), np.ones((1, 3), np.uint8)).ravel()
@@ -481,7 +497,7 @@ def _profile_street_center(profile: np.ndarray, approximate: float, max_width: i
     peaks = np.flatnonzero(local_max)
     peaks = peaks[np.argsort(values[peaks])[-min(18, len(peaks)):]]
     baseline = float(np.median(values))
-    best_center, best_score = float(approximate), 0.0
+    candidates = []
     min_width = 3
     for left in peaks:
         for right in peaks:
@@ -494,14 +510,34 @@ def _profile_street_center(profile: np.ndarray, approximate: float, max_width: i
             edge_strength = math.sqrt(max(0.0, values[left] - baseline) * max(0.0, values[right] - baseline))
             symmetry = math.exp(-abs(center - approximate) / max(2.0, max_width * 0.35))
             score = edge_strength * symmetry
-            if score > best_score:
-                best_center, best_score = center, score
+            if score > 1e-6:
+                candidates.append((score, center, int(left), int(right)))
+    if not candidates:
+        return float(approximate), 0.0
+    candidates.sort(key=lambda item: item[0], reverse=True)
+    best_score, best_center, left, right = candidates[0]
+    if left < 2 or right > values.size - 3:
+        return float(approximate), 0.0
+    if require_seed_inside and not (left <= approximate <= right):
+        return float(approximate), 0.0
+
+
+    if any(
+        alternative_left <= approximate <= alternative_right
+        and abs(center - approximate) + 2.0 <= abs(best_center - approximate)
+        and score >= best_score * 0.50
+        for score, center, alternative_left, alternative_right in candidates[1:]
+    ):
+        return float(approximate), 0.0
+    if any(abs(center - best_center) >= 2.0 and score >= best_score * 0.90
+           for score, center, _, _ in candidates[1:]):
+        return float(approximate), 0.0
     scale = float(np.percentile(values, 90) - baseline) + 1e-9
     confidence = float(np.clip(best_score / scale, 0.0, 1.0))
     return (best_center, confidence) if confidence >= 0.08 else (float(approximate), 0.0)
 
 
-def _odd_kernel(value: int, maximum: int) -> int:
+def _refinement_odd_kernel(value: int, maximum: int) -> int:
     kernel = max(1, int(value))
     if kernel % 2 == 0:
         kernel += 1
@@ -565,7 +601,7 @@ def _corner_colour_candidate(
     height, width = roi_bgr.shape[:2]
     if min(height, width) < 9:
         return approximate_local, 0.0
-    kernel = _odd_kernel(noise_kernel, min(height, width))
+    kernel = _refinement_odd_kernel(noise_kernel, min(height, width))
     filtered = cv2.medianBlur(roi_bgr, kernel) if kernel >= 3 else roi_bgr
     lab = cv2.cvtColor(filtered, cv2.COLOR_BGR2LAB).astype(np.float32)
     patch = int(round(min(height, width) * float(corner_patch_ratio)))
@@ -584,7 +620,7 @@ def _corner_colour_candidate(
     distance_to_die = np.sqrt(np.sum(difference * difference, axis=3)).min(axis=2)
 
 
-    response_kernel = _odd_kernel(min(noise_kernel, 5), min(height, width))
+    response_kernel = _refinement_odd_kernel(min(noise_kernel, 5), min(height, width))
     if response_kernel >= 3:
         distance_to_die = cv2.medianBlur(distance_to_die.astype(np.float32), response_kernel)
 
@@ -617,6 +653,9 @@ def refine_cross_point(
     ``gradient`` uses paired Lab-gradient boundaries. ``corner_color`` learns
     the four local corner-die colours and selects bands unlike all of them.
     ``auto`` combines both, preferring the corner-colour cue under noise.
+    Colour modes require agreeing gradient evidence, even when selected
+    explicitly. Weak, truncated, competing or conflicting evidence returns
+    the original model point with zero confidence instead of moving it.
     """
 
     if mode not in ("auto", "gradient", "corner_color"):
@@ -635,12 +674,21 @@ def refine_cross_point(
     if min(roi.shape[:2]) < 7:
         return (ax, ay), 0.0
 
+
+    if x1 != int(round(ax)) - radius or x2 != int(round(ax)) + radius + 1 \
+            or y1 != int(round(ay)) - radius or y2 != int(round(ay)) + radius + 1:
+        return (ax, ay), 0.0
+
     lab = cv2.cvtColor(roi, cv2.COLOR_BGR2LAB).astype(np.float32)
+
+    channel_ranges = np.percentile(lab, 95, axis=(0, 1)) - np.percentile(lab, 5, axis=(0, 1))
+    if float(np.max(channel_ranges)) < 6.0:
+        return (ax, ay), 0.0
     gx_energy = np.zeros(lab.shape[:2], np.float32)
     gy_energy = np.zeros(lab.shape[:2], np.float32)
     for channel in cv2.split(lab):
         centered = channel - float(np.median(channel))
-        robust_scale = float(np.percentile(np.abs(centered), 95)) + 1e-6
+        robust_scale = max(4.0, float(np.percentile(np.abs(centered), 95)))
         normalized_channel = centered / robust_scale
         gx_energy += cv2.Scharr(normalized_channel, cv2.CV_32F, 1, 0) ** 2
         gy_energy += cv2.Scharr(normalized_channel, cv2.CV_32F, 0, 1) ** 2
@@ -649,8 +697,12 @@ def refine_cross_point(
     vertical_profile = np.median(gx, axis=0)
     horizontal_profile = np.median(gy, axis=1)
     street_width = int(max_street_width or max(8, radius))
-    local_x, confidence_x = _profile_street_center(vertical_profile, ax - x1, street_width)
-    local_y, confidence_y = _profile_street_center(horizontal_profile, ay - y1, street_width)
+    local_x, confidence_x = _profile_street_candidate(
+        vertical_profile, ax - x1, street_width, require_seed_inside=mode == "gradient"
+    )
+    local_y, confidence_y = _profile_street_candidate(
+        horizontal_profile, ay - y1, street_width, require_seed_inside=mode == "gradient"
+    )
     gradient_confidence = math.sqrt(confidence_x * confidence_y)
     gradient_point = (float(x1 + local_x), float(y1 + local_y))
 
@@ -664,22 +716,17 @@ def refine_cross_point(
 
     if mode == "gradient":
         return (gradient_point, float(gradient_confidence)) if gradient_confidence > 0.0 else ((ax, ay), 0.0)
-    if mode == "corner_color":
-        return (colour_point, float(colour_confidence)) if colour_confidence > 0.0 else ((ax, ay), 0.0)
-    if gradient_confidence <= 0.0 and colour_confidence <= 0.0:
-        return (ax, ay), 0.0
-    if colour_confidence <= 0.0:
-        return gradient_point, float(gradient_confidence)
-    if gradient_confidence <= 0.0:
-        return colour_point, float(colour_confidence)
 
+
+    if gradient_confidence <= 0.0 or colour_confidence <= 0.0:
+        return (ax, ay), 0.0
     disagreement = math.dist(gradient_point, colour_point)
+    if disagreement > 1.0:
+        return (ax, ay), 0.0
+    if mode == "corner_color":
+        return colour_point, float(colour_confidence)
     colour_weight = float(corner_reference_weight) * colour_confidence
     gradient_weight = (1.0 - float(corner_reference_weight)) * gradient_confidence
-    if disagreement > max(4.0, radius * 0.55):
-        if colour_weight >= gradient_weight:
-            return colour_point, float(colour_confidence)
-        return gradient_point, float(gradient_confidence)
     total_weight = colour_weight + gradient_weight
     if total_weight <= 1e-9:
         return colour_point, float(colour_confidence)

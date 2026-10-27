@@ -237,8 +237,11 @@ dm_local = build_die_map_from_yolo(..., angle_mode="local")
 1. YOLO 점 주변 ROI의 네 corner patch에서 die 대표 Lab 색상 계산
 2. 네 색상과 모두 다른 vertical/horizontal street 후보 계산
 3. Median filter와 projection으로 점 노이즈 억제
-4. Lab gradient 경계쌍 결과와 결합
-5. `refine_min_confidence` 미만이면 YOLO 원좌표 유지
+4. Lab gradient 경계쌍과 색상 후보가 모두 유효하고 1px 이내로 일치하는지 검사
+5. 후보가 충돌하거나, 원래 점을 지지하는 경쟁 경계가 남거나, 신호·주변 문맥이 부족하면 YOLO 원좌표와 보정 confidence 0 반환
+6. 검증된 후보만 결합하고, `refine_min_confidence` 미만이면 YOLO 원좌표 유지
+
+`corner_color`를 직접 선택해도 경계 후보의 독립 검증을 적용합니다. `gradient` 단독 모드는 가장 강한 경계쌍이 모델 점을 포함할 때만 이동합니다. 입력·반환 형식과 기본값은 유지됩니다. [보정 안전성 및 격자 계산 상세 흐름](REFINEMENT_SAFETY_KO.md)을 참고하세요.
 
 ```python
 dm = build_die_map_from_yolo(
