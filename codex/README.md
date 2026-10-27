@@ -261,6 +261,25 @@ print(grid.refinement_confidences)
 
 실제 교차점이 ROI 밖이면 `refine_radius`를 키우십시오. 보정 후가 더 부정확하면 `refine=False` 결과와 비교합니다.
 
+새 `cross_lines` 모드는 네 corner의 기준색 대신 상하·좌우 street 경계의 공간적 연속성을 검사합니다. 기본 모드는 계속 `auto`입니다. [여덟 보정 파라미터의 기본값·적용 범위·진단 방법](REFINEMENT_PARAMETERS_KO.md)에서 고정 제한과 confidence의 의미를 확인할 수 있습니다.
+
+```python
+dm = build_die_map_from_yolo(
+    wafer_image=wafer_bgr,
+    clip_image=center_clip_bgr,
+    detections=detections_xywh,
+    detection_format="xywh",
+    normalized=False,
+    clip_origin=(clip_x, clip_y),
+    refine=True,
+    refine_mode="cross_lines",
+    refine_radius=18,
+    refine_noise_kernel=5,
+    refine_max_street_width=None,
+    refine_min_confidence=0.15,
+)
+```
+
 ## 7. 진단 Overlay
 
 ### Clip overlay

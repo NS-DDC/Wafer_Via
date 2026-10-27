@@ -1,7 +1,7 @@
 """Copy maintained refinement into the otherwise independent die-render module.
 
 Run this after changing codex/wafer_via.py, then run the two existing notch
-standalone builders. Only the marked refinement section is replaced here;
+standalone builders. The marked refinement section and mode alias are copied;
 the die-render pipeline and its public arguments remain its own source.
 """
 
@@ -29,6 +29,11 @@ def main() -> None:
     source_start, source_end = _bounds(source)
     target_start, target_end = _bounds(target)
     replacement = target[:target_start] + source[source_start:source_end] + target[target_end:]
+    source_alias = [line for line in source.splitlines() if line.startswith("RefinementMode = ")]
+    target_alias = [line for line in target.splitlines() if line.startswith("RefinementMode = ")]
+    if len(source_alias) != 1 or len(target_alias) != 1:
+        raise RuntimeError("Expected one single-line RefinementMode alias in each module.")
+    replacement = replacement.replace(target_alias[0], source_alias[0], 1)
     if replacement != target:
         TARGET.write_text(replacement, encoding="utf-8")
     print(f"Synchronized refinement: {TARGET.relative_to(ROOT)}")

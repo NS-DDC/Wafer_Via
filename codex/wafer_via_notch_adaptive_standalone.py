@@ -22,7 +22,7 @@ PointPair = Tuple[Point, Point]
 DetectionFormat = Literal[
     "auto", "point", "point_conf", "xyxy", "xywh", "yolo_txt", "xyxy_conf_class"
 ]
-RefinementMode = Literal["auto", "gradient", "corner_color"]
+RefinementMode = Literal["auto", "gradient", "corner_color", "cross_lines"]
 
 __all__ = [
     "GridEstimate",
@@ -637,6 +637,150 @@ def _corner_colour_candidate(
     return (float(center_x), float(center_y)), float(confidence)
 
 
+def _cross_lines_axis_candidates(
+    lab: np.ndarray,
+    valid: np.ndarray,
+    approximate: float,
+    radius: int,
+    max_width: int,
+) -> List[Dict[str, Any]]:
+    """Measure a strip on its two outer arms, without corner-colour references.
+
+    Rows run along the strip and columns across it. One edge of one arm may
+    disappear into an identically coloured die, but each edge must exist on
+    at least one arm and each arm must have a continuous visible edge.
+    """
+    size = lab.shape[0]
+    middle = (size - 1) / 2.0
+    inner, outer = int(math.ceil(radius * 0.55)), int(math.floor(radius * 0.88))
+    if outer - inner < 3:
+        return []
+    arms = (np.arange(int(middle) - outer, int(middle) - inner + 1),
+            np.arange(int(middle) + inner, int(middle) + outer + 1))
+    gradient = np.sqrt(np.sum(cv2.Scharr(lab, cv2.CV_32F, 1, 0) ** 2, axis=2)) / 32.0
+    profiles = np.asarray([np.median(gradient[rows], axis=0) for rows in arms])
+    combined = profiles.max(axis=0)
+    threshold = max(3.0, float(np.percentile(combined, 95)) * 0.16)
+    dilated = cv2.dilate(combined.reshape(1, -1), np.ones((1, 3), np.uint8)).ravel()
+    raw_peaks = np.flatnonzero((combined >= dilated - 1e-6) & (combined >= threshold))
+
+    groups = np.split(raw_peaks, np.flatnonzero(np.diff(raw_peaks) > 1) + 1)
+    peaks = []
+    for group in groups:
+        if not len(group):
+            continue
+        peak = float(np.average(group, weights=combined[group]))
+        if 2.0 <= peak <= size - 3.0:
+            peaks.append(peak)
+    peaks = sorted(peaks, key=lambda x: combined[int(round(x))], reverse=True)[:16]
+    peaks.sort()
+    candidates = []
+    for i, left in enumerate(peaks):
+        for right in peaks[i + 1:]:
+            width = right - left
+            center = (left + right) / 2.0
+            if width < 3.0 or width > max_width or abs(center - approximate) > max(4.0, radius * 0.35):
+                continue
+            columns = np.arange(int(math.ceil(left + 1.5)), int(math.floor(right - 1.5)) + 1)
+            if not len(columns):
+                columns = np.asarray([int(round(center))])
+            boundary_columns = [np.arange(int(round(edge)) - 1, int(round(edge)) + 2) for edge in (left, right)]
+            context_columns = np.arange(int(math.floor(left)) - 2, int(math.ceil(right)) + 3)
+            if any(not np.all(valid[np.ix_(rows, context_columns)]) for rows in arms):
+                continue
+            strengths = np.asarray([[float(np.median(np.max(gradient[np.ix_(rows, cols)], axis=1)))
+                                     for cols in boundary_columns] for rows in arms])
+            if np.any(strengths.max(axis=0) < threshold) or np.any(strengths.max(axis=1) < threshold):
+                continue
+            continuity = np.asarray([[float(np.mean(np.max(gradient[np.ix_(rows, cols)], axis=1)
+                                                     >= max(threshold, strengths[a, b] * 0.35)))
+                                      for b, cols in enumerate(boundary_columns)] for a, rows in enumerate(arms)])
+            supported = (strengths >= threshold) & (continuity >= 0.65)
+            if not np.all(supported.any(axis=0)) or not np.all(supported.any(axis=1)):
+                continue
+            arm_pixels = [lab[np.ix_(rows, columns)].reshape(-1, 3) for rows in arms]
+            colours = np.asarray([np.median(pixels, axis=0) for pixels in arm_pixels])
+            edge_strength = float(np.sqrt(np.prod(strengths.max(axis=0))))
+            texture_limit = max(6.0, min(12.0, edge_strength * 0.15))
+            if float(np.linalg.norm(colours[0] - colours[1])) > texture_limit:
+                continue
+            colour = np.median(np.concatenate(arm_pixels), axis=0)
+            texture = float(np.percentile(np.linalg.norm(np.concatenate(arm_pixels) - colour, axis=1), 90))
+            if texture > texture_limit:
+                continue
+            support = float(np.mean(supported))
+            score = edge_strength * support * math.exp(-texture / max(6.0, texture_limit))
+            candidates.append({"center": center, "left": left, "right": right,
+                               "score": score, "support": support, "colour": colour,
+                               "texture": texture, "contrast": edge_strength})
+    return sorted(candidates, key=lambda candidate: candidate["score"], reverse=True)
+
+
+def _cross_lines_candidate(
+    roi_bgr: np.ndarray,
+    approximate_local: Point,
+    *,
+    search_radius: int,
+    max_street_width: int,
+    noise_kernel: int,
+) -> Tuple[Point, float]:
+    """Find a common crossing of four coherent outer arms within +/-12 degrees.
+
+    The angle search is deliberately local to near-axis-aligned wafer grids.
+    Colour only verifies that the four strip interiors belong together; no
+    absolute colour and no corner patch is used as a street/die reference.
+    """
+    radius = int(search_radius)
+    kernel = _refinement_odd_kernel(noise_kernel, min(roi_bgr.shape[:2]))
+    filtered = cv2.medianBlur(roi_bgr, kernel) if kernel >= 3 else roi_bgr
+    lab = cv2.cvtColor(filtered, cv2.COLOR_BGR2LAB).astype(np.float32)
+    lab = cv2.GaussianBlur(lab, (3, 3), 0.65)
+    center = (float(radius), float(radius))
+    hypotheses = []
+    for angle in range(-12, 13, 2):
+        matrix = cv2.getRotationMatrix2D(center, float(angle), 1.0)
+        aligned = cv2.warpAffine(lab, matrix, (lab.shape[1], lab.shape[0]), flags=cv2.INTER_LINEAR)
+        valid = cv2.warpAffine(np.ones(lab.shape[:2], np.float32), matrix,
+                               (lab.shape[1], lab.shape[0]), flags=cv2.INTER_LINEAR) >= 0.999
+        seed = matrix[:, :2] @ np.asarray(approximate_local) + matrix[:, 2]
+        x_candidates = _cross_lines_axis_candidates(aligned, valid, float(seed[0]), radius, max_street_width)
+        y_candidates = _cross_lines_axis_candidates(aligned.transpose(1, 0, 2), valid.T,
+                                                    float(seed[1]), radius, max_street_width)
+        for x in x_candidates[:8]:
+            for y in y_candidates[:8]:
+                colour_difference = float(np.linalg.norm(x["colour"] - y["colour"]))
+                if colour_difference > 12.0:
+                    continue
+                score = math.sqrt(x["score"] * y["score"]) * math.exp(-colour_difference / 12.0)
+
+
+                ambiguous = False
+                for candidates, chosen, approximate in ((x_candidates, x, seed[0]), (y_candidates, y, seed[1])):
+                    for other in candidates:
+                        if (other["left"] <= approximate <= other["right"]
+                                and abs(other["center"] - approximate) + 2.0 <= abs(chosen["center"] - approximate)
+                                and other["score"] >= chosen["score"] * 0.50):
+                            ambiguous = True
+                            break
+                inverse = cv2.invertAffineTransform(matrix)
+                point = inverse[:, :2] @ np.asarray((x["center"], y["center"])) + inverse[:, 2]
+                hypotheses.append({"point": point, "score": score, "support": min(x["support"], y["support"]),
+                                   "contrast": min(x["contrast"], y["contrast"]), "angle": angle,
+                                   "seed_competition": ambiguous})
+    if not hypotheses:
+        return approximate_local, 0.0
+    hypotheses.sort(key=lambda hypothesis: hypothesis["score"], reverse=True)
+    best = hypotheses[0]
+    if best["seed_competition"]:
+        return approximate_local, 0.0
+
+    if any(float(np.linalg.norm(other["point"] - best["point"])) >= 2.0
+           and other["score"] >= best["score"] * 0.80 for other in hypotheses[1:]):
+        return approximate_local, 0.0
+    confidence = float(np.clip(best["support"] * min(1.0, best["contrast"] / 12.0), 0.0, 1.0))
+    return (float(best["point"][0]), float(best["point"][1])), confidence
+
+
 def refine_cross_point(
     clip_image: ImageInput,
     approximate_point: Point,
@@ -653,16 +797,18 @@ def refine_cross_point(
     ``gradient`` uses paired Lab-gradient boundaries. ``corner_color`` learns
     the four local corner-die colours and selects bands unlike all of them.
     ``auto`` combines both, preferring the corner-colour cue under noise.
+    ``cross_lines`` checks paired boundaries and four outer street arms over
+    a local +/-12 degree angle search, without either corner-colour parameter.
     Colour modes require agreeing gradient evidence, even when selected
     explicitly. Weak, truncated, competing or conflicting evidence returns
     the original model point with zero confidence instead of moving it.
     """
 
-    if mode not in ("auto", "gradient", "corner_color"):
-        raise ValueError("mode must be 'auto', 'gradient', or 'corner_color'.")
-    if not (0.05 <= float(corner_patch_ratio) <= 0.33):
+    if mode not in ("auto", "gradient", "corner_color", "cross_lines"):
+        raise ValueError("mode must be 'auto', 'gradient', 'corner_color', or 'cross_lines'.")
+    if mode != "cross_lines" and not (0.05 <= float(corner_patch_ratio) <= 0.33):
         raise ValueError("corner_patch_ratio must be between 0.05 and 0.33.")
-    if not (0.0 <= float(corner_reference_weight) <= 1.0):
+    if mode != "cross_lines" and not (0.0 <= float(corner_reference_weight) <= 1.0):
         raise ValueError("corner_reference_weight must be between 0.0 and 1.0.")
     image = _load_bgr(clip_image)
     height, width = image.shape[:2]
@@ -684,6 +830,16 @@ def refine_cross_point(
     channel_ranges = np.percentile(lab, 95, axis=(0, 1)) - np.percentile(lab, 5, axis=(0, 1))
     if float(np.max(channel_ranges)) < 6.0:
         return (ax, ay), 0.0
+    if mode == "cross_lines":
+        local_point, confidence = _cross_lines_candidate(
+            roi, (ax - x1, ay - y1), search_radius=radius,
+            max_street_width=int(max_street_width or max(8, radius)),
+            noise_kernel=noise_kernel,
+        )
+        if confidence <= 0.0:
+            return (ax, ay), 0.0
+        return (float(x1 + local_point[0]), float(y1 + local_point[1])), confidence
+
     gx_energy = np.zeros(lab.shape[:2], np.float32)
     gy_energy = np.zeros(lab.shape[:2], np.float32)
     for channel in cv2.split(lab):
