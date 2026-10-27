@@ -1053,29 +1053,73 @@ def locate_die(
     return _describe_located_die(die_map, ix, iy, qx, qy, input_type)
 
 
+def _locate_point_dies(die_map: WaferDieMap, point: Point) -> List[Dict[str, Any]]:
+    """Use the single-die result and inspect only immediate grid neighbours."""
+    try:
+        if len(point) != 2:
+            raise ValueError
+
+
+        qx, qy = float(point[0]), float(point[1])
+    except (TypeError, ValueError, OverflowError) as exc:
+        raise ValueError("point must contain two finite coordinates.") from exc
+    if not math.isfinite(qx) or not math.isfinite(qy):
+        raise ValueError("point must contain two finite coordinates.")
+
+    primary = locate_die(die_map, point=(qx, qy), return_all=False)
+    owner_x, owner_y = primary["die_index"]
+    relative = np.asarray((qx - die_map.x0, qy - die_map.y0), dtype=np.float64)
+    projected = (float(relative @ np.asarray(die_map.axis_x)),
+                 -float(relative @ np.asarray(die_map.axis_y)))
+    candidates = []
+    for position, pitch, owner in zip(
+        projected, (die_map.pitch_x, die_map.pitch_y), (owner_x, owner_y)
+    ):
+
+        tolerance = min(1e-7, pitch * 1e-6)
+        offset = position - owner * pitch
+        if offset <= tolerance:
+            indices = (owner - 1, owner)
+        elif pitch - offset <= tolerance:
+            indices = (owner, owner + 1)
+        else:
+            indices = (owner,)
+        candidates.append(indices)
+
+    matches = []
+    for iy in candidates[1]:
+        for ix in candidates[0]:
+            if die_map.get_die(ix, iy) is None:
+                continue
+            if (ix, iy) == (owner_x, owner_y):
+                matches.append(primary)
+            else:
+                matches.append(_describe_located_die(die_map, ix, iy, qx, qy, "point"))
+    if not matches:
+        primary["is_fallback"] = True
+        matches.append(primary)
+    return matches
+
+
 def _locate_all_dies(
     die_map: WaferDieMap,
     *,
     point: Optional[Point],
     bbox: Optional[Tuple[float, float, float, float]],
 ) -> List[Dict[str, Any]]:
-    tolerance_px = 1e-7
     if bbox is None:
-        query = np.asarray(point, dtype=np.float64)
-        if query.shape != (2,) or not np.all(np.isfinite(query)):
-            raise ValueError("point must contain two finite coordinates.")
-        corners = query.reshape(1, 2)
-        input_type = "point"
-    else:
-        bounds = np.asarray(bbox, dtype=np.float64)
-        if bounds.shape != (4,) or not np.all(np.isfinite(bounds)):
-            raise ValueError("bbox must contain four finite coordinates.")
-        if bounds[2] <= bounds[0] or bounds[3] <= bounds[1]:
-            raise ValueError("bbox must satisfy x1 < x2 and y1 < y2.")
-        x1, y1, x2, y2 = bounds
-        query = bounds[:2] / 2.0 + bounds[2:] / 2.0
-        corners = np.asarray(((x1, y1), (x2, y1), (x2, y2), (x1, y2)))
-        input_type = "bbox"
+        return _locate_point_dies(die_map, point)
+
+    tolerance_px = 1e-7
+    bounds = np.asarray(bbox, dtype=np.float64)
+    if bounds.shape != (4,) or not np.all(np.isfinite(bounds)):
+        raise ValueError("bbox must contain four finite coordinates.")
+    if bounds[2] <= bounds[0] or bounds[3] <= bounds[1]:
+        raise ValueError("bbox must satisfy x1 < x2 and y1 < y2.")
+    x1, y1, x2, y2 = bounds
+    query = bounds[:2] / 2.0 + bounds[2:] / 2.0
+    corners = np.asarray(((x1, y1), (x2, y1), (x2, y2), (x1, y2)))
+    input_type = "bbox"
 
     relative = corners - np.asarray((die_map.x0, die_map.y0))
     projected = np.column_stack((
@@ -1103,6 +1147,7 @@ def _locate_all_dies(
 
     matches = []
     for ix, iy in candidates:
+        ix, iy = int(ix), int(iy)
         if bbox is not None:
             cell_lower = np.asarray((ix, iy)) * pitch
             cell_upper = cell_lower + pitch
@@ -1122,16 +1167,6 @@ def _locate_all_dies(
         matches.append(_describe_located_die(
             die_map, ix, iy, float(query[0]), float(query[1]), input_type
         ))
-    if not matches and bbox is None:
-
-
-        ix = math.floor(float(projected[0, 0]) / die_map.pitch_x)
-        iy = math.floor(float(projected[0, 1]) / die_map.pitch_y)
-        fallback = _describe_located_die(
-            die_map, ix, iy, float(query[0]), float(query[1]), input_type
-        )
-        fallback["is_fallback"] = True
-        matches.append(fallback)
     return matches
 
 
