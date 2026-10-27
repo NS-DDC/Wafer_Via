@@ -336,6 +336,22 @@ result = locate_die(dm, point=(5499, 4700))
 result = locate_die(dm, bbox=(4880, 5080, 4980, 5180))
 ```
 
+`return_all=True`로 point를 조회하면 유효한 die map과 유한한 픽셀 좌표에 대해 최소 1개 결과를 리스트로 반환합니다.
+
+```python
+hits = locate_die(dm, point=(x, y), return_all=True)
+for hit in hits:
+    print(hit["die_index"], hit["die_center_px"])
+    if hit.get("is_fallback", False):
+        print("저장된 die가 없어 원점·pitch·각도로 계산한 격자 칸입니다.")
+```
+
+- 저장된 die가 있으면 기존 결과를 그대로 반환합니다. 공유 경계에서는 2개, 꼭짓점에서는 최대 4개입니다.
+- 저장된 die가 없으면 기본 단일 조회와 같은 방식으로 격자 칸 1개를 계산하고 `is_fallback=True`를 붙입니다. `include_edge=False`로 빠진 칸, 맵 바깥 좌표, 저장 die가 없는 맵도 여기에 해당합니다. 맵에 die를 추가하지는 않습니다.
+- 계산 결과가 있다고 실제 wafer 내부이거나 crop할 영상 영역이 있다는 뜻은 아닙니다. `in_wafer`, `is_outside_image`, `crop_rect_px`를 확인하십시오.
+- bbox 조회의 미일치 결과는 기존대로 `[]`입니다. 잘못된 point 형식이나 NaN/무한대는 `ValueError`입니다.
+- 입력 좌표는 `dm.coordinate_space`와 일치해야 합니다. 기본 모듈은 원본 영상 좌표, notch 정렬 맵은 정렬 영상 좌표를 사용합니다. 원본 점을 notch 맵에 넣으려면 `transform_point_to_aligned`로 한 번 변환하십시오.
+
 주요 반환값:
 
 ```python

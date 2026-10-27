@@ -1025,13 +1025,15 @@ def locate_die(
     *,
     return_all: bool = False,
 ) -> Union[Dict[str, Any], List[Dict[str, Any]]]:
-    """Return one die by default, or all matching stored dies as a list.
+    """Return one die by default, or matching dies as a list.
 
     Coordinates use the die-map image space. With ``return_all=True``, a
     point includes adjacent cells on a shared edge; a bbox includes cells
-    with positive-area overlap. No match returns []. Bbox edge contact alone
-    is excluded. Results are ordered by (iy, ix); query_px stays the input
-    point or bbox centre. The default single-die behaviour is unchanged.
+    with positive-area overlap. If no stored cell matches a valid point,
+    return its computed grid cell with ``is_fallback=True``; point results
+    are never empty. A bbox with no match still returns []. Bbox edge contact
+    alone is excluded. Results are ordered by (iy, ix); query_px stays the
+    input point or bbox centre. The default single-die behaviour is unchanged.
     """
 
     if (point is None) == (bbox is None):
@@ -1121,6 +1123,16 @@ def _locate_all_dies(
         matches.append(_describe_located_die(
             die_map, ix, iy, float(query[0]), float(query[1]), input_type
         ))
+    if not matches and bbox is None:
+
+
+        ix = math.floor(float(projected[0, 0]) / die_map.pitch_x)
+        iy = math.floor(float(projected[0, 1]) / die_map.pitch_y)
+        fallback = _describe_located_die(
+            die_map, ix, iy, float(query[0]), float(query[1]), input_type
+        )
+        fallback["is_fallback"] = True
+        matches.append(fallback)
     return matches
 
 
