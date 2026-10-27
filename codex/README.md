@@ -237,8 +237,11 @@ dm_local = build_die_map_from_yolo(..., angle_mode="local")
 1. YOLO 점 주변 ROI의 네 corner patch에서 die 대표 Lab 색상 계산
 2. 네 색상과 모두 다른 vertical/horizontal street 후보 계산
 3. Median filter와 projection으로 점 노이즈 억제
-4. Lab gradient 경계쌍 결과와 결합
-5. `refine_min_confidence` 미만이면 YOLO 원좌표 유지
+4. Lab gradient 경계쌍과 색상 후보가 모두 유효하고 1px 이내로 일치하는지 검사
+5. 후보가 충돌하거나, 원래 점을 지지하는 경쟁 경계가 남거나, 신호·주변 문맥이 부족하면 YOLO 원좌표와 보정 confidence 0 반환
+6. 검증된 후보만 결합하고, `refine_min_confidence` 미만이면 YOLO 원좌표 유지
+
+`corner_color`를 직접 선택해도 경계 후보의 독립 검증을 적용합니다. `gradient` 단독 모드는 가장 강한 경계쌍이 모델 점을 포함할 때만 이동합니다. 입력·반환 형식과 기본값은 유지됩니다. [보정 안전성 및 격자 계산 상세 흐름](REFINEMENT_SAFETY_KO.md)을 참고하세요.
 
 ```python
 dm = build_die_map_from_yolo(
@@ -257,6 +260,25 @@ print(grid.refinement_confidences)
 ```
 
 실제 교차점이 ROI 밖이면 `refine_radius`를 키우십시오. 보정 후가 더 부정확하면 `refine=False` 결과와 비교합니다.
+
+새 `cross_lines` 모드는 네 corner의 기준색 대신 상하·좌우 street 경계의 공간적 연속성을 검사합니다. 기본 모드는 계속 `auto`입니다. [여덟 보정 파라미터의 기본값·적용 범위·진단 방법](REFINEMENT_PARAMETERS_KO.md)에서 고정 제한과 confidence의 의미를 확인할 수 있습니다.
+
+```python
+dm = build_die_map_from_yolo(
+    wafer_image=wafer_bgr,
+    clip_image=center_clip_bgr,
+    detections=detections_xywh,
+    detection_format="xywh",
+    normalized=False,
+    clip_origin=(clip_x, clip_y),
+    refine=True,
+    refine_mode="cross_lines",
+    refine_radius=18,
+    refine_noise_kernel=5,
+    refine_max_street_width=None,
+    refine_min_confidence=0.15,
+)
+```
 
 ## 7. 진단 Overlay
 
@@ -324,7 +346,7 @@ if die is not None:
 
 ## 9. `locate_die()`
 
-Point 또는 bbox 중심으로 die index를 찾습니다.
+Point 또는 bbox 중심으로 die index를 찾습니다. **`return_all=False`는 die 한 개를 설명하는 `dict`이고, `len(result) == 24`는 die 24개가 아니라 반환 항목(key) 24개라는 뜻입니다.** `return_all=True`는 die 결과들을 담은 `list`이므로 이때의 `len(hits)`가 결과 die 개수입니다.
 
 ```python
 result = locate_die(dm, point=(5499, 4700))
@@ -332,6 +354,22 @@ result = locate_die(dm, point=(5499, 4700))
 # 또는
 result = locate_die(dm, bbox=(4880, 5080, 4980, 5180))
 ```
+
+`return_all=True`로 point를 조회하면 유효한 die map과 유한한 픽셀 좌표에 대해 1~4개 결과를 리스트로 반환합니다. 일반 위치는 1개, 공유 경계는 최대 2개, 꼭짓점은 최대 4개입니다. 정상 hit의 dict에는 기존 24개 항목이 유지되며, 저장된 die가 없어 계산한 fallback에만 `is_fallback=True`가 추가됩니다.
+
+```python
+hits = locate_die(dm, point=(x, y), return_all=True)
+for hit in hits:
+    print(hit["die_index"], hit["die_center_px"])
+    if hit.get("is_fallback", False):
+        print("저장된 die가 없어 원점·pitch·각도로 계산한 격자 칸입니다.")
+```
+
+- 저장된 die가 있으면 기존 결과를 그대로 반환합니다. 공유 경계에서는 2개, 꼭짓점에서는 최대 4개입니다.
+- 저장된 die가 없으면 기본 단일 조회와 같은 방식으로 격자 칸 1개를 계산하고 `is_fallback=True`를 붙입니다. `include_edge=False`로 빠진 칸, 맵 바깥 좌표, 저장 die가 없는 맵도 여기에 해당합니다. 맵에 die를 추가하지는 않습니다.
+- 계산 결과가 있다고 실제 wafer 내부이거나 crop할 영상 영역이 있다는 뜻은 아닙니다. `in_wafer`, `is_outside_image`, `crop_rect_px`를 확인하십시오.
+- bbox 조회의 미일치 결과는 기존대로 `[]`입니다. 잘못된 point 형식이나 NaN/무한대는 `ValueError`입니다.
+- 입력 좌표는 `dm.coordinate_space`와 일치해야 합니다. 기본 모듈은 원본 영상 좌표, notch 정렬 맵은 정렬 영상 좌표를 사용합니다. 원본 점을 notch 맵에 넣으려면 `transform_point_to_aligned`로 한 번 변환하십시오.
 
 주요 반환값:
 
@@ -347,6 +385,38 @@ print(result["is_edge"])
 ```
 
 Query가 wafer 또는 이미지 밖이어도 격자 수식으로 `die_index`를 계산합니다. 실제 wafer 내부 여부는 `in_wafer`로 확인하십시오.
+
+### `False`는 `len=24`인데 `True`는 결과가 없어 보일 때
+
+아래 코드는 **문제가 발생한 프로세스의 같은 `locate_die`, `dm`, `x`, `y`**를 사용합니다. 진단 중 다른 모듈에서 함수를 다시 import하지 말고 실행하면, 실제 함수의 파일·시그니처와 두 호출의 반환 타입을 함께 확인할 수 있습니다. 호출 전후를 모두 출력하므로 빈 리스트가 반환된 경우와 함수가 끝나지 않거나 예외가 발생한 경우도 구분됩니다.
+
+```python
+import inspect
+
+query = (x, y)
+print("실행 모듈:", locate_die.__module__, flush=True)
+print("실행 파일:", inspect.getsourcefile(locate_die), flush=True)
+print("시그니처:", inspect.signature(locate_die), flush=True)
+print("조회점:", repr(query), "좌표계:", getattr(dm, "coordinate_space", "unknown"), flush=True)
+print("저장된 die 수:", len(dm.dies_by_index), flush=True)
+
+print("False 호출 전", flush=True)
+single = locate_die(dm, point=query, return_all=False)
+print("False 호출 후:", type(single).__name__,
+      "len=", len(single) if single is not None else None, flush=True)
+
+print("True 호출 전", flush=True)
+hits = locate_die(dm, point=query, return_all=True)
+print("True 호출 후:", type(hits).__name__,
+      "len=", len(hits) if hits is not None else None, flush=True)
+if isinstance(hits, list):
+    for hit in hits:
+        print("die:", hit["die_index"], "fallback:", hit.get("is_fallback", False), flush=True)
+else:
+    print("예상과 다른 반환값:", repr(hits), flush=True)
+```
+
+이전 버전은 저장된 die가 없는 point에 `[]`을 반환할 수 있습니다. 같은 이름의 파일이 여러 폴더에 있거나 Python이 이미 이전 함수를 import한 상태라면, 다른 파일을 수정해도 실행 코드는 바뀌지 않습니다. 위에서 확인한 **실제로 사용 중인 모듈의 최신 파일 전체**를 교체한 뒤 프로그램·노트북 커널을 재시작하십시오. 모듈형 notch는 함께 사용하는 `wafer_via.py`, standalone은 사용 중인 standalone 파일 전체를 교체합니다. 파일 경로가 맞아도 메모리에 이전 코드가 남을 수 있습니다. 이 정보만으로 외부 실행 환경의 원인이 확정되는 것은 아니며, 실제 출력과 오류 메시지로 확인해야 합니다.
 
 ## 10. 주요 반환 객체
 
